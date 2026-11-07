@@ -268,7 +268,7 @@ impl AutoSource {
             Ok(rows) => Ok((SocketSourceKind::SockDiag, rows)),
             Err(e) => {
                 if !self.warned {
-                    eprintln!("lantern discovery: sock_diag unavailable ({e}); falling back to procfs");
+                    tracing::warn!(error = %e, "sock_diag unavailable; falling back to procfs");
                     self.warned = true;
                 }
                 Ok((SocketSourceKind::ProcNetTcp, self.proc.listening_tcp()?))

@@ -170,9 +170,12 @@ impl Scanner {
         }
         let scan_ms = start.elapsed().as_secs_f32() * 1000.0;
         if scan_ms > 50.0 {
-            eprintln!(
-                "lantern discovery: slow scan {scan_ms:.1} ms (source {source_ms:.1} ms, proc {observe_ms:.1} ms, build {:.1} ms)",
-                build_start.elapsed().as_secs_f32() * 1000.0
+            tracing::warn!(
+                scan_ms,
+                source_ms,
+                proc_ms = observe_ms,
+                build_ms = build_start.elapsed().as_secs_f32() * 1000.0,
+                "slow discovery scan"
             );
         }
         Ok(Snapshot {
