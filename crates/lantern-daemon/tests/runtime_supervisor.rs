@@ -881,10 +881,11 @@ impl UserSystemd for DeploySystemd {
                 "other"
             };
             self.verbs.lock().unwrap().push(verb.into());
+            let status_failed = text.contains("STATUSFAIL");
             self.fake.set_snapshot(UnitSnapshot {
                 sub: "exited".into(),
                 exit_kind: ExitCodeKind::Exited,
-                exit_code: Some(0),
+                exit_code: Some(i32::from(status_failed)),
                 ..running_snapshot(&spec.unit)
             });
             Ok(())
@@ -967,6 +968,73 @@ async fn runtime_deploy_start_restart_and_stop_use_oneshots() {
     assert_eq!(snap.status, OperationStatus::Succeeded, "{snap:?}");
     assert_eq!(*systemd.verbs.lock().unwrap(), vec!["start", "restart", "stop"]);
     assert!(!running.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn runtime_deploy_status_failure_uses_crash_retry_path() {
+    use lantern_core::template::TemplateString;
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("statusfail", &temp.0, "unused", &[]);
+    {
+        let mut all = store.instances.lock().unwrap();
+        let m = Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest);
+        m.deploy.start = Some(TemplateString::parse("echo BEGINMARKER ${PORT}").0);
+        m.deploy.status = Some(TemplateString::parse("false # STATUSFAIL").0);
+    }
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let backend = Arc::new(DeploySystemd {
+        fake: FakeSystemd::default(),
+        running: running.clone(),
+        verbs: Mutex::new(vec![]),
+    });
+    let mut cfg = config(&temp);
+    cfg.settings.health.grace_secs = 0;
+    cfg.settings.runtime.backoff_base_secs = 1;
+    cfg.settings.runtime.backoff_cap_secs = 1;
+    let rt = Runtime::with_scoped_journal(
+        cfg,
+        store,
+        Arc::new(DeployProbe(running.clone())),
+        backend.clone(),
+        OperationTracker::new(EventBus::new()),
+        lantern_daemon::runtime::RuntimeAdapters {
+            preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+            router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+            services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+        },
+        true,
+    );
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    for _ in 0..3 {
+        rt.check_health_now(&id).await.unwrap();
+    }
+    let state = rt.state(&id).unwrap();
+    assert_eq!(state.status, InstanceStatus::Crashed);
+    assert!(state.next_retry_at.is_some());
+    running.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if backend
+                .verbs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|verb| *verb == "start")
+                .count()
+                >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("deploy.start was not retried");
+    rt.shutdown_background();
 }
 
 struct TestServices {

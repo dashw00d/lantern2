@@ -213,6 +213,7 @@ struct ActorState {
     active: Option<ActiveOperation>,
     generation: u64,
     retry_streak: u32,
+    deploy_status_failures: u32,
     ready_at: Option<Instant>,
     deploy_started: bool,
     worktree_env: BTreeMap<String, String>,
@@ -237,6 +238,7 @@ impl Actor {
                 active: None,
                 generation: 0,
                 retry_streak: 0,
+                deploy_status_failures: 0,
                 ready_at: None,
                 deploy_started: false,
                 worktree_env: BTreeMap::new(),
@@ -1184,6 +1186,7 @@ impl Runtime {
             let mut s = actor.state.lock().unwrap();
             if s.generation == generation {
                 s.ready_at = Some(Instant::now());
+                s.deploy_status_failures = 0;
             }
         }
         let _ = self.inner.store.record_started(id);
@@ -1883,7 +1886,7 @@ impl Runtime {
                     break;
                 };
                 let started = Instant::now();
-                let result = rt.health_probe(&inst, &client).await;
+                let (result, deploy_alive) = rt.health_probe(&inst, &client).await;
                 let ok = result.is_ok();
                 failures = if ok {
                     0
@@ -1921,7 +1924,9 @@ impl Runtime {
                     );
                     h.recent.truncate(10);
                 });
-                if state == HealthState::Failing {
+                if rt.deploy_liveness(&inst, &actor, generation, deploy_alive).await {
+                    break;
+                } else if state == HealthState::Failing && deploy_alive != Some(false) {
                     rt.event(&id, &actor, generation, Event::HealthFailed);
                 } else if ok {
                     rt.event(&id, &actor, generation, Event::HealthRecovered);
@@ -1929,7 +1934,31 @@ impl Runtime {
             }
         });
     }
-    async fn health_probe(&self, inst: &Instance, client: &reqwest::Client) -> Result<Option<u16>, String> {
+    async fn health_probe(
+        &self,
+        inst: &Instance,
+        client: &reqwest::Client,
+    ) -> (Result<Option<u16>, String>, Option<bool>) {
+        if inst.manifest.deploy.start.is_some() && inst.manifest.deploy.status.is_some() {
+            match self.deploy_status(&inst.id).await {
+                Ok(status) if !status.alive => {
+                    return (
+                        Err(format!("deploy.status exited {:?}", status.exit_code)),
+                        Some(false),
+                    );
+                }
+                Ok(_) if inst.manifest.health_endpoint.is_none() => return (Ok(None), Some(true)),
+                Ok(_) => return (self.ordinary_health_probe(inst, client).await, Some(true)),
+                Err(error) => return (Err(error.to_string()), None),
+            }
+        }
+        (self.ordinary_health_probe(inst, client).await, None)
+    }
+    async fn ordinary_health_probe(
+        &self,
+        inst: &Instance,
+        client: &reqwest::Client,
+    ) -> Result<Option<u16>, String> {
         let health = &self.inner.config.settings.health;
         if let Some(endpoint) = &inst.manifest.health_endpoint {
             let base = inst
@@ -1968,12 +1997,6 @@ impl Runtime {
                 },
                 Err(e) => Err(e.to_string()),
             }
-        } else if inst.manifest.deploy.start.is_some() && inst.manifest.deploy.status.is_some() {
-            match self.deploy_status(&inst.id).await {
-                Ok(status) if status.alive => Ok(None),
-                Ok(status) => Err(format!("deploy.status exited {:?}", status.exit_code)),
-                Err(e) => Err(e.to_string()),
-            }
         } else if inst.manifest.deploy.start.is_some() {
             match inst.runtime.port {
                 Some(port) => match self.probe(port, None).await {
@@ -1999,6 +2022,55 @@ impl Runtime {
         } else {
             Ok(None)
         }
+    }
+    async fn deploy_liveness(
+        &self,
+        inst: &Instance,
+        actor: &Arc<Actor>,
+        generation: u64,
+        alive: Option<bool>,
+    ) -> bool {
+        let Some(alive) = alive else {
+            return false;
+        };
+        let _io = actor.io_lock.lock().await;
+        let crashed = {
+            let mut state = actor.state.lock().unwrap();
+            if state.generation != generation
+                || !matches!(
+                    state.supervisor.status,
+                    InstanceStatus::Running | InstanceStatus::Unhealthy
+                )
+            {
+                return false;
+            }
+            state.deploy_status_failures = if alive {
+                0
+            } else {
+                state.deploy_status_failures.saturating_add(1)
+            };
+            state.deploy_status_failures >= 3
+        };
+        if crashed {
+            let row = UnitSnapshot {
+                unit: String::new(),
+                load: Load::Loaded,
+                active: Active::Failed,
+                sub: "failed".into(),
+                result: "deploy.status reported the process unavailable".into(),
+                main_pid: None,
+                exit_code: None,
+                exit_kind: ExitCodeKind::Unknown,
+                started_at: inst.runtime.started_at,
+                invocation_id: None,
+                cgroup: None,
+            };
+            self.handle_exit(&inst.id, actor, generation, &row, false);
+            if let Err(error) = self.inner.router.unpublish(&inst.id).await {
+                tracing::warn!(id = %inst.id, %error, "failed to unpublish crashed deploy");
+            }
+        }
+        crashed
     }
     /// Run an immediate health probe for a running instance and publish its sample.
     pub async fn check_health_now(
@@ -2027,7 +2099,7 @@ impl Runtime {
             .build()
             .map_err(|e| RuntimeError::Other(e.to_string()))?;
         let started = Instant::now();
-        let result = self.health_probe(&inst, &client).await;
+        let (result, deploy_alive) = self.health_probe(&inst, &client).await;
         let latency = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
         let ok = result.is_ok();
         let status = result.as_ref().ok().copied().flatten();
@@ -2069,7 +2141,12 @@ impl Runtime {
         }) {
             return Err(RuntimeError::Other("instance changed during health check".into()));
         }
-        if state == HealthState::Failing {
+        if self
+            .deploy_liveness(&inst, &actor, generation, deploy_alive)
+            .await
+        {
+            // The crash transition and retry are handled by deploy_liveness.
+        } else if state == HealthState::Failing && deploy_alive != Some(false) {
             self.event(id, &actor, generation, Event::HealthFailed);
         } else if ok {
             self.event(id, &actor, generation, Event::HealthRecovered);
