@@ -90,25 +90,29 @@ pub async fn run(args: DaemonArgs) -> Result<(), String> {
     run_until(args, shutdown).await
 }
 
+fn set_dev_defaults(env: &mut BTreeMap<String, String>, home: &std::path::Path) {
+    let root = home.join(".local/share/lantern-dev");
+    for (name, path) in [
+        ("LANTERN_CONFIG_DIR", root.join("config")),
+        ("LANTERN_STATE_DIR", root.join("state")),
+        ("LANTERN_DATA_DIR", root.clone()),
+        ("LANTERN_CACHE_DIR", root.join("cache")),
+    ] {
+        env.entry(name.into())
+            .or_insert_with(|| path.to_string_lossy().into_owned());
+    }
+    env.entry("LANTERN_DAEMON_PORT".into())
+        .or_insert_with(|| "4778".into());
+    env.entry("LANTERN_TLD".into()).or_insert_with(|| "glow2".into());
+}
+
 /// Run an in-process daemon until the supplied cancellation token is cancelled.
 pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<(), String> {
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let mut env: BTreeMap<String, String> = args.environment.unwrap_or_else(|| std::env::vars().collect());
     let home = PathBuf::from(env.get("HOME").ok_or("HOME must be set for daemon startup")?);
     if args.dev {
-        let root = home.join(".local/share/lantern-dev");
-        for (name, path) in [
-            ("LANTERN_CONFIG_DIR", root.join("config")),
-            ("LANTERN_STATE_DIR", root.join("state")),
-            ("LANTERN_DATA_DIR", root.join("data")),
-            ("LANTERN_CACHE_DIR", root.join("cache")),
-        ] {
-            env.entry(name.into())
-                .or_insert_with(|| path.to_string_lossy().into_owned());
-        }
-        env.entry("LANTERN_DAEMON_PORT".into())
-            .or_insert_with(|| "4778".into());
-        env.entry("LANTERN_TLD".into()).or_insert_with(|| "glow2".into());
+        set_dev_defaults(&mut env, &home);
     }
     let dirs = Dirs::from_env(&env)?;
     let settings_override = args.settings.is_some();
@@ -541,4 +545,20 @@ fn notify_systemd(address: &str, message: &[u8]) -> std::io::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn notify_systemd(_: &str, _: &[u8]) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod dev_tests {
+    use super::*;
+
+    #[test]
+    fn app_dev_data_defaults_and_explicit_override() {
+        let home = std::path::Path::new("/home/test");
+        let mut env = BTreeMap::new();
+        set_dev_defaults(&mut env, home);
+        assert_eq!(env["LANTERN_DATA_DIR"], "/home/test/.local/share/lantern-dev");
+        env.insert("LANTERN_DATA_DIR".into(), "/custom/data".into());
+        set_dev_defaults(&mut env, home);
+        assert_eq!(env["LANTERN_DATA_DIR"], "/custom/data");
+    }
 }

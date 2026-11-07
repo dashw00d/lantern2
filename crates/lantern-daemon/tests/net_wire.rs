@@ -70,6 +70,10 @@ async fn net_wire_missing_caddy_preserves_plan_and_discovers_installed_binary() 
     std::fs::write(&path_binary, "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&path_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
+        network::resolve_caddy("", &dirs.data, path_binary.parent().unwrap().to_str().unwrap()),
+        Some(executable.clone())
+    );
+    assert_eq!(
         network::resolve_caddy(path_binary.to_str().unwrap(), &dirs.data, ""),
         Some(path_binary.clone())
     );
