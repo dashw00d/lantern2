@@ -775,7 +775,7 @@ async fn system_step_dispatch_propagates_failure_without_elevation() {
         fn execute(&self, command: &lantern_cli::SystemCommand) -> Result<Value, String> {
             assert!(matches!(
                 command,
-                lantern_cli::SystemCommand::InitSystem { uid: 1234 }
+                lantern_cli::SystemCommand::InitSystem { uid: Some(1234), .. }
             ));
             Ok(json!({"system_steps":[{"id":"dns", "state":"Failed", "detail":"fixture"}]}))
         }
@@ -838,5 +838,52 @@ async fn doctor_and_init_render_human_or_one_json_document() {
             assert!(text.contains("User steps:\n  ca: Changed — created"), "{text}");
             assert!(text.contains("System steps:\n  ports: Pending"));
         }
+    }
+}
+
+#[tokio::test]
+async fn init_port_strategy_and_root_fallback_cli_are_forwarded() {
+    use lantern_cli::args::PortMode;
+    struct FakeSystem;
+    impl lantern_cli::SystemActions for FakeSystem {
+        fn execute(&self, command: &lantern_cli::SystemCommand) -> Result<Value, String> {
+            match command {
+                lantern_cli::SystemCommand::Init {
+                    ports: PortMode::Sysctl,
+                    ..
+                }
+                | lantern_cli::SystemCommand::Init {
+                    ports: PortMode::Setcap,
+                    ..
+                }
+                | lantern_cli::SystemCommand::InitSystem {
+                    uid: None,
+                    ports: PortMode::Sysctl,
+                    from_package: false,
+                }
+                | lantern_cli::SystemCommand::InitSystem {
+                    uid: None,
+                    ports: PortMode::Sysctl,
+                    from_package: true,
+                } => (),
+                other => panic!("unexpected init parameters: {other:?}"),
+            }
+            Ok(json!({"system_steps":[]}))
+        }
+    }
+    for args in [
+        &["lantern", "init", "--yes"][..],
+        &["lantern", "init", "--yes", "--ports=setcap"][..],
+        &["lantern", "init", "--system-steps"][..],
+        &["lantern", "init", "--system-steps", "--from-package"][..],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert!(matches!(
+            dispatch(cli, &FakeSystem, &mut out, &mut err, false).await,
+            CliAction::Exit(0)
+        ));
+        assert!(err.is_empty());
     }
 }

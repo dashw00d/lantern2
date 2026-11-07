@@ -409,13 +409,20 @@ async fn execute(ctx: &mut Context<'_>, system: &dyn SystemActions) -> Result<Op
             yes,
             system_steps,
             uid,
+            ports,
+            from_package,
         } => {
             let command = if *system_steps {
                 SystemCommand::InitSystem {
-                    uid: uid.expect("clap requires uid"),
+                    uid: *uid,
+                    ports: *ports,
+                    from_package: *from_package,
                 }
             } else {
-                SystemCommand::Init { yes: *yes }
+                SystemCommand::Init {
+                    yes: *yes,
+                    ports: *ports,
+                }
             };
             run_system(system, command).map(Some)
         }

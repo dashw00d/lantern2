@@ -375,7 +375,14 @@ pub fn plan_system_steps(ctx: &SystemInitCtx<'_>) -> Result<Vec<StepReport>, Str
         state: step.check(),
         needs_root: step.needs_root(),
     };
-    let mut steps = vec![report(&ports), report(&dns)];
+    let mut steps = vec![
+        StepReport {
+            id: ports.id(),
+            state: ports.configuration_check(),
+            needs_root: ports.needs_root(),
+        },
+        report(&dns),
+    ];
     if ctx.from_package {
         steps.push(StepReport {
             id: "system_trust",
@@ -427,7 +434,12 @@ pub fn run_init(user: &InitCtx<'_>, system: &SystemInitCtx<'_>) -> Result<InitPl
         .iter()
         .any(|s| matches!(s.state, StepState::Pending(_)));
     let pkexec = if !any_failed && pending {
-        Some(pkexec_invocation(user.executable, system.uid)?)
+        let mut command = pkexec_invocation(user.executable, system.uid)?;
+        command.args.push("--json".into());
+        if system.port_strategy == PortStrategy::Setcap {
+            command.args.push("--ports=setcap".into());
+        }
+        Some(command)
     } else {
         None
     };
@@ -436,6 +448,63 @@ pub fn run_init(user: &InitCtx<'_>, system: &SystemInitCtx<'_>) -> Result<InitPl
         system_steps,
         pkexec,
     })
+}
+
+/// Execute a pending root plan through the injected runner and recheck its results.
+pub fn complete_init(system: &SystemInitCtx<'_>, plan: &InitPlan) -> Result<Vec<StepReport>, String> {
+    let Some(mut command) = plan.pkexec.clone() else {
+        return Ok(plan.system_steps.clone());
+    };
+    for key in [
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env.insert(key.into(), value);
+        }
+    }
+    command.fake_root = system.paths.fake_root.is_some();
+    let fallback = format!(
+        "sudo lantern init --system-steps --uid {}{}",
+        system.uid,
+        if system.port_strategy == PortStrategy::Setcap {
+            " --ports=setcap"
+        } else {
+            ""
+        }
+    );
+    let result = system
+        .runner
+        .run(&command)
+        .map_err(|e| format!("could not run pkexec: {e}; run {fallback}"))?;
+    if !result.success {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        return Err(format!(
+            "root setup failed{}; run {fallback}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    let steps = plan_system_steps(system)?;
+    if steps
+        .iter()
+        .any(|step| matches!(step.state, StepState::Pending(_) | StepState::Failed(_)))
+    {
+        return Err(format!("root setup did not pass its recheck; run {fallback}"));
+    }
+    Ok(steps)
 }
 
 /// Undo installed root files, optionally removing the system trust anchor.

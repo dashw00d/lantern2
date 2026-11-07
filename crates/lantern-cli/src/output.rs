@@ -240,23 +240,23 @@ pub(crate) fn doctor(checks: &[serde_json::Value]) -> String {
                 clean(title, false),
                 clean(detail, false)
             ));
-            if matches!(status, "warn" | "fail") {
-                if let Some(fix) = check.get("fix").and_then(serde_json::Value::as_object) {
-                    let description = fix
-                        .get("description")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let command = fix
-                        .get("command")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    if !description.is_empty() || !command.is_empty() {
-                        text.push_str(&format!("    fix: {}", clean(description, false)));
-                        if !command.is_empty() {
-                            text.push_str(&format!(" — {}", clean(command, false)));
-                        }
-                        text.push('\n');
+            if matches!(status, "warn" | "fail")
+                && let Some(fix) = check.get("fix").and_then(serde_json::Value::as_object)
+            {
+                let description = fix
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let command = fix
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if !description.is_empty() || !command.is_empty() {
+                    text.push_str(&format!("    fix: {}", clean(description, false)));
+                    if !command.is_empty() {
+                        text.push_str(&format!(" — {}", clean(command, false)));
                     }
+                    text.push('\n');
                 }
             }
         }
