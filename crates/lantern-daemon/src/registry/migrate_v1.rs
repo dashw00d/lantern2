@@ -483,6 +483,35 @@ fn prepare(reg: &RegistryHandle, from: &Path, dirs: &Dirs, force: bool) -> Resul
             false
         }
     });
+    let profile = profile.and_then(|name| match reg.active_profile() {
+        None => {
+            action(
+                &mut plan,
+                ActionKind::Added,
+                "active_profile",
+                Some(format!("activate {name}")),
+            );
+            Some(name)
+        }
+        Some(existing) if existing == name => {
+            action(
+                &mut plan,
+                ActionKind::AlreadyPresent,
+                "active_profile",
+                Some(name),
+            );
+            None
+        }
+        Some(existing) => {
+            action(
+                &mut plan,
+                ActionKind::Skipped,
+                "active_profile",
+                Some(format!("existing profile {existing} retained")),
+            );
+            None
+        }
+    });
     let tld = settings.get("tld").and_then(Value::as_str).unwrap_or("glow");
     let snapshot = reg.state_snapshot();
     let mut known = snapshot.projects;

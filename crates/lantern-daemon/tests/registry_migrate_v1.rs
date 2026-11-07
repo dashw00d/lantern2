@@ -102,6 +102,11 @@ async fn registry_migrate_v1_dry_run_apply_repeat_and_force() {
             .iter()
             .any(|a| a.what == "lantern" && a.kind == ActionKind::Skipped)
     );
+    assert!(
+        dry.actions
+            .iter()
+            .any(|a| a.what == "active_profile" && a.kind == ActionKind::Added)
+    );
     assert!(registry.state_snapshot().projects.is_empty());
     assert!(!t.dirs().config.join("profiles/custom.yaml").exists());
     assert_eq!(
