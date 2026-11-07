@@ -12,7 +12,7 @@ use std::{
     collections::BTreeMap,
     os::unix::fs::PermissionsExt,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -43,14 +43,17 @@ async fn net_caddy_fake_admin_persists_only_accepted_configs() {
     let listener = UnixListener::bind(&socket).unwrap();
     let reject = Arc::new(AtomicBool::new(false));
     let posts = Arc::new(AtomicUsize::new(0));
+    let current = Arc::new(Mutex::new("{}".to_owned()));
     let server = tokio::spawn({
         let reject = reject.clone();
         let posts = posts.clone();
+        let current = current.clone();
         async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let reject = reject.clone();
                 let posts = posts.clone();
+                let current = current.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -85,9 +88,13 @@ async fn net_caddy_fake_admin_persists_only_accepted_configs() {
                         posts.fetch_add(1, Ordering::SeqCst);
                     }
                     let (status, body) = if is_post && reject.load(Ordering::SeqCst) {
-                        ("400 Bad Request", "address already in use")
+                        ("400 Bad Request", "address already in use".to_owned())
+                    } else if is_post {
+                        *current.lock().unwrap() =
+                            String::from_utf8(request[header_end..header_end + length].to_vec()).unwrap();
+                        ("200 OK", "{}".to_owned())
                     } else {
-                        ("200 OK", "{}")
+                        ("200 OK", current.lock().unwrap().clone())
                     };
                     let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -145,6 +152,9 @@ async fn net_caddy_fake_admin_persists_only_accepted_configs() {
     );
     assert_eq!(caddy.apply(&empty).await.unwrap(), ApplyOutcome::Unchanged);
     assert_eq!(posts.load(Ordering::SeqCst), 1);
+    *current.lock().unwrap() = "{}".into();
+    assert_eq!(caddy.apply(&empty).await.unwrap(), ApplyOutcome::Applied);
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
     reject.store(true, Ordering::SeqCst);
     let changed = RoutePlan {
         routes: vec![Route {

@@ -108,10 +108,18 @@ fn selected(instance: &Instance, auto_adopt: bool) -> Target {
             tls: false,
         };
     }
-    let root = instance
-        .checkout
-        .path
-        .join(instance.manifest.root.as_deref().unwrap_or("."));
+    let relative_root = std::path::Path::new(instance.manifest.root.as_deref().unwrap_or("."));
+    if matches!(instance.manifest.serve, ServeMode::Php | ServeMode::Static)
+        && relative_root.components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Target::Down;
+    }
+    let root = instance.checkout.path.join(relative_root);
     let target = match instance.manifest.serve {
         ServeMode::Php => Some(RouteTarget::Php(root)),
         ServeMode::Static => Some(RouteTarget::Static(root)),

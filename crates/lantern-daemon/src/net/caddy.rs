@@ -170,7 +170,7 @@ async fn request(
             .await
             .map_err(|e| NetError::Unavailable(e.to_string()))?;
         let status = response.status();
-        let bytes = Limited::new(response.into_body(), 65536)
+        let bytes = Limited::new(response.into_body(), 16 * 1024 * 1024)
             .collect()
             .await
             .map_err(|e| NetError::Unavailable(e.to_string()))?
@@ -284,7 +284,11 @@ impl Caddy {
         if state.json.as_deref() == Some(&text)
             && request(&self.cfg.render.admin_socket, "GET", "/config/", String::new())
                 .await
-                .is_ok_and(|(s, _)| s.is_success())
+                .is_ok_and(|(s, body)| {
+                    s.is_success()
+                        && serde_json::from_str::<serde_json::Value>(&body)
+                            .is_ok_and(|current| current == value)
+                })
         {
             return Ok(ApplyOutcome::Unchanged);
         }

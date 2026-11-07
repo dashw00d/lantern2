@@ -144,6 +144,13 @@ fn net_route_d9_statuses_adoption_and_collisions() {
     assert!(
         matches!(target(&plan,"app.glow"),Target::Live{target:RouteTarget::Php(p),..} if p==&PathBuf::from("/checkout/public"))
     );
+    Arc::make_mut(&mut app.manifest).root = Some("../../outside".into());
+    let invalid = build_plan(&PlanInput {
+        instances: &[app.clone()],
+        tld: "glow",
+        auto_adopt: false,
+    });
+    assert_eq!(target(&invalid, "app.glow"), &Target::Down);
     let mut other = instance("other");
     other.domain = app.domain.clone();
     let mut bad = instance("bad");
@@ -212,5 +219,64 @@ async fn net_router_debounces_keeps_desired_state_and_retries() {
     tokio::time::sleep(Duration::from_millis(1400)).await;
     assert!(router.flush().await.is_ok());
     assert!(router.php_ready().await.is_err());
+    cancel.cancel();
+}
+
+#[derive(Debug)]
+struct SlowApply {
+    plans: Mutex<Vec<RoutePlan>>,
+    started: tokio::sync::Notify,
+    gate: tokio::sync::Semaphore,
+}
+
+impl RouteApplier for SlowApply {
+    fn apply<'a>(&'a self, plan: &'a RoutePlan) -> ApplyFuture<'a> {
+        Box::pin(async move {
+            let first = {
+                let mut plans = self.plans.lock().unwrap();
+                plans.push(plan.clone());
+                plans.len() == 1
+            };
+            if first {
+                self.started.notify_one();
+                self.gate.acquire().await.unwrap().forget();
+            }
+            Ok(())
+        })
+    }
+}
+#[tokio::test]
+async fn net_router_reapplies_changes_arriving_during_reload() {
+    let slow = Arc::new(SlowApply {
+        plans: Mutex::new(Vec::new()),
+        started: tokio::sync::Notify::new(),
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let cancel = CancellationToken::new();
+    let router = NetRouter::new(
+        slow.clone(),
+        "glow".into(),
+        false,
+        "/missing/fpm".into(),
+        cancel.clone(),
+    );
+    let mut app = instance("app");
+    app.runtime.status = InstanceStatus::Starting;
+    router.replace_instances(vec![app.clone()]);
+    tokio::time::timeout(Duration::from_secs(2), slow.started.notified())
+        .await
+        .unwrap();
+    app.runtime.status = InstanceStatus::Running;
+    app.runtime.upstream = Some("127.0.0.1:39730".parse().unwrap());
+    router.replace_instances(vec![app]);
+    slow.gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), router.flush())
+        .await
+        .unwrap()
+        .unwrap();
+    let plans = slow.plans.lock().unwrap();
+    assert_eq!(plans.len(), 2);
+    assert_eq!(target(&plans[0], "app.glow"), &Target::Down);
+    assert!(matches!(target(&plans[1], "app.glow"), Target::Live { .. }));
     cancel.cancel();
 }
