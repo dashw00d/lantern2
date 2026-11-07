@@ -31,7 +31,7 @@ pub struct RenderCtx {
 }
 
 fn gateway(ctx: &RenderCtx, page: bool) -> Value {
-    let mut set = json!({"Host": [ctx.gateway.to_string()]});
+    let mut set = json!({"Host": [ctx.gateway.to_string()], "X-Forwarded-Host": ["{http.request.hostport}"]});
     if page {
         set["X-Lantern-Orig-Uri"] = json!(["{http.request.orig_uri}"]);
         set["X-Lantern-Error-Status"] = json!(["{http.error.status_code}"]);

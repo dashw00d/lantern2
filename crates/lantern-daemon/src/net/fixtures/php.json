@@ -50,6 +50,9 @@
                           "Host": [
                             "127.0.0.1:39701"
                           ],
+                          "X-Forwarded-Host": [
+                            "{http.request.hostport}"
+                          ],
                           "X-Lantern-Error-Status": [
                             "{http.error.status_code}"
                           ],
@@ -97,6 +100,9 @@
                               "set": {
                                 "Host": [
                                   "127.0.0.1:39701"
+                                ],
+                                "X-Forwarded-Host": [
+                                  "{http.request.hostport}"
                                 ]
                               }
                             }
@@ -245,6 +251,9 @@
                               "set": {
                                 "Host": [
                                   "127.0.0.1:39701"
+                                ],
+                                "X-Forwarded-Host": [
+                                  "{http.request.hostport}"
                                 ]
                               }
                             }
@@ -279,6 +288,9 @@
                               "set": {
                                 "Host": [
                                   "127.0.0.1:39701"
+                                ],
+                                "X-Forwarded-Host": [
+                                  "{http.request.hostport}"
                                 ],
                                 "X-Lantern-Error-Status": [
                                   "{http.error.status_code}"
@@ -324,6 +336,9 @@
                               "set": {
                                 "Host": [
                                   "127.0.0.1:39701"
+                                ],
+                                "X-Forwarded-Host": [
+                                  "{http.request.hostport}"
                                 ]
                               }
                             }
@@ -372,6 +387,9 @@
                               "set": {
                                 "Host": [
                                   "127.0.0.1:39701"
+                                ],
+                                "X-Forwarded-Host": [
+                                  "{http.request.hostport}"
                                 ]
                               }
                             }
@@ -410,6 +428,9 @@
                       "set": {
                         "Host": [
                           "127.0.0.1:39701"
+                        ],
+                        "X-Forwarded-Host": [
+                          "{http.request.hostport}"
                         ],
                         "X-Lantern-Error-Status": [
                           "{http.error.status_code}"
