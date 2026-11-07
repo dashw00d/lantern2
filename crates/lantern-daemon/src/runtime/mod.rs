@@ -20,3 +20,11 @@ pub mod state_machine;
 
 /// Consumer-defined integration seams.
 pub mod seams;
+
+/// Live runtime facade and supervisor operations.
+pub mod facade;
+
+pub use facade::{
+    EnvReport, HistoryQuery, ReconcileReport, Runtime, RuntimeConfig, RuntimeError, RuntimeOperation,
+    StartOpts, StopOpts,
+};
