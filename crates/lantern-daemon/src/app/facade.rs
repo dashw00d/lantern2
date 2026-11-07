@@ -963,12 +963,23 @@ impl DaemonFacade for AppFacade {
                 remote: None,
                 pr_trust: None,
             };
-            let result = match app.instances_service.run_branch(req, &op).await {
+            let result = match app.instances_service.run_branch_unprepared(req, &op).await {
                 Ok(result) => {
                     let created = matches!(result.outcome, Outcome::CreatedWorktree(_));
                     let instance = result.instance;
-                    if result.start {
-                        match app.enqueue(instance.clone(), Action::Start, None) {
+                    let status = app.view(&instance).map(|v| v.runtime.status);
+                    let action = if result.start {
+                        Some(Action::Start)
+                    } else if status
+                        .is_ok_and(|s| matches!(s, InstanceStatus::Running | InstanceStatus::Unhealthy))
+                    {
+                        None
+                    } else {
+                        Some(Action::Prepare(false))
+                    };
+                    if let Some(action) = action {
+                        op.step(if result.start { "Starting" } else { "Preparing" });
+                        match app.enqueue(instance.clone(), action, None) {
                             Ok(ticket) => {
                                 let cancel = op.cancel_token();
                                 let result = tokio::select! {
@@ -980,9 +991,9 @@ impl DaemonFacade for AppFacade {
                                         Ok(json!({"instance":instance, "created":created}))
                                     }
                                     Some(done) => Err(done.error.unwrap_or_else(|| {
-                                        error("operation_failed", "start did not complete")
+                                        error("operation_failed", "checkout operation did not complete")
                                     })),
-                                    None => Err(error("operation_failed", "start operation disappeared")),
+                                    None => Err(error("operation_failed", "checkout operation disappeared")),
                                 }
                             }
                             Err(e) => Err(e),

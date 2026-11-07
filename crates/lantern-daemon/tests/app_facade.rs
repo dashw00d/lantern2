@@ -1,5 +1,8 @@
 use lantern_core::{
-    api::{OperationStatus, PatchProjectRequest, PrepareRequest, RegisterProjectRequest, ReloadRequest},
+    api::{
+        CreateInstanceRequest, OperationStatus, PatchProjectRequest, PrepareRequest, RegisterProjectRequest,
+        ReloadRequest, RunTarget,
+    },
     detect::Templates,
     dirs::Dirs,
     ids::InstanceId,
@@ -371,6 +374,66 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
             .port_leases
             .contains_key(&InstanceId::primary(&renamed))
     );
+    let repo = temp.0.join("git-project");
+    fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    fs::write(
+        repo.join("lantern.yaml"),
+        "id: gitapp\ntype: proxy\nrun: {cmd: 'python3 -m http.server ${PORT}'}\n",
+    )
+    .unwrap();
+    run_git(&repo, &["add", "lantern.yaml"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let project = app
+        .register_project(RegisterProjectRequest {
+            path: repo,
+            id: None,
+            name: None,
+            enabled: None,
+            overrides: None,
+            write_manifest: false,
+        })
+        .await
+        .unwrap();
+    let branch = app
+        .run_branch(
+            project.project.id,
+            CreateInstanceRequest {
+                target: RunTarget::NewBranch {
+                    name: "feature".into(),
+                    base: None,
+                },
+                fetch: false,
+                start: false,
+                pin: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    let result = tracker.wait(&branch.id, Duration::from_secs(20)).await.unwrap();
+    assert_eq!(result.status, OperationStatus::Succeeded, "{:?}", result.error);
+    let id = InstanceId::parse(result.result.unwrap()["instance"].as_str().unwrap()).unwrap();
+    assert_eq!(id.as_str(), "gitapp@feature");
+    assert!(
+        app.instance(id.clone())
+            .await
+            .unwrap()
+            .checkout
+            .path
+            .starts_with(app.dirs.data.join("worktrees"))
+    );
+    assert!(registry.state_snapshot().port_leases.contains_key(&id));
     fs::create_dir_all(&app.dirs.config).unwrap();
     fs::write(
         app.dirs.config.join("config.toml"),
@@ -395,4 +458,21 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
 
 fn project_id(id: &InstanceId) -> lantern_core::ids::ProjectId {
     id.project()
+}
+
+fn run_git(dir: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
