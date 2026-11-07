@@ -777,6 +777,7 @@ mod tests {
             if let Some(row) = rows.first().filter(|row| row.active == Active::Failed) {
                 assert_eq!(row.exit_kind, ExitCodeKind::Exited);
                 assert_eq!(row.exit_code, Some(3));
+                assert!(row.started_at.is_some(), "missing real start timestamp: {row:?}");
                 break;
             }
             assert!(
