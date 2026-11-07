@@ -6,3 +6,4 @@ pub mod dns;
 pub mod gateway;
 pub mod routes;
 pub mod sync;
+pub mod tls;
