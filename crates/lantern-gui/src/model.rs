@@ -186,7 +186,7 @@ impl Mirror {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use lantern_core::{
         api::{DiagnosticCounts, ManifestSummary},
@@ -200,7 +200,7 @@ mod tests {
     fn project_id() -> ProjectId {
         ProjectId::parse("example").unwrap()
     }
-    fn instance(status: InstanceStatus) -> InstanceView {
+    pub(crate) fn instance(status: InstanceStatus) -> InstanceView {
         let project = project_id();
         InstanceView {
             id: id("example"),
@@ -238,7 +238,7 @@ mod tests {
             },
         }
     }
-    fn project() -> ProjectSummary {
+    pub(crate) fn project() -> ProjectSummary {
         ProjectSummary {
             project: Project {
                 id: project_id(),
@@ -262,7 +262,7 @@ mod tests {
             routing: None,
         }
     }
-    fn hello(boot: &str) -> WireEvent {
+    pub(crate) fn hello(boot: &str) -> WireEvent {
         WireEvent::Hello {
             api_version: 1,
             daemon_version: "2".into(),
