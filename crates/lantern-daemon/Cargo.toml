@@ -30,6 +30,8 @@ percent-encoding = "2"
 serde_urlencoded = "0.7"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
+rmcp = { version = "3.9.0", features = ["server", "macros", "transport-streamable-http-server"] }
+
 [dev-dependencies]
 lantern-client = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
