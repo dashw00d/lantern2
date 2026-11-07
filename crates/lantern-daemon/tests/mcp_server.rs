@@ -231,6 +231,25 @@ fn ticket() -> lantern_daemon::api::facade::OperationTicket {
 }
 #[async_trait]
 impl DaemonFacade for CompleteFake {
+    async fn operation(
+        &self,
+        id: lantern_core::api::OperationId,
+        _: std::time::Duration,
+    ) -> FacadeResult<lantern_core::api::Operation> {
+        Ok(lantern_core::api::Operation {
+            id,
+            kind: lantern_core::api::OperationKind::Start,
+            instance: Some(InstanceId::parse("myapp").unwrap()),
+            status: lantern_core::api::OperationStatus::Succeeded,
+            noop: false,
+            step: None,
+            steps: vec![],
+            created_at: lantern_core::Timestamp::now(),
+            finished_at: Some(lantern_core::Timestamp::now()),
+            error: None,
+            result: None,
+        })
+    }
     async fn projects(&self, f: ProjectFilter) -> FacadeResult<Vec<ProjectSummary>> {
         FakeFacade.projects(f).await
     }
@@ -586,4 +605,79 @@ async fn mcp_upstream_http_redirect_and_response_cap() {
     assert!(result.truncated);
     shutdown.cancel();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn mcp_guard_and_shared_api_jobs() {
+    use lantern_daemon::{
+        api::{self, ApiConfig, ApiState},
+        events::EventBus,
+        operations::OperationTracker,
+    };
+    let bus = EventBus::new();
+    let tracker = OperationTracker::new(bus.clone());
+    let facade: Arc<dyn DaemonFacade> = Arc::new(CompleteFake);
+    let config = McpConfig {
+        api_client: Arc::new(RecordingClient::default()),
+        operations: tracker.clone(),
+        trust_risk_metadata: true,
+        ..Default::default()
+    };
+    let app = api::router_with_mcp(
+        ApiState::new(
+            facade.clone(),
+            bus,
+            tracker.clone(),
+            ApiConfig::new(39800, "glow", "test"),
+        ),
+        mcp::service(facade, config),
+    );
+    let bad = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "evil.test")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(bad).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let bad_origin = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "127.0.0.1:39800")
+        .header("origin", "https://evil.test")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(bad_origin).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let submit = rpc_using(
+        app.clone(),
+        "tools/call",
+        json!({"name":"call_tool_api","arguments":{"tool":"myapp","path":"/ok","async":true}}),
+    )
+    .await;
+    let value: Value =
+        serde_json::from_str(submit["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let id = lantern_core::api::OperationId(value["job_id"].as_str().unwrap().into());
+    let op = tracker
+        .wait(&id, std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(op.kind, lantern_core::api::OperationKind::ApiCall);
+    assert_eq!(op.status, lantern_core::api::OperationStatus::Succeeded);
+    assert!(op.result.is_some());
+    let status = rpc_using(
+        app,
+        "tools/call",
+        json!({"name":"get_operation","arguments":{"operation_id":id}}),
+    )
+    .await;
+    let result: Value =
+        serde_json::from_str(status["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(result["status"], "succeeded");
 }

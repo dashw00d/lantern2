@@ -89,10 +89,19 @@ impl ApiState {
 }
 /// Construct the REST/SSE router with security enforced on every request.
 pub fn router(state: ApiState) -> Router {
+    guarded_router(state, None)
+}
+/// Construct the API router with MCP covered by the same Host and Origin guard.
+pub fn router_with_mcp(state: ApiState, mcp: crate::mcp::McpService) -> Router {
+    guarded_router(state, Some(mcp))
+}
+fn guarded_router(state: ApiState, mcp: Option<crate::mcp::McpService>) -> Router {
     let config = state.config.clone();
-    Router::new()
-        .fallback(dispatch::handle)
-        .with_state(state)
+    let mut routes = Router::new().fallback(dispatch::handle).with_state(state);
+    if let Some(mcp) = mcp {
+        routes = routes.nest_service("/mcp", mcp);
+    }
+    routes
         .layer(middleware::from_fn_with_state(config, guard::check))
         .layer(middleware::from_fn(guard::headers))
 }

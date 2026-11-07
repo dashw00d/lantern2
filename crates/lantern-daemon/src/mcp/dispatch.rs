@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use lantern_core::{
-    api::{CreateInstanceRequest, LogParams, RunTarget},
+    api::{CreateInstanceRequest, LogParams, OperationId, OperationStatus, RunTarget},
     ids::{InstanceId, ProjectId, branch_slug},
     model::{HealthState, HealthSummary, ProjectKind, Stream},
 };
@@ -246,11 +246,20 @@ impl LanternMcp {
             )]),
         }
     }
-    async fn ticket(&self, ticket: OperationTicket, id: Option<&InstanceId>, _wait: u32) -> ToolResult {
-        // The facade does not yet expose the shared tracker. Return the ticket immediately;
-        // integration must supply operation lookup and bounded waits through that facade.
+    async fn ticket(&self, ticket: OperationTicket, id: Option<&InstanceId>, wait: u32) -> ToolResult {
+        let op = self
+            .facade
+            .operation(ticket.id.clone(), Duration::from_secs(u64::from(wait)))
+            .await
+            .map_err(failure)?;
+        if op.status == OperationStatus::Failed {
+            return Err(op.error.map_or_else(|| "operation failed".into(), |e| failure(e)));
+        }
+        if op.status == OperationStatus::Cancelled {
+            return Err("operation cancelled".into());
+        }
         Ok(
-            json!({"status":"in_progress", "operation_id":ticket.id, "instance":id, "message":"Use get_operation to check progress."}),
+            json!({"status":op.status, "operation_id":op.id, "instance":op.instance.as_ref().or(id), "result":op.result, "noop":op.noop}),
         )
     }
     async fn dispatch(&self, name: &str, a: &Value) -> ToolResult {
@@ -458,11 +467,14 @@ impl LanternMcp {
                     .await
             }
             "get_operation" => {
-                let id = field(a, "operation_id").unwrap_or_default();
-                if !id.starts_with("mcp-job-") {
-                    return Err("Lifecycle operation lookup is unavailable until the daemon facade is wired to its operation tracker. The operation continues independently.".into());
-                }
-                self.job_result(id, false).await
+                let id = OperationId(field(a, "operation_id").unwrap_or_default().into());
+                let wait = Duration::from_secs(u64::from(num(a, "wait_seconds", 0, 55)));
+                let op = if let Some(op) = self.api.tracker.wait(&id, wait).await {
+                    op
+                } else {
+                    self.facade.operation(id, wait).await.map_err(failure)?
+                };
+                json_value(op)
             }
             "get_job_result" => {
                 self.job_result(field(a, "job_id").unwrap_or_default(), true)

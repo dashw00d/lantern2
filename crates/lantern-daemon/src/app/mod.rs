@@ -379,21 +379,54 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     {
         tracing::warn!(%error, "systemd readiness notification failed");
     }
-    let api_state = ApiState::new(
-        facade.clone(),
-        bus,
-        tracker.clone(),
-        ApiConfig::new(settings.daemon.port, settings.domains.tld, boot_id),
-    );
+    let mut api_config = ApiConfig::new(settings.daemon.port, settings.domains.tld.clone(), boot_id);
+    if settings.proxy.https_port != 443 {
+        api_config.gateway_port = Some(settings.proxy.https_port);
+    }
+    let api_state = ApiState::new(facade.clone(), bus, tracker.clone(), api_config);
     let gateway = crate::net::gateway::router(crate::net::gateway::GatewayState {
-        backend: Arc::new(gateway::GatewayAdapter::new(router, registry.clone(), facade)),
+        backend: Arc::new(gateway::GatewayAdapter::new(
+            router,
+            registry.clone(),
+            facade.clone(),
+        )),
         daemon_port: settings.daemon.port,
         https_port: settings.proxy.https_port,
         root_cert: net_paths.root_cert,
     });
-    let result = api::serve(listener, api::router(api_state).merge(gateway), shutdown.clone())
-        .await
-        .map_err(|e| e.to_string());
+    let policy = crate::mcp::upstream::UpstreamPolicy {
+        tld: settings.domains.tld.clone(),
+        allowed_hosts: settings.mcp.allowed_upstream_hosts.clone(),
+        infra_ports: vec![
+            settings.daemon.port,
+            settings
+                .dns
+                .listen
+                .parse::<std::net::SocketAddrV4>()
+                .map_or(5354, |addr| addr.port()),
+            2019,
+            settings.proxy.http_port,
+            settings.proxy.https_port,
+        ],
+    };
+    let mcp = crate::mcp::service(
+        facade.clone(),
+        crate::mcp::McpConfig {
+            shutdown: shutdown.clone(),
+            operations: tracker.clone(),
+            upstream_policy: policy,
+            trust_risk_metadata: true,
+            allow_critical_calls: settings.mcp.allow_critical_calls,
+            ..Default::default()
+        },
+    );
+    let result = api::serve(
+        listener,
+        api::router_with_mcp(api_state, mcp).merge(gateway),
+        shutdown.clone(),
+    )
+    .await
+    .map_err(|e| e.to_string());
     if let Some(address) = env.get("NOTIFY_SOCKET")
         && let Err(error) = notify_systemd(address, b"STOPPING=1")
     {
