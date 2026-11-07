@@ -11,3 +11,8 @@ workspace = true
 [dependencies]
 lantern-core = { workspace = true }
 lantern-cli = { workspace = true }
+lantern-daemon = { workspace = true }
+lantern-system = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "signal"] }
+rustix = { version = "1", features = ["process"] }

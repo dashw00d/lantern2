@@ -86,6 +86,12 @@ fn unavailable() -> ApiError {
 /// Optional/default methods report unavailable until the controller wires that subsystem.
 #[async_trait]
 pub trait DaemonFacade: Send + Sync + 'static {
+    /// Track state-stream interest for discovery scheduling.
+    fn listener_interest(&self, _active: bool) {}
+    /// Read or wait for a tracked operation, shared by REST and MCP.
+    async fn operation(&self, _id: OperationId, _wait: std::time::Duration) -> FacadeResult<Operation> {
+        Err(unavailable())
+    }
     /// List projects.
     async fn projects(&self, _filter: ProjectFilter) -> FacadeResult<Vec<ProjectSummary>> {
         Err(unavailable())
@@ -308,6 +314,18 @@ pub trait DaemonFacade: Send + Sync + 'static {
     }
     /// Reload settings.
     async fn reload_settings(&self) -> FacadeResult<Value> {
+        Err(unavailable())
+    }
+    /// Read the last captured shell environment metadata.
+    async fn environment(&self) -> FacadeResult<Value> {
+        Err(unavailable())
+    }
+    /// Capture shell environment again.
+    async fn refresh_environment(&self) -> FacadeResult<Value> {
+        Err(unavailable())
+    }
+    /// Inspect or apply safe worktree GC after an explicit POST.
+    async fn worktree_gc(&self, _id: ProjectId, _apply: bool, _fetch: bool) -> FacadeResult<Value> {
         Err(unavailable())
     }
     /// Read daemon system information.

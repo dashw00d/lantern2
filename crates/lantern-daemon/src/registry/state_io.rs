@@ -64,6 +64,7 @@ pub fn empty_state() -> StateFile {
 enum Command {
     Dirty(StateFile),
     Flush(oneshot::Sender<Result<(), String>>),
+    Shutdown(oneshot::Sender<Result<(), String>>),
 }
 
 /// Handle to the single writer. Send snapshots in mutation order, then flush at barriers.
@@ -112,6 +113,15 @@ impl StateIo {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Command::Flush(tx))
+            .map_err(|_| "state writer stopped".to_string())?;
+        rx.await.map_err(|_| "state writer stopped".to_string())?
+    }
+
+    /// Flush and release the daemon state lock before an in-process restart.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Shutdown(tx))
             .map_err(|_| "state writer stopped".to_string())?;
         rx.await.map_err(|_| "state writer stopped".to_string())?
     }
@@ -234,10 +244,11 @@ fn write_atomic(path: &Path, state: &StateFile) -> Result<(), String> {
 
 async fn writer(
     path: PathBuf,
-    _lock: File,
+    lock: File,
     mut rx: mpsc::UnboundedReceiver<Command>,
     errors: watch::Sender<Option<String>>,
 ) {
+    let mut lock = Some(lock);
     let mut pending: Option<StateFile> = None;
     let mut first: Option<Instant> = None;
     let mut deadline: Option<Instant> = None;
@@ -256,6 +267,12 @@ async fn writer(
                     let result = persist(&path, &mut pending, &errors);
                     if result.is_ok() { first = None; deadline = None; retrying = false; } else { deadline = Some(Instant::now() + RETRY); retrying = true; }
                     let _ = reply.send(result);
+                }
+                Some(Command::Shutdown(reply)) => {
+                    let result = persist(&path, &mut pending, &errors);
+                    drop(lock.take());
+                    let _ = reply.send(result);
+                    break;
                 }
                 None => { let _ = persist(&path, &mut pending, &errors); break; }
             },

@@ -11,7 +11,10 @@ pub use execute::dispatch;
 
 /// Arguments forwarded to the daemon implementation by the binary.
 #[derive(Debug, Clone, Default)]
-pub struct DaemonArgs {}
+pub struct DaemonArgs {
+    /// Use isolated development defaults.
+    pub dev: bool,
+}
 
 /// Action returned to the single-binary entry point.
 #[derive(Debug)]
@@ -29,6 +32,8 @@ pub enum CliAction {
 pub enum SystemCommand {
     /// Initialize the machine.
     Init { yes: bool },
+    /// Run privileged setup for a validated target uid.
+    InitSystem { uid: u32 },
     /// Run diagnostics.
     Doctor { fix: bool },
     /// Remove system integration.
@@ -52,6 +57,11 @@ impl SystemActions for UnassembledSystem {
 
 /// Parse and run the CLI, returning the process action to the binary.
 pub fn run() -> CliAction {
+    run_with_system(&UnassembledSystem)
+}
+
+/// Parse and run the CLI with a concrete offline system integration.
+pub fn run_with_system(system: &dyn SystemActions) -> CliAction {
     use clap::Parser;
     use std::io::IsTerminal;
     let argv: Vec<_> = std::env::args_os().collect();
@@ -79,7 +89,7 @@ pub fn run() -> CliAction {
     };
     runtime.block_on(dispatch(
         cli,
-        &UnassembledSystem,
+        system,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
         tty,

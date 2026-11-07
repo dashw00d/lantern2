@@ -594,6 +594,22 @@ impl InstanceService {
         req: RunBranchRequest,
         op: &OpHandle,
     ) -> Result<RunBranchResponse, InstanceError> {
+        self.run_branch_inner(req, op, true).await
+    }
+    /// Resolve or create a checkout, leaving preparation to the caller's shared operation gate.
+    pub async fn run_branch_unprepared(
+        &self,
+        req: RunBranchRequest,
+        op: &OpHandle,
+    ) -> Result<RunBranchResponse, InstanceError> {
+        self.run_branch_inner(req, op, false).await
+    }
+    async fn run_branch_inner(
+        &self,
+        req: RunBranchRequest,
+        op: &OpHandle,
+        prepare: bool,
+    ) -> Result<RunBranchResponse, InstanceError> {
         let cancel = op.cancel_token();
         if cancel.is_cancelled() {
             return Err(InstanceError::Cancelled);
@@ -640,7 +656,9 @@ impl InstanceService {
                     };
                     let domain = instance_domain(&p.primary_domain, id.slug());
                     drop(guard);
-                    self.ensure_prepared(&id, false, op).await?;
+                    if prepare {
+                        self.ensure_prepared(&id, false, op).await?;
+                    }
                     return Ok(RunBranchResponse {
                         instance: id,
                         domain,
@@ -849,7 +867,9 @@ impl InstanceService {
         }
         let domain = instance_domain(&p.primary_domain, id.slug());
         drop(guard);
-        self.ensure_prepared(&id, false, op).await?;
+        if prepare {
+            self.ensure_prepared(&id, false, op).await?;
+        }
         Ok(RunBranchResponse {
             instance: id,
             domain,
@@ -901,6 +921,15 @@ impl InstanceService {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Prepared, InstanceError> {
         self.prepare_inner(id, false, cancel, None).await
+    }
+    /// Runtime hook with the supervisor cancellation token and operation progress.
+    pub async fn ensure_ready_with_progress(
+        &self,
+        id: &InstanceId,
+        cancel: tokio_util::sync::CancellationToken,
+        op: &OpHandle,
+    ) -> Result<Prepared, InstanceError> {
+        self.prepare_inner(id, false, cancel, Some(op)).await
     }
     async fn prepare_inner(
         &self,

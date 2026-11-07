@@ -12,7 +12,7 @@ use lantern_core::{
     ids::InstanceId,
 };
 use serde::Deserialize;
-use std::{io, pin::Pin};
+use std::{io, pin::Pin, sync::Arc};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -59,6 +59,13 @@ fn frame(event: WireEvent) -> Result<SseEvent, serde_json::Error> {
         .event(name)
         .data(serde_json::to_string(&event)?))
 }
+struct InterestGuard(Arc<dyn super::facade::DaemonFacade>);
+impl Drop for InterestGuard {
+    fn drop(&mut self) {
+        self.0.listener_interest(false);
+    }
+}
+
 pub(crate) async fn stream(
     state: ApiState,
     query: &str,
@@ -120,7 +127,14 @@ pub(crate) async fn stream(
         .map(frame)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| HttpError::new("internal", "could not serialize event snapshot"))?;
+    let interest = if q.state {
+        state.facade.listener_interest(true);
+        Some(InterestGuard(state.facade.clone()))
+    } else {
+        None
+    };
     let stream = async_stream::stream! {
+        let _interest = interest;
         let _permit = permit;
         for frame in initial { yield Ok::<_, io::Error>(frame); }
         loop {

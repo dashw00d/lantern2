@@ -161,6 +161,11 @@ impl RegistryHandle {
         let io = self.lock().io.clone();
         io.flush().await
     }
+    /// Flush and stop the state writer, releasing its exclusive lock.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let io = self.lock().io.clone();
+        io.shutdown().await
+    }
     /// Subscribe to nonfatal persistence failures and their subsequent recovery.
     pub fn subscribe_write_errors(&self) -> watch::Receiver<Option<String>> {
         self.lock().io.subscribe_errors()
@@ -346,6 +351,102 @@ impl RegistryHandle {
         s.publish_index();
         s.bus.publish(Event::ProjectRemoved { id: id.clone() });
         Ok(())
+    }
+    /// Rename a stopped project and every instance atomically, preserving aliases and leases.
+    pub fn rename_project(
+        &self,
+        old: &ProjectId,
+        new: ProjectId,
+    ) -> Result<Vec<(InstanceId, InstanceId)>, Error> {
+        ProjectId::parse(new.as_str())?;
+        let mut s = self.lock();
+        let mut project = s
+            .file
+            .projects
+            .get(old)
+            .cloned()
+            .ok_or_else(|| Error::ProjectNotFound(old.clone()))?;
+        if &new == old {
+            return Ok(Vec::new());
+        }
+        if s.file
+            .projects
+            .values()
+            .any(|p| p.id != *old && (p.id == new || p.aliases.iter().any(|a| a == new.as_str())))
+        {
+            return Err(Error::Conflict(new.to_string()));
+        }
+        let ids: Vec<_> = s
+            .file
+            .instances
+            .keys()
+            .filter(|id| id.project() == *old)
+            .cloned()
+            .collect();
+        for id in &ids {
+            if s.runtime
+                .get(id)
+                .is_some_and(|r| !matches!(r.status, InstanceStatus::Stopped | InstanceStatus::NeedsConfig))
+            {
+                return Err(Error::Conflict(format!("{id} is not stopped")));
+            }
+        }
+        let pairs = ids
+            .into_iter()
+            .map(|id| {
+                let renamed = match id.slug() {
+                    Some(slug) => InstanceId::derived(&new, slug)?,
+                    None => InstanceId::primary(&new),
+                };
+                Ok((id, renamed))
+            })
+            .collect::<Result<Vec<_>, IdError>>()?;
+        let backup_file = s.file.clone();
+        let backup_runtime = s.runtime.clone();
+        let backup_checkouts = s.checkouts.clone();
+        let backup_manifests = s.manifests.clone();
+        let backup_stale = s.setup_stale.clone();
+        s.file.projects.remove(old);
+        project.id = new.clone();
+        if !project.aliases.iter().any(|a| a == old.as_str()) {
+            project.aliases.push(old.to_string());
+        }
+        s.file.projects.insert(new.clone(), project);
+        for (from, to) in &pairs {
+            let mut record = s.file.instances.remove(from).expect("collected instance");
+            record.project = new.clone();
+            s.file.instances.insert(to.clone(), record);
+            if let Some(value) = s.file.port_leases.remove(from) {
+                s.file.port_leases.insert(to.clone(), value);
+            }
+            if let Some(value) = s.checkouts.remove(from) {
+                s.checkouts.insert(to.clone(), value);
+            }
+            if let Some(value) = s.runtime.remove(from) {
+                s.runtime.insert(to.clone(), value);
+            }
+            s.manifests.remove(from);
+            if let Some(value) = s.setup_stale.remove(from) {
+                s.setup_stale.insert(to.clone(), value);
+            }
+            if let Err(error) = s.resolve_manifest(to) {
+                s.file = backup_file;
+                s.runtime = backup_runtime;
+                s.checkouts = backup_checkouts;
+                s.manifests = backup_manifests;
+                s.setup_stale = backup_stale;
+                return Err(error);
+            }
+        }
+        s.dirty();
+        s.publish_index();
+        s.bus.publish(Event::ProjectRemoved { id: old.clone() });
+        for (from, to) in &pairs {
+            s.bus.publish(Event::InstanceRemoved { id: from.clone() });
+            s.publish_instance(to);
+        }
+        s.publish_project(&new);
+        Ok(pairs)
     }
     /// Insert or replace a project checkout/instance record.
     pub fn upsert_instance(&self, id: InstanceId, record: InstanceRecord) -> Result<(), Error> {
@@ -808,6 +909,7 @@ impl State {
         if let Some(primary) = &primary
             && let Some(new_id) = primary.raw.id.as_ref()
             && new_id != project.id.as_str()
+            && !project.aliases.iter().any(|alias| alias == new_id)
         {
             resolved.diagnostics.push(Diagnostic {
                 severity: Severity::Warning,

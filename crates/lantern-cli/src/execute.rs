@@ -93,7 +93,8 @@ pub async fn dispatch(
     match &cli.command {
         Some(Command::Daemon {
             command: None | Some(DaemonCommand::Run),
-        }) => return CliAction::RunDaemon(crate::DaemonArgs::default()),
+            dev,
+        }) => return CliAction::RunDaemon(crate::DaemonArgs { dev: *dev }),
         Some(Command::Gui(args)) => return CliAction::RunGui(args.clone()),
         _ => {}
     }
@@ -157,8 +158,6 @@ fn needs_daemon(command: Option<&Command>) -> bool {
                 | Command::Init { .. }
                 | Command::Doctor { .. }
                 | Command::Uninstall { .. }
-                | Command::MigrateV1 { .. }
-                | Command::Env { .. }
         ) | Some(Command::Manifest {
             command: ManifestCommand::Check { .. }
         }) | Some(Command::Mcp { .. })
@@ -367,9 +366,50 @@ async fn execute(ctx: &mut Context<'_>, system: &dyn SystemActions) -> Result<Op
         Command::Mcp {
             command: McpCommand::Install { .. },
         } => Err(Failure::unsupported("mcp install is not assembled yet")),
-        Command::MigrateV1 { .. } => Err(Failure::unsupported("migrate-v1 is not assembled yet")),
-        Command::Env { .. } => Err(Failure::unsupported("environment API is not assembled yet")),
-        Command::Init { yes } => run_system(system, SystemCommand::Init { yes: *yes }).map(Some),
+        Command::MigrateV1 {
+            from,
+            dry_run,
+            yes,
+            force,
+        } => {
+            if !dry_run && !yes {
+                return Err(Failure::usage(
+                    "migrate-v1 requires --yes to apply changes; use --dry-run to preview",
+                ));
+            }
+            let result = ctx
+                .client()?
+                .import_v1(api::ImportV1Request {
+                    from: from.clone(),
+                    dry_run: *dry_run,
+                    force: *force,
+                })
+                .await
+                .map_err(|e| ctx.failure(e))?;
+            Ok(Some(Reply::pretty(&result)?))
+        }
+        Command::Env { command } => {
+            let (method, path) = match command {
+                EnvCommand::Show => (reqwest::Method::GET, vec!["api", "system", "env"]),
+                EnvCommand::Refresh => (reqwest::Method::POST, vec!["api", "system", "env", "refresh"]),
+            };
+            let value = auxiliary_request(ctx, method, &path, None).await?;
+            Ok(Some(Reply::pretty(&value)?))
+        }
+        Command::Init {
+            yes,
+            system_steps,
+            uid,
+        } => {
+            let command = if *system_steps {
+                SystemCommand::InitSystem {
+                    uid: uid.expect("clap requires uid"),
+                }
+            } else {
+                SystemCommand::Init { yes: *yes }
+            };
+            run_system(system, command).map(Some)
+        }
         Command::Doctor { fix } => run_system(system, SystemCommand::Doctor { fix: *fix }).map(Some),
         Command::Uninstall { purge_data, yes } => run_system(
             system,
@@ -386,7 +426,9 @@ async fn execute(ctx: &mut Context<'_>, system: &dyn SystemActions) -> Result<Op
             let path = dirs.config.join("config.toml");
             Ok(Some(Reply::value(&path, format!("{}\n", path.display()))?))
         }
-        Command::Daemon { command: Some(cmd) } => daemon_control(cmd, ctx).map(Some),
+        Command::Daemon {
+            command: Some(cmd), ..
+        } => daemon_control(cmd, ctx).map(Some),
         Command::Ls(args) => ls(ctx, args).await.map(Some),
         Command::Status { target: name } => status(ctx, name.as_deref()).await.map(Some),
         Command::On(args) => actions(ctx, &args.targets, &args.wait, Action::Start, args.open)
@@ -529,10 +571,60 @@ async fn execute(ctx: &mut Context<'_>, system: &dyn SystemActions) -> Result<Op
         }
         Command::Services { command } => services(ctx, command.as_ref()).await.map(Some),
         Command::Config { command } => config(ctx, command.as_ref()).await.map(Some),
-        Command::Gui(_) | Command::Daemon { command: None } => {
+        Command::Gui(_) | Command::Daemon { command: None, .. } => {
             unreachable!("process action is dispatched earlier")
         }
     }
+}
+
+async fn auxiliary_request(
+    ctx: &Context<'_>,
+    method: reqwest::Method,
+    path: &[&str],
+    body: Option<Value>,
+) -> Result<Value> {
+    let mut url = reqwest::Url::parse(&ctx.host).map_err(|e| Failure::new(1, "protocol", e.to_string()))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| Failure::new(1, "protocol", "invalid daemon URL"))?;
+        segments.pop_if_empty();
+        for part in path {
+            segments.push(part);
+        }
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| Failure::new(1, "protocol", e.to_string()))?;
+    let mut request = client.request(method.clone(), url);
+    if method == reqwest::Method::POST {
+        request = request.json(&body.unwrap_or_else(|| json!({})));
+    }
+    let response = request.send().await.map_err(|e| {
+        if e.is_connect() {
+            Failure::new(3, "daemon_unreachable", e.to_string())
+        } else if e.is_timeout() {
+            Failure::new(6, "timeout", e.to_string())
+        } else {
+            Failure::new(1, "protocol", e.to_string())
+        }
+    })?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|e| Failure::new(1, "protocol", e.to_string()))?;
+    if !status.is_success() {
+        let error: api::ApiError = serde_json::from_value(value.get("error").cloned().unwrap_or(Value::Null))
+            .map_err(|e| Failure::new(1, "protocol", e.to_string()))?;
+        return Err(Failure {
+            code: crate::error::code_for_api(status.as_u16(), &error.code),
+            error,
+        });
+    }
+    Ok(value)
 }
 
 fn run_system(system: &dyn SystemActions, command: SystemCommand) -> Result<Reply> {
@@ -546,9 +638,23 @@ fn run_system(system: &dyn SystemActions, command: SystemCommand) -> Result<Repl
                 .iter()
                 .any(|check| check.get("status").and_then(Value::as_str) == Some("fail"))
         });
+    let setup_failed = matches!(
+        command,
+        SystemCommand::Init { .. } | SystemCommand::InitSystem { .. }
+    ) && ["user_steps", "system_steps"]
+        .iter()
+        .filter_map(|key| value.get(*key).and_then(Value::as_array))
+        .flatten()
+        .any(|step| {
+            step.get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| state.starts_with("Failed"))
+        });
     let mut result = Reply::pretty(&value)?;
     if failed {
         result.code = 8;
+    } else if setup_failed {
+        result.code = 1;
     }
     Ok(result)
 }
@@ -997,7 +1103,21 @@ async fn worktree(ctx: &mut Context<'_>, command: &WorktreeCommand) -> Result<Re
                 output::instances(std::slice::from_ref(&view), &[], ctx.color),
             )
         }
-        WorktreeCommand::Gc { .. } => Err(Failure::unsupported("worktree GC API is not assembled yet")),
+        WorktreeCommand::Gc {
+            project: name,
+            apply,
+            fetch,
+        } => {
+            let p = project(ctx, &client, name.as_deref()).await?;
+            let value = auxiliary_request(
+                ctx,
+                reqwest::Method::POST,
+                &["api", "projects", p.as_str(), "gc"],
+                Some(json!({"apply":apply, "fetch":fetch})),
+            )
+            .await?;
+            Reply::pretty(&value)
+        }
         WorktreeCommand::Rm {
             target: name,
             force,

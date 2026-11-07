@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 lantern-core = { workspace = true }
+lantern-system = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -34,3 +35,5 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 lantern-client = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
+lantern-cli = { workspace = true }
+clap = { version = "4.6", features = ["derive"] }
