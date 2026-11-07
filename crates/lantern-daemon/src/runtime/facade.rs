@@ -2400,14 +2400,18 @@ impl Runtime {
     }
     /// Read recent journal history for an instance from the configured slice.
     pub async fn log_history(&self, id: &InstanceId, q: HistoryQuery) -> Result<Vec<LogLine>, RuntimeError> {
-        let count = q.limit.min(10000).to_string();
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let count = q.limit.min(10000);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let mut args = vec![
             "--user".to_owned(),
             "--output=json".into(),
             "--all".into(),
             "--no-pager".into(),
-            "--lines".into(),
-            count,
+            "--reverse".into(),
+            "--lines=all".into(),
         ];
         if self.inner.restrict_journal_to_units {
             let mut units = vec![self.inner.config.names.instance(id)];
@@ -2425,10 +2429,35 @@ impl Runtime {
         } else {
             args.push(format!("_SYSTEMD_USER_SLICE={}", self.inner.config.names.slice));
         }
-        let output = tokio::process::Command::new("journalctl")
+        let mut child = tokio::process::Command::new("journalctl")
             .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .output()
+            .spawn()
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        let stdout = child.stdout.take().expect("piped journal stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let mut result = Vec::with_capacity(count);
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| RuntimeError::Other(e.to_string()))?
+        {
+            if let Ok(Some(entry)) = journal::parse_line(&line, &self.inner.config.names)
+                && &entry.line.instance == id
+            {
+                result.push(entry.line);
+                if result.len() == count {
+                    // The newest matching entries have been found; no need to read the rest of the slice.
+                    let _ = child.kill().await;
+                    result.reverse();
+                    return Ok(result);
+                }
+            }
+        }
+        let output = child
+            .wait_with_output()
             .await
             .map_err(|e| RuntimeError::Other(e.to_string()))?;
         if !output.status.success() {
@@ -2436,12 +2465,8 @@ impl Runtime {
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|s| journal::parse_line(s, &self.inner.config.names).ok().flatten())
-            .map(|j| j.line)
-            .filter(|l| &l.instance == id)
-            .collect())
+        result.reverse();
+        Ok(result)
     }
     async fn backfill_unit_logs(&self, id: &InstanceId, unit: &str) -> Result<(), RuntimeError> {
         let limit = self.inner.config.settings.logs.ring_lines.min(10000);

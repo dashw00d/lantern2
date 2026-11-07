@@ -1159,6 +1159,65 @@ async fn runtime_reconcile_unready_unit_uses_elapsed_startup_time() {
 }
 
 #[tokio::test]
+async fn runtime_history_limits_after_filtering_instance() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("LANTERN_HISTORY_FIXTURE_CHILD").is_some() {
+        let temp = Temp::new();
+        let store = Arc::new(Store::default());
+        let id = store.insert("history", &temp.0, "unused", &[]);
+        let rt = runtime(
+            config(&temp),
+            store,
+            Arc::new(FakeProbe(Mutex::new(ProbeMode::Waiting))),
+            Arc::new(FakeSystemd::default()),
+        );
+        let lines = rt
+            .log_history(&id, lantern_daemon::runtime::HistoryQuery { limit: 2 })
+            .await
+            .unwrap();
+        assert_eq!(
+            lines.iter().map(|l| l.line.as_str()).collect::<Vec<_>>(),
+            ["old", "new"]
+        );
+        rt.shutdown_background();
+        return;
+    }
+    let temp = Temp::new();
+    let fake = temp.0.join("journalctl");
+    std::fs::write(&fake, r##"#!/usr/bin/python3
+import json, sys
+rows = [('history', 'old'), ('history', 'new'), ('other', 'noise1'), ('other', 'noise2'), ('other', 'noise3')]
+rows = [json.dumps({'_SYSTEMD_USER_UNIT': 'lantern-test-supervisor-inst-' + name + '.service', 'MESSAGE': line, '__REALTIME_TIMESTAMP': str(i+1), '__CURSOR': str(i+1)}) for i, (name, line) in enumerate(rows)]
+args = sys.argv[1:]
+if '--reverse' in args: rows.reverse()
+limit = None
+for i, arg in enumerate(args):
+    if arg == '--lines': limit = args[i+1]
+    if arg.startswith('--lines='): limit = arg.split('=', 1)[1]
+if limit and limit != 'all': rows = rows[:int(limit)] if '--reverse' in args else rows[-int(limit):]
+print('\n'.join(rows))
+"##).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime_history_limits_after_filtering_instance",
+            "--nocapture",
+        ])
+        .env("LANTERN_HISTORY_FIXTURE_CHILD", "1")
+        .env("PATH", format!("{}:/usr/bin:/bin", temp.0.display()))
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn runtime_captures_and_refreshes_shell_env_when_sources_change() {
     use std::os::unix::fs::PermissionsExt;
     let temp = Temp::new();
