@@ -2,3 +2,6 @@
 
 /// Launcher script generation and toolchain detection.
 pub mod launcher;
+
+/// Login-shell environment capture and cache.
+pub mod shell_env;
