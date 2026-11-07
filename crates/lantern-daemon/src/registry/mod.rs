@@ -944,7 +944,7 @@ impl State {
                 triggers: m.routing.triggers.clone(),
                 risk,
                 requires_confirmation: m.routing.requires_confirmation,
-                max_concurrent: Some(m.routing.max_concurrent),
+                max_concurrent: m.routing.max_concurrent,
                 agents: m.routing.agents.clone(),
             }),
         })

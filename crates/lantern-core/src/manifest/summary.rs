@@ -73,4 +73,30 @@ mod tests {
         // Env values never appear in the summary.
         assert!(!serde_json::to_string(&s).unwrap().contains("hunter2"));
     }
+
+    #[test]
+    fn critical_risk_and_unset_concurrency_survive_resolution() {
+        let parsed = parse_manifest(
+            "id: app\nrouting: {risk: critical}\nendpoints:\n  - {method: POST, path: /wipe, risk: critical}\n",
+            "lantern.yaml",
+        );
+        let r = resolve(ResolveInput {
+            dir_name: "app",
+            is_primary: true,
+            primary: Some(&parsed),
+            checkout: None,
+            overrides: &RawManifest::default(),
+            templates: &NoTemplates,
+            detection: &crate::detect::Detection::default(),
+            settings: &crate::settings::Settings::default(),
+        });
+        assert_eq!(r.routing.risk.as_deref(), Some("critical"));
+        assert_eq!(r.endpoints[0].risk.as_deref(), Some("critical"));
+        assert_eq!(r.routing.max_concurrent, None, "unset means unlimited");
+        assert!(
+            r.diagnostics.iter().all(|d| d.code != "bad_value"),
+            "{:?}",
+            r.diagnostics
+        );
+    }
 }

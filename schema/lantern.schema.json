@@ -240,6 +240,7 @@
             "low",
             "medium",
             "high",
+            "critical",
             null
           ],
           "type": [
@@ -369,6 +370,7 @@
             "low",
             "medium",
             "high",
+            "critical",
             null
           ],
           "type": [

@@ -38,12 +38,12 @@ pub fn manifest_json_schema() -> Value {
     choices(
         &mut schema,
         "/definitions/RoutingSection/properties/risk",
-        &["low", "medium", "high"],
+        &["low", "medium", "high", "critical"],
     );
     choices(
         &mut schema,
         "/definitions/EndpointEntry/properties/risk",
-        &["low", "medium", "high"],
+        &["low", "medium", "high", "critical"],
     );
     schema
 }

@@ -489,7 +489,7 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
         }
         if r.risk
             .as_deref()
-            .is_some_and(|s| !["low", "medium", "high"].contains(&s))
+            .is_some_and(|s| !["low", "medium", "high", "critical"].contains(&s))
         {
             add(
                 Severity::Warning,
@@ -522,7 +522,7 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
             }
             if e.risk
                 .as_deref()
-                .is_some_and(|s| !["low", "medium", "high"].contains(&s))
+                .is_some_and(|s| !["low", "medium", "high", "critical"].contains(&s))
             {
                 add(
                     Severity::Warning,
@@ -837,7 +837,8 @@ pub struct Routing {
     pub triggers: Vec<String>,
     pub risk: Option<String>,
     pub requires_confirmation: bool,
-    pub max_concurrent: u32,
+    /// `None` = unlimited (15 §6.4).
+    pub max_concurrent: Option<u32>,
     pub agents: Vec<String>,
 }
 /// A resolved document reference and its inferred kind.
@@ -1267,9 +1268,9 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
         triggers: routing.triggers.unwrap_or_default(),
         risk: routing
             .risk
-            .filter(|r| ["low", "medium", "high"].contains(&r.as_str())),
+            .filter(|r| ["low", "medium", "high", "critical"].contains(&r.as_str())),
         requires_confirmation: routing.requires_confirmation.unwrap_or(false),
-        max_concurrent: routing.max_concurrent.unwrap_or(1),
+        max_concurrent: routing.max_concurrent,
         agents: routing.agents.unwrap_or_default(),
     };
     let docs = raw
@@ -1296,7 +1297,9 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
             path: e.path,
             description: e.description,
             category: e.category,
-            risk: e.risk.filter(|r| ["low", "medium", "high"].contains(&r.as_str())),
+            risk: e
+                .risk
+                .filter(|r| ["low", "medium", "high", "critical"].contains(&r.as_str())),
             body_hint: e.body_hint,
             params: e.params,
         })
