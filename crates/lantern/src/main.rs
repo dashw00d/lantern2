@@ -25,10 +25,13 @@ fn main() {
                 }
             }
         }
-        lantern_cli::CliAction::RunGui(_) => {
-            eprintln!("GUI is not assembled yet");
-            2
-        }
+        lantern_cli::CliAction::RunGui(args) => match lantern_gui::run(args) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("gui: {error}");
+                1
+            }
+        },
     };
     std::process::exit(code);
 }
