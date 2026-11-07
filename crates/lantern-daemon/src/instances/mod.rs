@@ -49,6 +49,10 @@ pub trait InstanceStore: Send + Sync {
     fn status(&self, id: &InstanceId) -> Result<InstanceStatus, String>;
     /// Obtain the sticky port lease created with the record.
     fn port(&self, id: &InstanceId) -> Result<Option<u16>, String>;
+    /// Publish the derived setup-staleness flag for an instance.
+    fn set_setup_stale(&self, _id: &InstanceId, _stale: bool) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// One setup command, rendered for the shell with values supplied only in the environment.

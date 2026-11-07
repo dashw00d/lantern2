@@ -106,6 +106,7 @@ struct FakeStore {
     manifest: Mutex<Option<Arc<ResolvedManifest>>>,
     statuses: Mutex<BTreeMap<InstanceId, InstanceStatus>>,
     port: Mutex<Option<u16>>,
+    stale: Mutex<BTreeMap<InstanceId, bool>>,
 }
 impl InstanceStore for FakeStore {
     fn project(&self, id: &ProjectId) -> Result<Option<ProjectConfig>, String> {
@@ -157,6 +158,10 @@ impl InstanceStore for FakeStore {
     }
     fn port(&self, _: &InstanceId) -> Result<Option<u16>, String> {
         Ok(*self.port.lock().unwrap())
+    }
+    fn set_setup_stale(&self, id: &InstanceId, stale: bool) -> Result<(), String> {
+        self.stale.lock().unwrap().insert(id.clone(), stale);
+        Ok(())
     }
 }
 #[derive(Default)]
@@ -638,6 +643,24 @@ async fn instances_setup_stale_and_copy_guards() {
     );
     assert_eq!(runner.calls.lock().unwrap().len(), 2);
     op.finish(OpOutcome::Cancelled);
+}
+
+#[tokio::test]
+async fn instances_tick_publishes_stale_without_git_metadata_change() {
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    let common = root.join(".git");
+    service.tick(&common, false).await.unwrap();
+    service.tick(&common, false).await.unwrap();
+    let id = InstanceId::primary(&ProjectId::parse("myapp").unwrap());
+    assert_eq!(store.stale.lock().unwrap().get(&id), Some(&false));
+    let lock = root.join("apps/web/package-lock.json");
+    fs::write(&lock, "changed").unwrap();
+    assert!(!service.tick(&common, false).await.unwrap());
+    assert_eq!(store.stale.lock().unwrap().get(&id), Some(&true));
+    fs::remove_file(lock).unwrap();
+    service.tick(&common, false).await.unwrap();
+    assert_eq!(store.stale.lock().unwrap().get(&id), Some(&false));
 }
 
 #[tokio::test]

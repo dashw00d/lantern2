@@ -230,6 +230,8 @@ impl InstanceService {
             let state = all.entry(common_dir.to_path_buf()).or_default();
             state.fp = fp;
             state.last = Some(Instant::now());
+        } else {
+            self.publish_setup_staleness(common_dir)?;
         }
         Ok(should)
     }
@@ -444,6 +446,36 @@ impl InstanceService {
             }
         }
         self.purge_missing_unlocked(common)?;
+        self.publish_setup_staleness(common)?;
+        Ok(())
+    }
+    fn publish_setup_staleness(&self, common: &Path) -> Result<(), InstanceError> {
+        for (id, record) in self.store.records().map_err(InstanceError::Adapter)? {
+            let Some(project) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+            else {
+                continue;
+            };
+            if !project
+                .project
+                .repo
+                .as_ref()
+                .is_some_and(|repo| repo.common_dir == common)
+                || record.checkout.phase != CheckoutPhase::Ready
+                || !record.checkout.path.is_dir()
+            {
+                continue;
+            }
+            match self.setup_stale(&id) {
+                Ok(stale) => self
+                    .store
+                    .set_setup_stale(&id, stale)
+                    .map_err(InstanceError::Adapter)?,
+                Err(error) => tracing::warn!(%id, %error, "could not calculate setup staleness"),
+            }
+        }
         Ok(())
     }
     fn recover_creating(&self, common: &Path, trees: &[Worktree]) -> Result<(), InstanceError> {
@@ -1218,6 +1250,10 @@ impl InstanceService {
             finished_at: Timestamp::now(),
         });
         self.store.upsert(id, record).map_err(InstanceError::Adapter)?;
+        let stale = self.setup_stale(id)?;
+        self.store
+            .set_setup_stale(id, stale)
+            .map_err(InstanceError::Adapter)?;
         progress(op, "Ready");
         Ok(Prepared {
             manifest,
