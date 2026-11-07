@@ -128,6 +128,9 @@ pub enum Command {
     },
     /// Run or control the daemon.
     Daemon {
+        /// Run with isolated development defaults.
+        #[arg(long)]
+        dev: bool,
         #[command(subcommand)]
         command: Option<DaemonCommand>,
     },

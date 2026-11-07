@@ -314,6 +314,18 @@ pub trait DaemonFacade: Send + Sync + 'static {
     async fn reload_settings(&self) -> FacadeResult<Value> {
         Err(unavailable())
     }
+    /// Read the last captured shell environment metadata.
+    async fn environment(&self) -> FacadeResult<Value> {
+        Err(unavailable())
+    }
+    /// Capture shell environment again.
+    async fn refresh_environment(&self) -> FacadeResult<Value> {
+        Err(unavailable())
+    }
+    /// Inspect or apply safe worktree GC after an explicit POST.
+    async fn worktree_gc(&self, _id: ProjectId, _apply: bool, _fetch: bool) -> FacadeResult<Value> {
+        Err(unavailable())
+    }
     /// Read daemon system information.
     async fn system_info(&self) -> FacadeResult<SystemInfo> {
         Err(unavailable())

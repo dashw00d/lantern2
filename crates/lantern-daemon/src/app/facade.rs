@@ -382,7 +382,7 @@ impl DaemonFacade for AppFacade {
                 "writing a suggested manifest is not supported by registration",
             ));
         }
-        let parsed = manifest::load(&root.join("lantern.yaml"));
+        let parsed = manifest::load(&root);
         let name = request
             .id
             .map(|i| i.to_string())
@@ -1061,6 +1061,69 @@ impl DaemonFacade for AppFacade {
             .ok_or_else(|| error("instance_not_found", format!("instance {id} not found")))?;
         serde_json::to_value(manifest.as_ref()).map_err(internal)
     }
+    async fn environment(&self) -> FacadeResult<Value> {
+        let report = self.runtime.env_report();
+        Ok(json!({"captured_at":report.captured_at, "path":report.path, "warning":report.warning}))
+    }
+    async fn refresh_environment(&self) -> FacadeResult<Value> {
+        let report = self.runtime.refresh_shell_env().await.map_err(runtime_error)?;
+        Ok(json!({"captured_at":report.captured_at, "path":report.path, "warning":report.warning}))
+    }
+    async fn worktree_gc(&self, id: ProjectId, apply: bool, fetch: bool) -> FacadeResult<Value> {
+        let project = self
+            .registry
+            .project(&id)
+            .ok_or_else(|| error("project_not_found", format!("project {id} not found")))?;
+        if fetch {
+            let repo = self.git.repo(
+                project
+                    .repo
+                    .ok_or_else(|| error("bad_request", "project is not a git repository"))?
+                    .common_dir,
+            );
+            let cancel = tokio_util::sync::CancellationToken::new();
+            for remote in repo.remotes().await.map_err(internal)? {
+                repo.fetch(&remote, Duration::from_secs(60), &cancel)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
+        let suggestions = self
+            .instances_service
+            .gc_suggestions(&id, u64::from(self.settings.worktrees.gc_hint_days))
+            .await
+            .map_err(internal)?;
+        let rows: Vec<_> = suggestions.iter().map(|s| json!({"instance":s.instance, "reason":format!("{:?}",s.reason), "action":format!("{:?}",s.action)})).collect();
+        let mut removed = Vec::new();
+        let mut skipped = Vec::new();
+        if apply {
+            for suggestion in suggestions {
+                if suggestion.action != crate::instances::GcAction::Remove {
+                    skipped.push(
+                        json!({"instance":suggestion.instance, "reason":"not a removable managed checkout"}),
+                    );
+                    continue;
+                }
+                match self.enqueue(suggestion.instance.clone(), Action::Remove, Some(RemoveInstanceParams::default())) {
+                    Ok(ticket) => match self.tracker.wait(&ticket.id, Duration::from_secs(600)).await {
+                        Some(op) if op.status == OperationStatus::Succeeded => removed.push(suggestion.instance),
+                        Some(op) => skipped.push(json!({"instance":suggestion.instance,"reason":op.error.map_or_else(|| "operation failed".into(), |e| e.message)})),
+                        None => skipped.push(json!({"instance":suggestion.instance,"reason":"operation disappeared"})),
+                    },
+                    Err(e) => skipped.push(json!({"instance":suggestion.instance,"reason":e.message})),
+                }
+            }
+        }
+        Ok(json!({"suggestions":rows, "removed":removed, "skipped":skipped}))
+    }
+    async fn schema(&self, name: String) -> FacadeResult<Value> {
+        match name.as_str() {
+            "manifest" => Ok(lantern_core::manifest::schema::manifest_json_schema()),
+            "profile" => Ok(lantern_core::manifest::schema::profile_json_schema()),
+            "config" => Ok(lantern_core::manifest::schema::config_json_schema()),
+            _ => Err(error("not_found", "unknown schema")),
+        }
+    }
     async fn settings(&self) -> FacadeResult<Value> {
         serde_json::to_value(&self.settings).map_err(internal)
     }
@@ -1070,6 +1133,53 @@ impl DaemonFacade for AppFacade {
             return Err(internal(report.errors.join("; ")));
         }
         Ok(ReconcileResponse { reconciled: true })
+    }
+    async fn system_health(&self) -> FacadeResult<SystemHealth> {
+        let dirs = self.dirs.clone();
+        let home = self.home.clone();
+        let settings = self.settings.clone();
+        tokio::task::spawn_blocking(move || {
+            use lantern_system::{
+                command::{ProcessRunner, find_program},
+                doctor::{self, DoctorCtx, LocalNetworkProbe},
+                paths::LanternPaths,
+            };
+            let cache = dirs.state.join("cache");
+            let paths = LanternPaths::new(dirs, home, None, cache, None).map_err(internal)?;
+            let runner = ProcessRunner {
+                fake_root: paths.fake_root.is_some(),
+            };
+            let network = LocalNetworkProbe {
+                paths: &paths,
+                settings: &settings,
+                runner: &runner,
+            };
+            let caddy = if settings.caddy.binary.is_empty() {
+                paths.bundled_caddy.clone()
+            } else {
+                PathBuf::from(&settings.caddy.binary)
+            };
+            let certutil = find_program(&["/usr/bin/certutil", "/usr/local/bin/certutil"]);
+            let checks = doctor::run(&DoctorCtx {
+                paths: &paths,
+                settings: &settings,
+                runner: &runner,
+                network: &network,
+                caddy: &caddy,
+                certutil: certutil.as_deref(),
+                search_path: std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect(),
+            });
+            let ok = checks
+                .iter()
+                .all(|c| matches!(c.status, CheckStatus::Ok | CheckStatus::Skipped));
+            Ok(SystemHealth {
+                ok,
+                checked_at: Timestamp::now(),
+                checks,
+            })
+        })
+        .await
+        .map_err(internal)?
     }
     async fn system_info(&self) -> FacadeResult<SystemInfo> {
         Ok(SystemInfo {

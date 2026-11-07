@@ -327,6 +327,18 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
             }
             output(call!("system", f.system_info()))
         }
+        ["api", "system", "env"] => {
+            if method != Method::GET {
+                return Err(method_error());
+            }
+            output(call!("runtime", f.environment()))
+        }
+        ["api", "system", "env", "refresh"] => {
+            if method != Method::POST {
+                return Err(method_error());
+            }
+            output(call!("runtime", f.refresh_environment()))
+        }
         ["api", "system", "health"] => {
             if method != Method::GET {
                 return Err(method_error());
@@ -443,6 +455,23 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
                 ));
             }
             list(call!("instances", f.checkouts(project(id)?)))
+        }
+        ["api", "projects", id, "gc"] => {
+            if method != Method::POST {
+                return Err(method_error());
+            }
+            #[derive(Deserialize, Default)]
+            struct GcRequest {
+                #[serde(default)]
+                apply: bool,
+                #[serde(default)]
+                fetch: bool,
+            }
+            let request: GcRequest = body(&bytes, true)?;
+            output(call!(
+                "instances",
+                f.worktree_gc(project(id)?, request.apply, request.fetch)
+            ))
         }
         ["api", "projects", id, "branches"] => {
             if method != Method::GET {
