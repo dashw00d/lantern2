@@ -8,7 +8,7 @@ pub mod mcp_install;
 mod output;
 mod target;
 
-use args::GuiArgs;
+use args::{GuiArgs, PortMode};
 pub use execute::dispatch;
 
 /// Arguments forwarded to the daemon implementation by the binary.
@@ -33,9 +33,13 @@ pub enum CliAction {
 #[derive(Debug, Clone)]
 pub enum SystemCommand {
     /// Initialize the machine.
-    Init { yes: bool },
+    Init { yes: bool, ports: PortMode },
     /// Run privileged setup for a validated target uid.
-    InitSystem { uid: u32 },
+    InitSystem {
+        uid: Option<u32>,
+        ports: PortMode,
+        from_package: bool,
+    },
     /// Run diagnostics.
     Doctor { fix: bool },
     /// Remove system integration.

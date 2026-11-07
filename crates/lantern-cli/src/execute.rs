@@ -395,7 +395,7 @@ async fn execute(ctx: &mut Context<'_>, system: &dyn SystemActions) -> Result<Op
                 })
                 .await
                 .map_err(|e| ctx.failure(e))?;
-            Ok(Some(Reply::pretty(&result)?))
+            Ok(Some(Reply::value(&result, output::migration(&result, *dry_run))?))
         }
         Command::Env { command } => {
             let (method, path) = match command {
@@ -409,13 +409,20 @@ async fn execute(ctx: &mut Context<'_>, system: &dyn SystemActions) -> Result<Op
             yes,
             system_steps,
             uid,
+            ports,
+            from_package,
         } => {
             let command = if *system_steps {
                 SystemCommand::InitSystem {
-                    uid: uid.expect("clap requires uid"),
+                    uid: *uid,
+                    ports: *ports,
+                    from_package: *from_package,
                 }
             } else {
-                SystemCommand::Init { yes: *yes }
+                SystemCommand::Init {
+                    yes: *yes,
+                    ports: *ports,
+                }
             };
             run_system(system, command).map(Some)
         }
@@ -659,7 +666,12 @@ fn run_system(system: &dyn SystemActions, command: SystemCommand) -> Result<Repl
                 .and_then(Value::as_str)
                 .is_some_and(|state| state.starts_with("Failed"))
         });
-    let mut result = Reply::pretty(&value)?;
+    let text = if matches!(command, SystemCommand::Doctor { .. }) {
+        output::doctor(checks.map_or(&[], Vec::as_slice))
+    } else {
+        output::system_steps(&value)
+    };
+    let mut result = Reply::value(&value, text)?;
     if failed {
         result.code = 8;
     } else if setup_failed {

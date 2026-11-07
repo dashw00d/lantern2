@@ -56,6 +56,71 @@ impl PortsStep<'_> {
         }
         Ok(())
     }
+    fn sysctl_threshold(&self) -> u16 {
+        80u16.min(self.http_port.min(self.https_port))
+    }
+    fn desired_conf(&self) -> String {
+        format!(
+            "# Managed by Lantern\nnet.ipv4.ip_unprivileged_port_start={}\n",
+            self.sysctl_threshold()
+        )
+    }
+    pub(crate) fn configuration_check(&self) -> StepState {
+        if let Err(error) = self.validate() {
+            return StepState::Failed(error);
+        }
+        if self.from_package && self.strategy == PortStrategy::Sysctl && self.paths.sysctl_conf.exists() {
+            return StepState::Skipped("existing sysctl configuration is preserved".into());
+        }
+        let min = self.http_port.min(self.https_port);
+        if min >= 1024 {
+            return self.check();
+        }
+        match self.strategy {
+            PortStrategy::Sysctl => {
+                let live_ok = fs::read_to_string(&self.paths.sysctl_live)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u16>().ok())
+                    .is_some_and(|v| v <= min);
+                let file_ok = fs::read(&self.paths.sysctl_conf)
+                    .is_ok_and(|data| data == self.desired_conf().as_bytes());
+                if live_ok && file_ok {
+                    StepState::Done("persistent sysctl and live threshold permit the configured ports".into())
+                } else {
+                    StepState::Pending("configure the persistent and live unprivileged port threshold".into())
+                }
+            }
+            PortStrategy::Setcap => {
+                if self.has_cap() {
+                    StepState::Done("Caddy has CAP_NET_BIND_SERVICE".into())
+                } else {
+                    StepState::Pending("grant the bundled Caddy CAP_NET_BIND_SERVICE".into())
+                }
+            }
+        }
+    }
+    fn trusted_setcap_target(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        if self.caddy != self.paths.bundled_caddy {
+            return false;
+        }
+        let Ok(file) = fs::symlink_metadata(self.caddy) else {
+            return false;
+        };
+        if !file.file_type().is_file() {
+            return false;
+        }
+        if self.paths.fake_root.is_some() {
+            return true;
+        }
+        if file.uid() != 0 || file.mode() & 0o022 != 0 {
+            return false;
+        }
+        self.caddy.ancestors().skip(1).all(|path| {
+            fs::symlink_metadata(path)
+                .is_ok_and(|meta| meta.file_type().is_dir() && meta.uid() == 0 && meta.mode() & 0o022 == 0)
+        })
+    }
     fn has_cap(&self) -> bool {
         let spec = CommandSpec::new("/usr/sbin/getcap", [self.caddy.as_os_str()], false);
         self.runner.run(&spec).is_ok_and(|out| {
@@ -106,13 +171,13 @@ impl Step for PortsStep<'_> {
         StepState::Pending("privileged ports require sysctl or a Caddy capability".into())
     }
     fn apply(&self) -> StepOutcome {
-        if let Err(out) = preflight(self.id(), self.check()) {
+        if let Err(out) = preflight(self.id(), self.configuration_check()) {
             return out;
         }
         let result = match self.strategy {
             PortStrategy::Sysctl => {
-                let threshold = 80u16.min(self.http_port.min(self.https_port));
-                let text = format!("# Managed by Lantern\nnet.ipv4.ip_unprivileged_port_start={threshold}\n");
+                let threshold = self.sysctl_threshold();
+                let text = self.desired_conf();
                 atomic_write(&self.paths.sysctl_conf, text.as_bytes(), 0o644)
                     .map_err(|e| e.to_string())
                     .and_then(|_| {
@@ -134,10 +199,8 @@ impl Step for PortsStep<'_> {
                     })
             }
             PortStrategy::Setcap => {
-                if self.caddy != self.paths.bundled_caddy
-                    || !fs::symlink_metadata(self.caddy).is_ok_and(|m| m.file_type().is_file())
-                {
-                    Err("setcap is restricted to the regular bundled Caddy executable".into())
+                if !self.trusted_setcap_target() {
+                    Err("setcap requires a regular root-owned bundled Caddy in root-owned, non-writable directories".into())
                 } else {
                     run_checked(
                         self.runner,

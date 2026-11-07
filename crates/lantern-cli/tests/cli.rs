@@ -775,7 +775,7 @@ async fn system_step_dispatch_propagates_failure_without_elevation() {
         fn execute(&self, command: &lantern_cli::SystemCommand) -> Result<Value, String> {
             assert!(matches!(
                 command,
-                lantern_cli::SystemCommand::InitSystem { uid: 1234 }
+                lantern_cli::SystemCommand::InitSystem { uid: Some(1234), .. }
             ));
             Ok(json!({"system_steps":[{"id":"dns", "state":"Failed", "detail":"fixture"}]}))
         }
@@ -788,4 +788,124 @@ async fn system_step_dispatch_propagates_failure_without_elevation() {
         CliAction::Exit(1)
     ));
     assert!(String::from_utf8(out).unwrap().contains("fixture"));
+}
+
+#[tokio::test]
+async fn doctor_and_init_render_human_or_one_json_document() {
+    struct FakeSystem;
+    impl lantern_cli::SystemActions for FakeSystem {
+        fn execute(&self, command: &lantern_cli::SystemCommand) -> Result<Value, String> {
+            if matches!(command, lantern_cli::SystemCommand::Doctor { .. }) {
+                Ok(json!({"checks":[
+                    {"id":"ports.bind","title":"Port permissions","status":"fail","detail":"blocked","fix":{"description":"Allow access","command":"sudo lantern init --system-steps","needs_root":true}},
+                    {"id":"session.systemd","title":"User systemd","status":"warn","detail":"degraded","fix":{"description":"Inspect failed units","command":"systemctl --user --failed","needs_root":false}},
+                    {"id":"ports.free","title":"Port availability","status":"ok","detail":"free","fix":null}
+                ]}))
+            } else {
+                Ok(
+                    json!({"user_steps":[{"id":"ca","state":"Changed","detail":"created"}],"system_steps":[{"id":"ports","state":"Pending"}],"pkexec":null}),
+                )
+            }
+        }
+    }
+    for args in [
+        &["lantern", "doctor"][..],
+        &["lantern", "doctor", "--json"][..],
+        &["lantern", "init", "--yes"][..],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let action = dispatch(cli, &FakeSystem, &mut out, &mut err, false).await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(err.is_empty());
+        if args.contains(&"doctor") {
+            assert!(matches!(action, CliAction::Exit(8)));
+            if args.contains(&"--json") {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(value["checks"].as_array().unwrap().len(), 3);
+                assert_eq!(text.lines().count(), 1);
+            } else {
+                assert!(text.contains("PORTS\n  ✗ Port permissions: blocked"), "{text}");
+                assert!(text.contains("  ✓ Port availability: free"));
+                assert!(text.contains("SESSION\n  ⚠ User systemd: degraded"));
+                assert!(text.contains("fix: Allow access — sudo lantern init --system-steps"));
+                assert!(text.contains("systemctl --user --failed"));
+                assert!(!text.trim_start().starts_with('{'));
+            }
+        } else {
+            assert!(matches!(action, CliAction::Exit(0)));
+            assert!(text.contains("User steps:\n  ca: Changed — created"), "{text}");
+            assert!(text.contains("System steps:\n  ports: Pending"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn init_port_strategy_and_root_fallback_cli_are_forwarded() {
+    use lantern_cli::args::PortMode;
+    struct FakeSystem;
+    impl lantern_cli::SystemActions for FakeSystem {
+        fn execute(&self, command: &lantern_cli::SystemCommand) -> Result<Value, String> {
+            match command {
+                lantern_cli::SystemCommand::Init {
+                    ports: PortMode::Sysctl,
+                    ..
+                }
+                | lantern_cli::SystemCommand::Init {
+                    ports: PortMode::Setcap,
+                    ..
+                }
+                | lantern_cli::SystemCommand::InitSystem {
+                    uid: None,
+                    ports: PortMode::Sysctl,
+                    from_package: false,
+                }
+                | lantern_cli::SystemCommand::InitSystem {
+                    uid: None,
+                    ports: PortMode::Sysctl,
+                    from_package: true,
+                } => (),
+                other => panic!("unexpected init parameters: {other:?}"),
+            }
+            Ok(json!({"system_steps":[]}))
+        }
+    }
+    for args in [
+        &["lantern", "init", "--yes"][..],
+        &["lantern", "init", "--yes", "--ports=setcap"][..],
+        &["lantern", "init", "--system-steps"][..],
+        &["lantern", "init", "--system-steps", "--from-package"][..],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert!(matches!(
+            dispatch(cli, &FakeSystem, &mut out, &mut err, false).await,
+            CliAction::Exit(0)
+        ));
+        assert!(err.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn doctor_warning_only_keeps_success_exit() {
+    struct FakeSystem;
+    impl lantern_cli::SystemActions for FakeSystem {
+        fn execute(&self, _: &lantern_cli::SystemCommand) -> Result<Value, String> {
+            Ok(
+                json!({"checks":[{"id":"session.systemd","title":"User systemd","status":"warn","detail":"degraded","fix":{"description":"inspect units","command":"systemctl --user --failed","needs_root":false}}]}),
+            )
+        }
+    }
+    for args in [&["lantern", "doctor"][..], &["lantern", "doctor", "--json"][..]] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert!(matches!(
+            dispatch(cli, &FakeSystem, &mut out, &mut err, false).await,
+            CliAction::Exit(0)
+        ));
+        assert!(err.is_empty());
+    }
 }

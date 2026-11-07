@@ -195,3 +195,179 @@ mod tests {
         assert_eq!(clean(input, true), "a\x1b[31mb\x1b[0mc");
     }
 }
+
+/// Render doctor checks grouped by their ID's area.
+pub(crate) fn doctor(checks: &[serde_json::Value]) -> String {
+    let mut groups: Vec<(String, Vec<&serde_json::Value>)> = Vec::new();
+    for check in checks {
+        let id = check
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("other");
+        let area = id.split(['.', '_']).next().unwrap_or("other").to_owned();
+        if let Some((_, group)) = groups.iter_mut().find(|(name, _)| *name == area) {
+            group.push(check);
+        } else {
+            groups.push((area, vec![check]));
+        }
+    }
+    let mut text = format!("Lantern doctor — {} checks\n", checks.len());
+    for (area, group) in groups {
+        text.push_str(&format!("\n{}\n", clean(&area.to_uppercase(), false)));
+        for check in group {
+            let status = check
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let glyph = match status {
+                "ok" => "✓",
+                "warn" => "⚠",
+                "fail" => "✗",
+                "skipped" => "–",
+                _ => "?",
+            };
+            let title = check
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| check.get("id").and_then(serde_json::Value::as_str))
+                .unwrap_or("Check");
+            let detail = check
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            text.push_str(&format!(
+                "  {glyph} {}: {}\n",
+                clean(title, false),
+                clean(detail, false)
+            ));
+            if matches!(status, "warn" | "fail")
+                && let Some(fix) = check.get("fix").and_then(serde_json::Value::as_object)
+            {
+                let description = fix
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let command = fix
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if !description.is_empty() || !command.is_empty() {
+                    text.push_str(&format!("    fix: {}", clean(description, false)));
+                    if !command.is_empty() {
+                        text.push_str(&format!(" — {}", clean(command, false)));
+                    }
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    text
+}
+
+/// Render initialization or uninstall step results and any elevation plan.
+pub(crate) fn system_steps(value: &serde_json::Value) -> String {
+    let mut text = String::new();
+    for (key, label) in [("user_steps", "User steps"), ("system_steps", "System steps")] {
+        if let Some(steps) = value.get(key).and_then(serde_json::Value::as_array) {
+            text.push_str(&format!("{label}:\n"));
+            for step in steps {
+                let id = step
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("step");
+                let state = step
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let detail = step
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                text.push_str(&format!("  {}: {}", clean(id, false), clean(state, false)));
+                if !detail.is_empty() {
+                    text.push_str(&format!(" — {}", clean(detail, false)));
+                }
+                text.push('\n');
+            }
+        }
+    }
+    if let Some(command) = value.get("pkexec").and_then(serde_json::Value::as_object) {
+        let program = command
+            .get("program")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("pkexec");
+        let args = command
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(shlex::try_quote)
+            .collect::<Result<Vec<_>, _>>();
+        if let Ok(args) = args {
+            text.push_str(&format!(
+                "Root steps pending: {} {}\n",
+                clean(program, false),
+                args.join(" ")
+            ));
+        }
+    }
+    if text.is_empty() {
+        text.push_str("No system steps reported.\n");
+    }
+    text
+}
+
+/// Render the v1 import plan without exposing JSON in the human CLI.
+pub(crate) fn migration(value: &serde_json::Value, dry_run: bool) -> String {
+    let mut text = if dry_run {
+        "v1 migration plan:\n"
+    } else {
+        "v1 migration results:\n"
+    }
+    .to_string();
+    if let Some(actions) = value.get("actions").and_then(serde_json::Value::as_array) {
+        if actions.is_empty() {
+            text.push_str("  No changes.\n");
+        }
+        for action in actions {
+            let kind = action
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let what = action
+                .get("what")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("item");
+            text.push_str(&format!("  {}: {}", clean(kind, false), clean(what, false)));
+            if let Some(reason) = action.get("reason").and_then(serde_json::Value::as_str) {
+                text.push_str(&format!(" — {}", clean(reason, false)));
+            }
+            text.push('\n');
+        }
+    }
+    if let Some(warnings) = value.get("warnings").and_then(serde_json::Value::as_array) {
+        for warning in warnings.iter().filter_map(serde_json::Value::as_str) {
+            text.push_str(&format!("  ⚠ {}\n", clean(warning, false)));
+        }
+    }
+    text
+}
+
+#[cfg(test)]
+mod system_output_tests {
+    use super::migration;
+    use serde_json::json;
+
+    #[test]
+    fn migration_plan_is_human_readable() {
+        let text = migration(
+            &json!({"actions":[{"kind":"skip","what":"old-app","reason":"already imported"}],"warnings":["missing file"]}),
+            true,
+        );
+        assert_eq!(
+            text,
+            "v1 migration plan:\n  skip: old-app — already imported\n  ⚠ missing file\n"
+        );
+    }
+}

@@ -492,6 +492,17 @@ fn init_composes_steps_with_uid_and_settings_validation() {
         .count();
     let plan = run_init(&user, &system).unwrap();
     assert!(plan.pkexec.is_some());
+    let setcap_plan = run_init(
+        &user,
+        &SystemInitCtx {
+            port_strategy: PortStrategy::Setcap,
+            ..system
+        },
+    )
+    .unwrap();
+    let args = &setcap_plan.pkexec.as_ref().unwrap().args;
+    assert!(args.iter().any(|arg| arg == "--ports=setcap"));
+    assert!(args.iter().any(|arg| arg == "--json"));
     assert_eq!(
         runner
             .state
@@ -1219,5 +1230,365 @@ fn constrained_root_accepts_local_tls_and_rejects_external_dns_in_memory() {
     assert!(
         outside.to_lowercase().contains("nameconstraint"),
         "unexpected error: {outside}"
+    );
+}
+
+#[test]
+fn doctor_session_classifies_manager_state_and_preserves_command_details() {
+    use lantern_core::api::CheckStatus;
+    use lantern_system::doctor::{DoctorCtx, run};
+    struct ManagerRunner<'a> {
+        base: RecordingRunner,
+        state: &'a str,
+        success: bool,
+        environment_error: Option<&'a str>,
+    }
+    impl CommandRunner for ManagerRunner<'_> {
+        fn run(&self, spec: &CommandSpec) -> io::Result<CommandOutput> {
+            let args: Vec<_> = spec.args.iter().map(|a| a.to_string_lossy()).collect();
+            if args.iter().any(|a| a == "show-environment")
+                && let Some(error) = self.environment_error
+            {
+                return Ok(CommandOutput {
+                    success: false,
+                    stdout: Vec::new(),
+                    stderr: error.as_bytes().to_vec(),
+                });
+            }
+            if args.iter().any(|a| a == "is-system-running") {
+                return Ok(CommandOutput {
+                    success: self.success,
+                    stdout: self.state.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            self.base.run(spec)
+        }
+    }
+    let f = Fixture::new();
+    let settings = lantern_core::settings::Settings::default();
+    for (state, success, error, expected) in [
+        ("running\n", true, None, CheckStatus::Ok),
+        ("degraded\n", false, None, CheckStatus::Warn),
+        ("offline\n", false, None, CheckStatus::Fail),
+        ("", false, None, CheckStatus::Fail),
+        (
+            "running\n",
+            true,
+            Some("cannot connect to bus"),
+            CheckStatus::Fail,
+        ),
+    ] {
+        let runner = ManagerRunner {
+            base: RecordingRunner::new(&f),
+            state,
+            success,
+            environment_error: error,
+        };
+        let ctx = DoctorCtx {
+            paths: &f.paths,
+            settings: &settings,
+            runner: &runner,
+            network: &OfflineNetwork,
+            caddy: &f.paths.bundled_caddy,
+            certutil: None,
+            search_path: vec![],
+        };
+        let checks = run(&ctx);
+        let check = checks.iter().find(|c| c.id == "session.systemd").unwrap();
+        assert_eq!(check.status, expected, "{state:?} {error:?}");
+        assert!(!check.detail.is_empty());
+        if state.trim() == "degraded" {
+            assert!(check.detail.contains("systemctl --user --failed"));
+            assert_eq!(check.fix.as_ref().unwrap().command, "systemctl --user --failed");
+        } else if state.trim() == "offline" {
+            assert!(check.detail.contains("offline"));
+        }
+        if let Some(error) = error {
+            assert!(check.detail.contains(error));
+        }
+        let unit = checks.iter().find(|c| c.id == "session.unit").unwrap();
+        assert_eq!(unit.status, CheckStatus::Fail);
+        assert!(unit.detail.contains("failed without output"));
+    }
+}
+
+#[test]
+fn init_sysctl_and_doctor_port_access_cover_defaults_caps_and_dev_ports() {
+    use lantern_core::api::CheckStatus;
+    use lantern_system::{
+        doctor::{DoctorCtx, run},
+        init::{SystemInitCtx, run_system_steps},
+    };
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    let settings = lantern_core::settings::Settings::default();
+    f.write(&f.paths.sysctl_live, b"1024\n");
+    f.write(&f.paths.bundled_caddy, b"fake executable");
+    let system = SystemInitCtx {
+        paths: &f.paths,
+        settings: &settings,
+        runner: &runner,
+        uid: 1000,
+        port_strategy: PortStrategy::Sysctl,
+        from_package: false,
+        migrate_v1: false,
+        allow_fake_cleanup: false,
+        system_trust_step: None,
+    };
+    let outcomes = run_system_steps(&system);
+    assert_eq!(
+        outcomes.iter().find(|o| o.id == "ports").unwrap().state,
+        OutcomeState::Changed
+    );
+    assert_eq!(
+        fs::read_to_string(&f.paths.sysctl_conf).unwrap(),
+        "# Managed by Lantern\nnet.ipv4.ip_unprivileged_port_start=80\n"
+    );
+    assert_eq!(fs::read_to_string(&f.paths.sysctl_live).unwrap(), "80");
+    assert!(
+        runner
+            .state
+            .borrow()
+            .commands
+            .iter()
+            .any(|c| c.program == Path::new("/usr/sbin/sysctl")
+                && c.args == ["-w", "net.ipv4.ip_unprivileged_port_start=80"]
+                && c.fake_root)
+    );
+
+    let check = |settings: &lantern_core::settings::Settings| {
+        let ctx = DoctorCtx {
+            paths: &f.paths,
+            settings,
+            runner: &runner,
+            network: &OfflineNetwork,
+            caddy: &f.paths.bundled_caddy,
+            certutil: None,
+            search_path: vec![],
+        };
+        run(&ctx).into_iter().find(|c| c.id == "ports.bind").unwrap()
+    };
+    assert_eq!(check(&settings).status, CheckStatus::Ok);
+    f.write(&f.paths.sysctl_live, b"1024");
+    let failed = check(&settings);
+    assert_eq!(failed.status, CheckStatus::Fail);
+    assert_eq!(failed.fix.unwrap().command, "sudo lantern init --system-steps");
+    runner.state.borrow_mut().cap = true;
+    assert_eq!(check(&settings).status, CheckStatus::Ok);
+    assert!(
+        runner
+            .state
+            .borrow()
+            .commands
+            .iter()
+            .any(|c| c.program == Path::new("/usr/sbin/getcap")
+                && c.args == [f.paths.bundled_caddy.as_os_str()])
+    );
+    runner.state.borrow_mut().cap = false;
+    let mut dev_settings = settings.clone();
+    dev_settings.proxy.http_port = 8080;
+    dev_settings.proxy.https_port = 8443;
+    assert_eq!(check(&dev_settings).status, CheckStatus::Ok);
+    let dev = SystemInitCtx {
+        settings: &dev_settings,
+        ..system
+    };
+    assert_eq!(
+        run_system_steps(&dev)
+            .iter()
+            .find(|o| o.id == "ports")
+            .unwrap()
+            .state,
+        OutcomeState::AlreadyDone
+    );
+    assert_eq!(fs::read_to_string(&f.paths.sysctl_live).unwrap(), "1024");
+}
+
+#[test]
+fn init_elevation_uses_selected_strategy_and_rechecks_fake_root() {
+    use lantern_system::init::{InitPlan, StepReport, SystemInitCtx, complete_init, pkexec_invocation};
+    struct ElevationRunner {
+        base: RecordingRunner,
+        fail: bool,
+    }
+    impl CommandRunner for ElevationRunner {
+        fn run(&self, spec: &CommandSpec) -> io::Result<CommandOutput> {
+            if spec.program == Path::new("/usr/bin/pkexec") {
+                assert!(spec.fake_root);
+                assert!(spec.args.iter().any(|arg| arg == "--ports=setcap"));
+                if self.fail {
+                    return Ok(CommandOutput {
+                        success: false,
+                        stdout: Vec::new(),
+                        stderr: b"cancelled".to_vec(),
+                    });
+                }
+                self.base.state.borrow_mut().cap = true;
+                return Ok(CommandOutput {
+                    success: true,
+                    stdout: b"{}".to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            self.base.run(spec)
+        }
+    }
+    let f = Fixture::new();
+    f.write(&f.paths.sysctl_live, b"1024");
+    let exe = f.paths.home.join("lantern");
+    f.write(&exe, b"fake");
+    let mut settings = lantern_core::settings::Settings::default();
+    settings.domains.tld = "localhost".into();
+    let runner = ElevationRunner {
+        base: RecordingRunner::new(&f),
+        fail: false,
+    };
+    let trust = FakeStep {
+        id: "system_trust",
+        root: true,
+        done: std::cell::Cell::new(true),
+    };
+    let system = SystemInitCtx {
+        paths: &f.paths,
+        settings: &settings,
+        runner: &runner,
+        uid: 1000,
+        port_strategy: PortStrategy::Setcap,
+        from_package: false,
+        migrate_v1: false,
+        allow_fake_cleanup: false,
+        system_trust_step: Some(&trust),
+    };
+    let mut cmd = pkexec_invocation(&exe, 1000).unwrap();
+    cmd.args.push("--ports=setcap".into());
+    let plan = InitPlan {
+        user_outcomes: vec![],
+        system_steps: vec![StepReport {
+            id: "ports",
+            state: StepState::Pending("needs access".into()),
+            needs_root: true,
+        }],
+        pkexec: Some(cmd),
+    };
+    let result = complete_init(&system, &plan).unwrap();
+    assert!(matches!(
+        result.iter().find(|s| s.id == "ports").unwrap().state,
+        StepState::Done(_)
+    ));
+    let failure = ElevationRunner {
+        base: RecordingRunner::new(&f),
+        fail: true,
+    };
+    let err = complete_init(
+        &SystemInitCtx {
+            runner: &failure,
+            ..system
+        },
+        &plan,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("cancelled")
+            && err.contains("sudo lantern init --system-steps --uid 1000 --ports=setcap"),
+        "{err}"
+    );
+    struct JsonFailure;
+    impl CommandRunner for JsonFailure {
+        fn run(&self, _: &CommandSpec) -> io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                success: false,
+                stdout: br#"{"system_steps":[{"id":"ports","state":"Failed","detail":"sysctl failed"}]}"#
+                    .to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+    let err = complete_init(
+        &SystemInitCtx {
+            runner: &JsonFailure,
+            ..system
+        },
+        &plan,
+    )
+    .unwrap_err();
+    assert!(err.contains("ports: sysctl failed"));
+    assert!(!err.contains('{'));
+    struct JsonError;
+    impl CommandRunner for JsonError {
+        fn run(&self, _: &CommandSpec) -> io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                success: false,
+                stdout: Vec::new(),
+                stderr: br#"{"error":{"message":"permission denied"},"exit_code":2}"#.to_vec(),
+            })
+        }
+    }
+    let err = complete_init(
+        &SystemInitCtx {
+            runner: &JsonError,
+            ..system
+        },
+        &plan,
+    )
+    .unwrap_err();
+    assert!(err.contains("permission denied"));
+    assert!(!err.contains('{'));
+}
+
+#[test]
+fn init_persists_the_selected_policy_even_when_live_ports_are_already_open() {
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(&f.paths.sysctl_live, b"0");
+    f.write(&f.paths.bundled_caddy, b"binary");
+    let step = PortsStep {
+        paths: &f.paths,
+        runner: &runner,
+        http_port: 80,
+        https_port: 443,
+        caddy: &f.paths.bundled_caddy,
+        strategy: PortStrategy::Sysctl,
+        from_package: false,
+    };
+    assert!(matches!(step.check(), StepState::Done(_)));
+    assert_eq!(step.apply().state, OutcomeState::Changed);
+    assert!(f.paths.sysctl_conf.exists());
+    assert_eq!(fs::read_to_string(&f.paths.sysctl_live).unwrap(), "80");
+    let cap = PortsStep {
+        strategy: PortStrategy::Setcap,
+        ..step
+    };
+    assert_eq!(cap.apply().state, OutcomeState::Changed);
+    assert!(runner.state.borrow().cap);
+}
+
+#[test]
+fn setcap_refuses_user_writable_bundled_target() {
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(&f.paths.sysctl_live, b"1024");
+    f.write(&f.paths.bundled_caddy, b"untrusted");
+    let mut paths = f.paths.clone();
+    paths.fake_root = None;
+    let step = PortsStep {
+        paths: &paths,
+        runner: &runner,
+        http_port: 80,
+        https_port: 443,
+        caddy: &paths.bundled_caddy,
+        strategy: PortStrategy::Setcap,
+        from_package: false,
+    };
+    let outcome = step.apply();
+    assert_eq!(outcome.state, OutcomeState::Failed);
+    assert!(outcome.detail.contains("root-owned"));
+    assert!(
+        !runner
+            .state
+            .borrow()
+            .commands
+            .iter()
+            .any(|command| command.mutating)
     );
 }

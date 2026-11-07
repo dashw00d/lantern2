@@ -108,11 +108,17 @@ pub enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
         /// Run the root-owned steps for the specified target user.
-        #[arg(long, requires = "uid")]
+        #[arg(long)]
         system_steps: bool,
         /// Numeric target user for privileged setup.
         #[arg(long, requires = "system_steps")]
         uid: Option<u32>,
+        /// Select how the proxy gains access to privileged ports.
+        #[arg(long, value_enum, default_value = "sysctl")]
+        ports: PortMode,
+        /// Preserve existing system files during package setup.
+        #[arg(long, requires = "system_steps")]
+        from_package: bool,
     },
     /// Remove system integration.
     Uninstall {
@@ -457,4 +463,13 @@ pub enum EnvCommand {
     Show,
     /// Refresh the shell environment.
     Refresh,
+}
+
+/// Strategy for privileged proxy ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PortMode {
+    /// Use the system-wide unprivileged port threshold.
+    Sysctl,
+    /// Grant the bundled Caddy executable the bind capability.
+    Setcap,
 }
