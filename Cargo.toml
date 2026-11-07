@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.2.0-dev"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/dashw00d/lantern"
+
+[workspace.dependencies]
+# Internal crates
+lantern-core = { path = "crates/lantern-core" }
+lantern-system = { path = "crates/lantern-system" }
+lantern-client = { path = "crates/lantern-client" }
+lantern-daemon = { path = "crates/lantern-daemon" }
+lantern-cli = { path = "crates/lantern-cli" }
+lantern-gui = { path = "crates/lantern-gui" }
+# Shared third-party baseline (lanes add crate-specific deps in their own crate's Cargo.toml)
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+jiff = { version = "0.2", features = ["serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
