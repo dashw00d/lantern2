@@ -26,8 +26,8 @@ use lantern_daemon::{
     operations::OperationTracker,
     registry::RegistryHandle,
     runtime::{
-        Runtime, RuntimeConfig,
-        seams::{PortProbe, ScannerProbe},
+        Runtime, RuntimeAdapters, RuntimeConfig,
+        seams::{PortProbe, ScannerProbe, UnavailableRouter, UnavailableServices},
         systemd::{FakeSystemd, UnitNames},
     },
 };
@@ -111,13 +111,13 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         Duration::from_secs(10),
     ));
     let names = UnitNames {
-        instance_prefix: "lantern-test-assembly-inst-".into(),
-        operation_prefix: "lantern-test-assembly-op-".into(),
+        instance_prefix: format!("lantern-test-assembly-{}-fake-inst-", std::process::id()),
+        operation_prefix: format!("lantern-test-assembly-{}-fake-op-", std::process::id()),
         slice: "app-lantern-test.slice".into(),
     };
     let fake = Arc::new(FakeSystemd::default());
     fake.set_auto_start(true);
-    let runtime = Arc::new(Runtime::with_preparer(
+    let runtime = Arc::new(Runtime::with_scoped_journal(
         RuntimeConfig {
             settings: settings.clone(),
             run_dir: temp.0.join("run"),
@@ -132,7 +132,12 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         probe,
         fake.clone(),
         tracker.clone(),
-        Arc::new(CheckoutPreparer(service.clone())),
+        RuntimeAdapters {
+            preparer: Arc::new(CheckoutPreparer(service.clone())),
+            router: Arc::new(UnavailableRouter),
+            services: Arc::new(UnavailableServices),
+        },
+        true,
     ));
     oneshot.bind(&runtime).unwrap();
     let scanner = Scanner::with_source(
@@ -147,7 +152,7 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         Arc::new(ScannerProbe::new(scanner)),
         registry.clone(),
         runtime.clone(),
-        names,
+        names.clone(),
         shutdown.clone(),
     );
     let app = AppFacade::new(
@@ -190,11 +195,7 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
     let view = app.instance(id.clone()).await.unwrap();
     assert_eq!(view.runtime.status, InstanceStatus::Running);
     assert!((39660..=39679).contains(&view.runtime.port.unwrap()));
-    let script = fs::read_to_string(temp.0.join(format!(
-        "run/lantern-test-assembly-inst-{}.service.sh",
-        id.safe_name()
-    )))
-    .unwrap();
+    let script = fs::read_to_string(temp.0.join(format!("run/{}.sh", names.instance(&id)))).unwrap();
     assert!(
         script.contains("APP_STAGE")
             && script.contains(&format!("from-sample-{}", view.runtime.port.unwrap()))
