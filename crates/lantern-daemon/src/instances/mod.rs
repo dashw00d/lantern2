@@ -12,7 +12,7 @@ use std::{
 use lantern_core::{
     ids::{InstanceId, ProjectId},
     manifest::ResolvedManifest,
-    model::{Project, Stream},
+    model::{InstanceStatus, Project, Stream},
     state::InstanceRecord,
 };
 use tokio_util::sync::CancellationToken;
@@ -45,6 +45,8 @@ pub trait InstanceStore: Send + Sync {
     fn rename(&self, old: &InstanceId, new: &InstanceId) -> Result<(), String>;
     /// Resolve the checkout's manifest with primary fallback, rejecting invalid checkout files.
     fn manifest(&self, id: &InstanceId) -> Result<Arc<ResolvedManifest>, String>;
+    /// Current live runtime status, not the persisted restart hint.
+    fn status(&self, id: &InstanceId) -> Result<InstanceStatus, String>;
     /// Obtain the sticky port lease created with the record.
     fn port(&self, id: &InstanceId) -> Result<Option<u16>, String>;
 }
@@ -113,3 +115,14 @@ pub enum InstanceError {
     #[error("{0}")]
     Refused(String),
 }
+
+/// Instance reconciliation and preparation service.
+pub mod service;
+pub use service::{
+    BranchTarget, CheckoutObservation, FetchPolicy, InstanceService, Outcome, Prepared, RunBranchRequest,
+    RunBranchResponse,
+};
+
+/// Worktree removal and GC safety checks.
+pub mod remove;
+pub use remove::{Blocker, GcAction, GcReason, GcSuggestion, RemovalCheck, RemoveOpts, RemoveResult};

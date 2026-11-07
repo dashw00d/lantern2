@@ -1,0 +1,904 @@
+//! Checkout reconciliation, branch planning and the preparation pipeline.
+use super::{InstanceError, InstanceStore, OneShot, OneShotSpec, ProjectConfig, deps, files};
+use crate::{
+    git::{AddMode, Git, RepoHandle, Worktree},
+    operations::OpHandle,
+};
+use lantern_core::{
+    Timestamp,
+    ids::{BRANCH_SLUG_MAX, InstanceId, ProjectId, branch_slug, detached_slug, instance_domain},
+    manifest::ResolvedManifest,
+    model::{CheckoutKind, InstanceStatus, Stream},
+    state::{CheckoutPhase, CheckoutRecord, InstanceRecord, SetupStamp},
+    template::VarContext,
+};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
+};
+use tokio::sync::{Mutex, Semaphore};
+
+/// User-selected branch target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchTarget {
+    /// Existing local or remote branch.
+    Branch(String),
+    /// Explicit new branch and optional base.
+    NewBranch {
+        /// Name for the new branch.
+        name: String,
+        /// Commit-ish base, or default branch when absent.
+        base: Option<String>,
+    },
+    /// Detached commit-ish.
+    Detached(String),
+    /// GitHub-style pull ref fetched from the selected remote.
+    Pr(u32),
+}
+/// Fetch policy for branch discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchPolicy {
+    /// Fetch only when a requested branch was not found.
+    Auto,
+    /// Refresh remote refs before resolution.
+    Always,
+    /// Never fetch except a requested PR.
+    Never,
+}
+/// Request to reuse or create a branch checkout.
+#[derive(Debug, Clone)]
+pub struct RunBranchRequest {
+    /// Registered project.
+    pub project: ProjectId,
+    /// Branch, new branch, revision, or PR.
+    pub target: BranchTarget,
+    /// Ask the controller to hand off to runtime start.
+    pub start: bool,
+    /// Pin the requested project's checkout.
+    pub pin: bool,
+    /// Remote fetch behavior.
+    pub fetch: FetchPolicy,
+    /// For an existing branch, create a detached checkout instead of reuse.
+    pub detach: bool,
+    /// Explicit remote selection, useful for ambiguity and PRs.
+    pub remote: Option<String>,
+}
+/// Result of resolving a run-branch request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Existing primary checkout.
+    ReusedPrimary,
+    /// Existing non-primary checkout.
+    ReusedCheckout,
+    /// Newly created managed worktree.
+    CreatedWorktree(AddMode),
+}
+/// Result and runtime hand-off requested by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunBranchResponse {
+    /// Actual instance identity, possibly a primary or frozen identity.
+    pub instance: InstanceId,
+    /// Resulting domain.
+    pub domain: String,
+    /// How the checkout was resolved.
+    pub outcome: Outcome,
+    /// Controller should start this prepared instance.
+    pub start: bool,
+}
+/// Prepared manifest and extra environment for the runtime start.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    /// Checkout-resolved manifest.
+    pub manifest: Arc<ResolvedManifest>,
+    /// Expanded non-primary worktree environment.
+    pub worktree_env: BTreeMap<String, String>,
+}
+/// Checkout observation associated with a persisted instance.
+#[derive(Debug, Clone)]
+pub struct CheckoutObservation {
+    /// Actual worktree data from git.
+    pub worktree: Worktree,
+    /// Project directory inside the worktree.
+    pub project_path: PathBuf,
+}
+#[derive(Debug, Default)]
+struct RefreshState {
+    fp: Option<u64>,
+    ticks: u64,
+    last: Option<Instant>,
+}
+
+/// Instance service, with injected store, one-shot runtime, and managed directory.
+pub struct InstanceService {
+    pub(crate) git: Git,
+    pub(crate) store: Arc<dyn InstanceStore>,
+    pub(crate) runner: Arc<dyn OneShot>,
+    pub(crate) worktrees_dir: PathBuf,
+    pub(crate) timeout: Duration,
+    pub(crate) setup_slots: Semaphore,
+    pub(crate) mutation: Mutex<()>,
+    observations: StdMutex<HashMap<InstanceId, CheckoutObservation>>,
+    refresh: StdMutex<HashMap<PathBuf, RefreshState>>,
+}
+impl std::fmt::Debug for InstanceService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceService")
+            .field("worktrees_dir", &self.worktrees_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InstanceService {
+    /// Construct a service with an explicit managed directory and setup limits.
+    pub fn new(
+        git: Git,
+        store: Arc<dyn InstanceStore>,
+        runner: Arc<dyn OneShot>,
+        worktrees_dir: PathBuf,
+        max_concurrent_setups: usize,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            git,
+            store,
+            runner,
+            worktrees_dir,
+            timeout,
+            setup_slots: Semaphore::new(max_concurrent_setups.max(1)),
+            mutation: Mutex::new(()),
+            observations: StdMutex::new(HashMap::new()),
+            refresh: StdMutex::new(HashMap::new()),
+        }
+    }
+    pub(crate) fn project(&self, id: &ProjectId) -> Result<ProjectConfig, InstanceError> {
+        self.store
+            .project(id)
+            .map_err(InstanceError::Adapter)?
+            .ok_or_else(|| InstanceError::NotFound(id.to_string()))
+    }
+    pub(crate) fn record(&self, id: &InstanceId) -> Result<InstanceRecord, InstanceError> {
+        self.store
+            .records()
+            .map_err(InstanceError::Adapter)?
+            .into_iter()
+            .find(|(i, _)| i == id)
+            .map(|(_, r)| r)
+            .ok_or_else(|| InstanceError::NotFound(id.to_string()))
+    }
+    pub(crate) fn repo(&self, p: &ProjectConfig) -> Result<RepoHandle, InstanceError> {
+        Ok(self.git.repo(
+            p.project
+                .repo
+                .as_ref()
+                .ok_or(InstanceError::NotARepo)?
+                .common_dir
+                .clone(),
+        ))
+    }
+    /// Choose five seconds with listeners or thirty seconds when idle.
+    pub fn refresh_interval(has_listeners: bool) -> Duration {
+        Duration::from_secs(if has_listeners { 5 } else { 30 })
+    }
+    /// Poll fingerprint and refresh on change, on force, or every twelfth tick.
+    pub async fn tick(&self, common_dir: &Path, force: bool) -> Result<bool, InstanceError> {
+        let known: Vec<PathBuf> = self
+            .observations
+            .lock()
+            .expect("observations lock")
+            .values()
+            .filter_map(|o| {
+                let r = std::fs::canonicalize(o.worktree.path.join(".git")).ok()?;
+                if r.starts_with(common_dir) {
+                    Some(o.worktree.path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let fp = self.git.repo(common_dir.to_path_buf()).fingerprint(&known);
+        let should = {
+            let mut all = self.refresh.lock().expect("refresh lock");
+            let state = all.entry(common_dir.to_path_buf()).or_default();
+            state.ticks += 1;
+            force || fp.is_none() || state.fp != fp || state.ticks % 12 == 0
+        };
+        if should {
+            self.refresh_repo(common_dir).await?;
+            let mut all = self.refresh.lock().expect("refresh lock");
+            let state = all.entry(common_dir.to_path_buf()).or_default();
+            state.fp = fp;
+            state.last = Some(Instant::now());
+        }
+        Ok(should)
+    }
+    /// Refresh a repo immediately (use before destructive or start operations).
+    pub async fn refresh_repo(&self, common_dir: &Path) -> Result<(), InstanceError> {
+        let _guard = self.mutation.lock().await;
+        self.refresh_unlocked(common_dir).await
+    }
+    pub(crate) async fn refresh_unlocked(&self, common: &Path) -> Result<(), InstanceError> {
+        let repo = self.git.repo(common.to_path_buf());
+        let trees = repo.list_worktrees().await?;
+        let mut projects = self
+            .store
+            .projects_in_repo(common)
+            .map_err(InstanceError::Adapter)?;
+        projects.sort_by(|a, b| a.project.id.cmp(&b.project.id));
+        let mut observed = HashSet::new();
+        let mut trees = trees;
+        trees.sort_by(|a, b| a.path.cmp(&b.path));
+        for p in projects {
+            let pr = p.project.repo.as_ref().ok_or(InstanceError::NotARepo)?;
+            let mut ordered = trees.clone();
+            ordered.sort_by_key(|w| (w.path != pr.git_root, w.path.clone()));
+            for wt in ordered.iter().filter(|w| !w.bare) {
+                let path = wt.path.join(&pr.subpath);
+                if !path.is_dir() {
+                    continue;
+                }
+                let all = self.store.records().map_err(InstanceError::Adapter)?;
+                let existing = all
+                    .iter()
+                    .find(|(_, r)| r.project == p.project.id && r.checkout.path == path)
+                    .cloned();
+                let kind = if wt.path == pr.git_root {
+                    CheckoutKind::Primary
+                } else {
+                    existing
+                        .as_ref()
+                        .map(|(_, r)| r.checkout.kind)
+                        .unwrap_or(CheckoutKind::Worktree)
+                };
+                let desired = if kind == CheckoutKind::Primary {
+                    None
+                } else {
+                    Some(
+                        wt.branch
+                            .as_deref()
+                            .map(branch_slug)
+                            .or_else(|| wt.head.as_deref().map(detached_slug))
+                            .unwrap_or_else(|| branch_slug(&path.to_string_lossy())),
+                    )
+                };
+                let (id, mut record) = if let Some((id, record)) = existing {
+                    if !record.claimed() && kind != CheckoutKind::Primary && id.slug() != desired.as_deref() {
+                        let (new, revived) =
+                            self.allocate(&p, desired.as_deref().unwrap_or("checkout"), Some(&id), false)?;
+                        if new != id {
+                            if revived.is_some() {
+                                self.store.remove(&id).map_err(InstanceError::Adapter)?;
+                            } else {
+                                self.store.rename(&id, &new).map_err(InstanceError::Adapter)?;
+                            }
+                        }
+                        (new, revived.unwrap_or(record))
+                    } else {
+                        (id, record)
+                    }
+                } else if kind == CheckoutKind::Primary {
+                    (
+                        InstanceId::primary(&p.project.id),
+                        new_record(&p.project.id, path.clone(), kind, false, false),
+                    )
+                } else {
+                    let (id, revived) =
+                        self.allocate(&p, desired.as_deref().unwrap_or("checkout"), None, false)?;
+                    (
+                        id,
+                        revived
+                            .unwrap_or_else(|| new_record(&p.project.id, path.clone(), kind, false, false)),
+                    )
+                };
+                record.checkout.path = path.clone();
+                record.checkout.kind = kind;
+                record.checkout.missing_since = None;
+                self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+                observed.insert(id.clone());
+                self.observations.lock().expect("observations lock").insert(
+                    id,
+                    CheckoutObservation {
+                        worktree: wt.clone(),
+                        project_path: path,
+                    },
+                );
+            }
+        }
+        for (id, mut record) in self.store.records().map_err(InstanceError::Adapter)? {
+            let Some(p) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+            else {
+                continue;
+            };
+            if p.project.repo.as_ref().is_some_and(|r| r.common_dir == common) && !observed.contains(&id) {
+                if record.checkout.missing_since.is_none() {
+                    record.checkout.missing_since = Some(Timestamp::now());
+                    self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+                }
+                self.observations.lock().expect("observations lock").remove(&id);
+            }
+        }
+        Ok(())
+    }
+    /// Get current observation after an explicit or scheduled refresh.
+    pub fn observation(&self, id: &InstanceId) -> Option<CheckoutObservation> {
+        self.observations
+            .lock()
+            .expect("observations lock")
+            .get(id)
+            .cloned()
+    }
+    /// Allocate a collision-free slug, reviving a matching missing instance if present.
+    pub fn allocate_slug(
+        &self,
+        project: &ProjectId,
+        desired: &str,
+        managed: bool,
+    ) -> Result<InstanceId, InstanceError> {
+        let p = self.project(project)?;
+        Ok(self.allocate(&p, desired, None, managed)?.0)
+    }
+    fn allocate(
+        &self,
+        p: &ProjectConfig,
+        desired: &str,
+        exclude: Option<&InstanceId>,
+        managed: bool,
+    ) -> Result<(InstanceId, Option<InstanceRecord>), InstanceError> {
+        let desired = branch_slug(desired);
+        let all = self.store.records().map_err(InstanceError::Adapter)?;
+        for n in 1u32.. {
+            let suffix = if n == 1 { String::new() } else { format!("-{n}") };
+            let keep = BRANCH_SLUG_MAX.saturating_sub(suffix.len());
+            let slug = format!(
+                "{}{}",
+                desired[..desired.len().min(keep)].trim_end_matches('-'),
+                suffix
+            );
+            let id = InstanceId::derived(&p.project.id, &slug)
+                .map_err(|e| InstanceError::Refused(e.to_string()))?;
+            let existing = all
+                .iter()
+                .find(|(other, _)| *other == id && Some(other) != exclude);
+            if existing.is_some_and(|(_, r)| r.checkout.missing_since.is_none()) {
+                continue;
+            }
+            let domain = instance_domain(&p.primary_domain, Some(&slug));
+            if domain.len() > 253 {
+                continue;
+            }
+            let mut occupied = false;
+            for (other, r) in &all {
+                if Some(other) == exclude || *other == id || r.checkout.missing_since.is_some() {
+                    continue;
+                }
+                if let Some(op) = self.store.project(&r.project).map_err(InstanceError::Adapter)? {
+                    if instance_domain(&op.primary_domain, other.slug()) == domain {
+                        occupied = true;
+                        break;
+                    }
+                }
+            }
+            if occupied || (managed && self.worktrees_dir.join(&p.repo_slug).join(&slug).exists()) {
+                continue;
+            }
+            return Ok((id, existing.map(|(_, r)| r.clone())));
+        }
+        Err(InstanceError::Refused("slug space exhausted".into()))
+    }
+    /// Pin or unpin a discovered checkout.
+    pub fn set_pinned(&self, id: &InstanceId, pinned: bool) -> Result<(), InstanceError> {
+        let mut r = self.record(id)?;
+        r.pinned = pinned;
+        self.store.upsert(id, r).map_err(InstanceError::Adapter)
+    }
+    /// Explicitly relabel a stopped instance, preserving its record and sticky resources.
+    pub fn rename_instance(&self, id: &InstanceId, slug: &str) -> Result<InstanceId, InstanceError> {
+        let r = self.record(id)?;
+        if id.is_primary() {
+            return Err(InstanceError::Refused("cannot relabel primary".into()));
+        }
+        if !matches!(
+            self.store.status(id).map_err(InstanceError::Adapter)?,
+            InstanceStatus::Stopped | InstanceStatus::NeedsConfig
+        ) {
+            return Err(InstanceError::Refused("instance is not stopped".into()));
+        }
+        let p = self.project(&r.project)?;
+        let desired = branch_slug(slug);
+        if desired != slug {
+            return Err(InstanceError::Refused("invalid slug".into()));
+        }
+        let (new, revived) = self.allocate(&p, slug, Some(id), false)?;
+        if new.slug() != Some(slug) || revived.is_some() {
+            return Err(InstanceError::Refused("slug or domain already in use".into()));
+        }
+        if &new != id {
+            self.store.rename(id, &new).map_err(InstanceError::Adapter)?;
+            let mut o = self.observations.lock().expect("observations lock");
+            if let Some(x) = o.remove(id) {
+                o.insert(new.clone(), x);
+            }
+        }
+        Ok(new)
+    }
+    /// Resolve, create or reuse a branch and prepare it for the runtime.
+    pub async fn run_branch(
+        &self,
+        req: RunBranchRequest,
+        op: &OpHandle,
+    ) -> Result<RunBranchResponse, InstanceError> {
+        let cancel = op.cancel_token();
+        if cancel.is_cancelled() {
+            return Err(InstanceError::Cancelled);
+        }
+        let p = self.project(&req.project)?;
+        let pr = p.project.repo.as_ref().ok_or(InstanceError::NotARepo)?.clone();
+        let repo = self.repo(&p)?;
+        let guard = self.mutation.lock().await;
+        self.refresh_unlocked(&pr.common_dir).await?;
+        let trees = repo.list_worktrees().await?;
+        let name = match &req.target {
+            BranchTarget::Branch(n) | BranchTarget::NewBranch { name: n, .. } => Some(n.as_str()),
+            _ => None,
+        };
+        if let Some(name) = name {
+            repo.validate_branch(name).await?;
+            if let Some(tree) = trees.iter().find(|w| w.branch.as_deref() == Some(name)) {
+                if matches!(req.target, BranchTarget::NewBranch { .. }) {
+                    return Err(InstanceError::Refused("branch_exists".into()));
+                }
+                if !req.detach {
+                    if tree.prunable.is_some() || !tree.path.is_dir() {
+                        return Err(InstanceError::Refused("checkout_missing".into()));
+                    }
+                    let path = tree.path.join(&pr.subpath);
+                    let (id, mut record) = self
+                        .store
+                        .records()
+                        .map_err(InstanceError::Adapter)?
+                        .into_iter()
+                        .find(|(_, r)| r.project == req.project && r.checkout.path == path)
+                        .ok_or_else(|| InstanceError::Refused("project_not_in_branch".into()))?;
+                    if req.pin {
+                        record.pinned = true;
+                        self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+                    }
+                    let outcome = if tree.path == pr.git_root {
+                        Outcome::ReusedPrimary
+                    } else {
+                        Outcome::ReusedCheckout
+                    };
+                    let domain = instance_domain(&p.primary_domain, id.slug());
+                    drop(guard);
+                    self.ensure_prepared(&id, false, op).await?;
+                    return Ok(RunBranchResponse {
+                        instance: id,
+                        domain,
+                        outcome,
+                        start: req.start,
+                    });
+                }
+            }
+        }
+        let remotes = repo.remotes().await?;
+        if req.fetch == FetchPolicy::Always && !matches!(req.target, BranchTarget::Pr(_)) {
+            for remote in &remotes {
+                op.step("Fetching");
+                repo.fetch(remote, Duration::from_secs(60), &cancel).await?;
+            }
+        }
+        let mut branches = repo.branches(100_000).await?;
+        if let BranchTarget::Branch(name) = &req.target
+            && !branches.iter().any(|b| b.name == *name)
+            && req.fetch == FetchPolicy::Auto
+        {
+            for remote in &remotes {
+                op.step("Fetching");
+                repo.fetch(remote, Duration::from_secs(60), &cancel).await?;
+            }
+            branches = repo.branches(100_000).await?;
+        }
+        let (mode, desired) = match &req.target {
+            BranchTarget::Branch(name) => {
+                if req.detach {
+                    let rev = if branches.iter().any(|b| b.name == *name && b.remote.is_none()) {
+                        format!("refs/heads/{name}")
+                    } else {
+                        let remote = select_remote(&branches, name, req.remote.as_deref())?;
+                        format!("refs/remotes/{remote}/{name}")
+                    };
+                    (AddMode::Detached(rev), branch_slug(name))
+                } else if branches.iter().any(|b| b.name == *name && b.remote.is_none()) {
+                    (AddMode::ExistingLocal(name.clone()), branch_slug(name))
+                } else {
+                    let remote = select_remote(&branches, name, req.remote.as_deref())?;
+                    (
+                        AddMode::TrackRemote {
+                            remote,
+                            branch: name.clone(),
+                        },
+                        branch_slug(name),
+                    )
+                }
+            }
+            BranchTarget::NewBranch { name, base } => {
+                if branches.iter().any(|b| b.name == *name) {
+                    return Err(InstanceError::Refused("branch_exists".into()));
+                }
+                let base = if let Some(base) = base {
+                    base.clone()
+                } else if let Some(b) = repo.default_branch().await? {
+                    b
+                } else if branches.iter().any(|b| b.name == "main" && b.remote.is_none()) {
+                    String::from("refs/heads/main")
+                } else if branches.iter().any(|b| b.name == "master" && b.remote.is_none()) {
+                    String::from("refs/heads/master")
+                } else {
+                    String::from("HEAD")
+                };
+                (
+                    AddMode::NewBranch {
+                        name: name.clone(),
+                        base,
+                    },
+                    branch_slug(name),
+                )
+            }
+            BranchTarget::Detached(rev) => {
+                let oid = repo.resolve_commit(rev).await?;
+                (AddMode::Detached(oid.clone()), detached_slug(&oid))
+            }
+            BranchTarget::Pr(n) => {
+                let remote = req
+                    .remote
+                    .clone()
+                    .or_else(|| remotes.iter().find(|r| r.as_str() == "origin").cloned())
+                    .or_else(|| remotes.first().cloned())
+                    .ok_or_else(|| InstanceError::Refused("no remote for PR".into()))?;
+                op.step("Fetching");
+                let oid = repo.fetch_pr(&remote, *n, &cancel).await?;
+                let name = format!("pr-{n}");
+                if branches.iter().any(|b| b.name == name) {
+                    return Err(InstanceError::Refused("branch_exists".into()));
+                }
+                (
+                    AddMode::NewBranch {
+                        name: name.clone(),
+                        base: oid,
+                    },
+                    name,
+                )
+            }
+        };
+        let (id, revived) = self.allocate(&p, &desired, None, true)?;
+        let slug = id.slug().expect("derived id");
+        let root = self.worktrees_dir.join(&p.repo_slug).join(slug);
+        let project_path = root.join(&pr.subpath);
+        let mut record = revived.unwrap_or_else(|| {
+            new_record(
+                &req.project,
+                project_path.clone(),
+                CheckoutKind::Managed,
+                req.pin,
+                matches!(mode, AddMode::NewBranch { .. } | AddMode::TrackRemote { .. }),
+            )
+        });
+        record.checkout.path = project_path.clone();
+        record.checkout.kind = CheckoutKind::Managed;
+        record.checkout.phase = CheckoutPhase::Creating;
+        record.checkout.missing_since = None;
+        record.pinned |= req.pin;
+        self.store
+            .upsert(&id, record.clone())
+            .map_err(InstanceError::Adapter)?;
+        std::fs::create_dir_all(root.parent().expect("managed parent"))?;
+        op.step("Creating worktree");
+        if let Err(e) = repo.add_worktree(&root, &mode, &cancel).await {
+            self.store.remove(&id).map_err(InstanceError::Adapter)?;
+            return Err(e.into());
+        }
+        record.checkout.phase = CheckoutPhase::Ready;
+        self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+        self.refresh_unlocked(&pr.common_dir).await?;
+        let actual = repo
+            .list_worktrees()
+            .await?
+            .into_iter()
+            .find(|w| w.path == root)
+            .ok_or_else(|| InstanceError::Refused("created worktree not listed".into()))?;
+        let expected = match &mode {
+            AddMode::ExistingLocal(n)
+            | AddMode::TrackRemote { branch: n, .. }
+            | AddMode::NewBranch { name: n, .. } => Some(n.as_str()),
+            AddMode::Detached(_) => None,
+        };
+        if expected != actual.branch.as_deref() || (expected.is_none() && !actual.detached) {
+            return Err(InstanceError::Refused(
+                "unexpected_detached or branch mismatch".into(),
+            ));
+        }
+        if !project_path.is_dir() {
+            return Err(InstanceError::Refused("project_not_in_branch".into()));
+        }
+        let domain = instance_domain(&p.primary_domain, id.slug());
+        drop(guard);
+        self.ensure_prepared(&id, false, op).await?;
+        Ok(RunBranchResponse {
+            instance: id,
+            domain,
+            outcome: Outcome::CreatedWorktree(mode),
+            start: req.start,
+        })
+    }
+    /// Ensure setup is current and return the runtime's expanded environment.
+    pub async fn ensure_prepared(
+        &self,
+        id: &InstanceId,
+        force: bool,
+        op: &OpHandle,
+    ) -> Result<Prepared, InstanceError> {
+        let cancel = op.cancel_token();
+        if cancel.is_cancelled() {
+            return Err(InstanceError::Cancelled);
+        }
+        let mut record = self.record(id)?;
+        let p = self.project(&record.project)?;
+        let pr = p.project.repo.as_ref();
+        let root = if let Some(pr) = pr {
+            strip_subpath(&record.checkout.path, &pr.subpath)?
+        } else {
+            record.checkout.path.clone()
+        };
+        if !record.checkout.path.is_dir() {
+            return Err(InstanceError::Refused("checkout_missing".into()));
+        }
+        op.step("Reading manifest");
+        let manifest = self.store.manifest(id).map_err(InstanceError::Adapter)?;
+        if !manifest.usable {
+            return Err(InstanceError::Refused("needs_config".into()));
+        }
+        let obs = self.observation(id);
+        let branch = obs.as_ref().and_then(|o| o.worktree.branch.clone()).or_else(|| {
+            obs.as_ref()
+                .and_then(|o| o.worktree.head.as_deref().map(detached_slug))
+        });
+        let slug = id
+            .slug()
+            .map(str::to_owned)
+            .or_else(|| branch.as_deref().map(branch_slug));
+        let domain = instance_domain(&p.primary_domain, id.slug());
+        let port = self.store.port(id).map_err(InstanceError::Adapter)?.unwrap_or(0);
+        let ctx = VarContext {
+            port,
+            host: "127.0.0.1".parse().expect("loopback"),
+            domain: domain.clone(),
+            url: format!("https://{domain}"),
+            project: p.project.id.clone(),
+            instance: id.clone(),
+            branch: branch.clone(),
+            branch_slug: slug.clone(),
+            checkout: record.checkout.path.clone(),
+            primary: p.project.root.clone(),
+        };
+        let worktree_env = if record.checkout.kind == CheckoutKind::Primary {
+            BTreeMap::new()
+        } else {
+            manifest
+                .worktree
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.render_data(&ctx)))
+                .collect()
+        };
+        let mut env: BTreeMap<String, String> = manifest
+            .run
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.render_data(&ctx)))
+            .collect();
+        env.extend(worktree_env.clone());
+        for (k, v) in [
+            ("PORT", port.to_string()),
+            ("HOST", ctx.host.to_string()),
+            ("DOMAIN", domain.clone()),
+            ("URL", ctx.url.clone()),
+            ("PROJECT", p.project.id.to_string()),
+            ("INSTANCE", id.safe_name()),
+            ("BRANCH", branch.unwrap_or_default()),
+            ("BRANCH_SLUG", slug.clone().unwrap_or_default()),
+            ("BRANCH_SNAKE", slug.unwrap_or_default().replace('-', "_")),
+            ("CHECKOUT", record.checkout.path.to_string_lossy().into_owned()),
+            ("PRIMARY", p.project.root.to_string_lossy().into_owned()),
+        ] {
+            env.insert(format!("LANTERN_{k}"), v);
+        }
+        env.insert("PORT".into(), port.to_string());
+        env.insert("DOMAIN".into(), domain);
+        env.insert("PROJECT_NAME".into(), p.project.id.to_string());
+        env.insert("LANTERN_PHASE".into(), "setup".into());
+        if record.checkout.kind == CheckoutKind::Primary && !force {
+            return Ok(Prepared {
+                manifest,
+                worktree_env,
+            });
+        }
+        let defaults = if manifest.setup.is_none() {
+            deps::default_setup(&record.checkout.path, &root)?
+        } else {
+            Vec::new()
+        };
+        let commands: Vec<(PathBuf, String)> = if let Some(setup) = &manifest.setup {
+            setup
+                .iter()
+                .map(|v| (record.checkout.path.clone(), v.render_shell()))
+                .collect()
+        } else {
+            defaults
+                .iter()
+                .map(|d| (d.cwd.clone(), d.command.clone()))
+                .collect()
+        };
+        let lock_hash = deps::lock_hash(&record.checkout.path, &root)?;
+        let commands_hash = deps::commands_hash(&commands);
+        let stale = record
+            .checkout
+            .setup
+            .as_ref()
+            .is_none_or(|s| s.lock_hash != lock_hash || s.commands_hash != commands_hash)
+            || defaults.iter().any(|d| !d.artifact.is_dir());
+        if !force && !stale {
+            return Ok(Prepared {
+                manifest,
+                worktree_env,
+            });
+        }
+        if record.checkout.kind != CheckoutKind::Primary {
+            let primary_root = pr.map(|r| r.git_root.as_path()).unwrap_or(&p.project.root);
+            op.step("Copying files");
+            let copied = files::materialize(
+                primary_root,
+                &p.project.root,
+                &root,
+                &record.checkout.path,
+                &manifest.worktree.copy,
+                false,
+                &cancel,
+            )?;
+            record.checkout.materialized.extend(copied);
+            record.checkout.materialized.sort();
+            record.checkout.materialized.dedup();
+            self.store
+                .upsert(id, record.clone())
+                .map_err(InstanceError::Adapter)?;
+            op.step("Linking files");
+            let linked = files::materialize(
+                primary_root,
+                &p.project.root,
+                &root,
+                &record.checkout.path,
+                &manifest.worktree.link,
+                true,
+                &cancel,
+            )?;
+            record.checkout.materialized.extend(linked);
+            record.checkout.materialized.sort();
+            record.checkout.materialized.dedup();
+            self.store
+                .upsert(id, record.clone())
+                .map_err(InstanceError::Adapter)?;
+        }
+        if !commands.is_empty() {
+            op.step("Waiting for a free setup slot");
+            let permit = tokio::select! {_=cancel.cancelled()=>return Err(InstanceError::Cancelled),p=self.setup_slots.acquire()=>p.map_err(|e|InstanceError::Adapter(e.to_string()))?};
+            for (i, (cwd, command)) in commands.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    return Err(InstanceError::Cancelled);
+                }
+                op.step(&format!("Setup {}/{}: {}", i + 1, commands.len(), command));
+                let spec = OneShotSpec {
+                    instance: id.clone(),
+                    cwd: cwd.clone(),
+                    shell_command: command.clone(),
+                    env: env.clone(),
+                    timeout: self.timeout,
+                    cancel: cancel.clone(),
+                    stream: Stream::Setup,
+                };
+                self.runner.run(spec).await.map_err(InstanceError::Adapter)?;
+            }
+            drop(permit);
+        }
+        if cancel.is_cancelled() {
+            return Err(InstanceError::Cancelled);
+        }
+        record.checkout.setup = Some(SetupStamp {
+            lock_hash: deps::lock_hash(&record.checkout.path, &root)?,
+            commands_hash,
+            finished_at: Timestamp::now(),
+        });
+        self.store.upsert(id, record).map_err(InstanceError::Adapter)?;
+        op.step("Ready");
+        Ok(Prepared {
+            manifest,
+            worktree_env,
+        })
+    }
+}
+
+fn select_remote(
+    branches: &[crate::git::BranchInfo],
+    name: &str,
+    requested: Option<&str>,
+) -> Result<String, InstanceError> {
+    let mut remotes: Vec<String> = branches
+        .iter()
+        .filter(|b| b.name == name)
+        .filter_map(|b| b.remote.clone())
+        .collect();
+    remotes.sort();
+    remotes.dedup();
+    if let Some(r) = requested {
+        return if remotes.iter().any(|v| v == r) {
+            Ok(r.into())
+        } else {
+            Err(InstanceError::Refused("branch_not_found".into()))
+        };
+    }
+    if remotes.len() == 1 {
+        return Ok(remotes.remove(0));
+    }
+    if remotes.iter().any(|v| v == "origin") {
+        return Ok("origin".into());
+    }
+    if remotes.is_empty() {
+        Err(InstanceError::Refused("branch_not_found".into()))
+    } else {
+        Err(InstanceError::Refused(format!(
+            "ambiguous_remote: {}",
+            remotes.join(", ")
+        )))
+    }
+}
+pub(crate) fn strip_subpath(path: &Path, subpath: &Path) -> Result<PathBuf, InstanceError> {
+    let mut p = path.to_path_buf();
+    for _ in subpath.components() {
+        if !p.pop() {
+            return Err(InstanceError::UnsafePath(path.display().to_string()));
+        }
+    }
+    if p.join(subpath) != path {
+        return Err(InstanceError::UnsafePath(path.display().to_string()));
+    }
+    Ok(p)
+}
+fn new_record(
+    project: &ProjectId,
+    path: PathBuf,
+    kind: CheckoutKind,
+    pinned: bool,
+    created_branch: bool,
+) -> InstanceRecord {
+    InstanceRecord {
+        project: project.clone(),
+        checkout: CheckoutRecord {
+            path,
+            kind,
+            phase: CheckoutPhase::Ready,
+            created_at: Timestamp::now(),
+            created_branch,
+            materialized: Vec::new(),
+            setup: None,
+            missing_since: None,
+        },
+        pinned,
+        adopt: false,
+        activated: false,
+        first_started: None,
+        last_started: None,
+        last_runtime: None,
+    }
+}
