@@ -194,6 +194,7 @@ struct ActorState {
 struct Actor {
     state: Mutex<ActorState>,
     io_lock: tokio::sync::Mutex<()>,
+    idle: tokio::sync::Notify,
     snapshot: watch::Sender<Option<UnitSnapshot>>,
 }
 impl Actor {
@@ -213,6 +214,7 @@ impl Actor {
                 deploy_started: false,
             }),
             io_lock: tokio::sync::Mutex::new(()),
+            idle: tokio::sync::Notify::new(),
             snapshot,
         }
     }
@@ -230,6 +232,8 @@ struct Inner {
     actors: Mutex<HashMap<InstanceId, Arc<Actor>>>,
     lease_lock: tokio::sync::Mutex<()>,
     env: Mutex<EnvReport>,
+    env_lock: tokio::sync::Mutex<()>,
+    env_sources: Mutex<Option<shell_env::SourceMtimes>>,
     shutdown: CancellationToken,
 }
 impl Drop for Inner {
@@ -321,6 +325,10 @@ impl Runtime {
             config.settings.logs.ring_bytes,
             1024,
         ));
+        let initial_sources = config
+            .shell_env_file
+            .is_file()
+            .then(|| shell_env::source_mtimes(&config.home));
         let inner = Arc::new(Inner {
             config,
             store,
@@ -334,6 +342,8 @@ impl Runtime {
             actors: Mutex::new(HashMap::new()),
             lease_lock: tokio::sync::Mutex::new(()),
             env: Mutex::new(EnvReport::default()),
+            env_lock: tokio::sync::Mutex::new(()),
+            env_sources: Mutex::new(initial_sources),
             shutdown: CancellationToken::new(),
         });
         tokio::spawn(poll_loop(Arc::downgrade(&inner)));
@@ -543,6 +553,23 @@ impl Runtime {
                 "prepare is owned by the instances subsystem",
             )),
         };
+        if token.is_cancelled() && operation != Operation::Stop {
+            // An explicit cancellation without a superseding Stop must also clean up.
+            if self.event(
+                &id,
+                &actor,
+                generation,
+                Event::Request {
+                    operation: Operation::Stop,
+                    validation: StartValidation::Ready,
+                },
+            ) && let Err(error) = self
+                .perform_stop(&id, &actor, generation, &CancellationToken::new())
+                .await
+            {
+                tracing::error!(%id, message=%error.message, "cancelled operation cleanup failed");
+            }
+        }
         let current = {
             let mut guard = actor.state.lock().unwrap();
             if guard.generation == generation {
@@ -552,6 +579,9 @@ impl Runtime {
                 false
             }
         };
+        if current {
+            actor.idle.notify_one();
+        }
         if token.is_cancelled() || !current {
             handle.finish(OpOutcome::Cancelled);
         } else {
@@ -585,12 +615,8 @@ impl Runtime {
         if token.is_cancelled() {
             return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
         }
-        if !noop {
-            self.inner
-                .router
-                .unpublish(id)
-                .await
-                .map_err(|e| Fault::new("route_failed", IssueCode::RouteFailed, e))?;
+        if !noop && let Err(error) = self.inner.router.unpublish(id).await {
+            tracing::warn!(%id, %error, "could not unpublish route before stop");
         }
         let instance = self
             .inner
@@ -691,33 +717,33 @@ impl Runtime {
         let result = self
             .start_inner(id, actor, generation, token, handle, deploy_restart)
             .await;
-        if let Err(fault) = &result {
-            if !token.is_cancelled() {
-                let status = self.state(id).map(|r| r.status);
-                if status == Some(InstanceStatus::Starting) {
-                    self.event(id, actor, generation, Event::DeployFailed(fault.issue));
-                }
-                if status == Some(InstanceStatus::Preparing) {
-                    let ev = if fault.issue == IssueCode::ManifestInvalid {
-                        Event::PlanInvalid(fault.issue)
-                    } else {
-                        Event::PreparationFailed(fault.issue)
-                    };
-                    self.event(id, actor, generation, ev);
-                }
-                if !matches!(status, Some(InstanceStatus::Crashed)) {
-                    self.update(id, actor, generation, {
-                        let fault = fault.clone();
-                        move |r| {
-                            r.issue = Some(RuntimeIssue {
-                                code: fault.issue,
-                                detail: fault.message.clone(),
-                                hint: None,
-                            });
-                            r.message = Some(fault.message);
-                        }
-                    });
-                }
+        if let Err(fault) = &result
+            && !token.is_cancelled()
+        {
+            let status = self.state(id).map(|r| r.status);
+            if status == Some(InstanceStatus::Starting) {
+                self.event(id, actor, generation, Event::DeployFailed(fault.issue));
+            }
+            if status == Some(InstanceStatus::Preparing) {
+                let ev = if fault.issue == IssueCode::ManifestInvalid {
+                    Event::PlanInvalid(fault.issue)
+                } else {
+                    Event::PreparationFailed(fault.issue)
+                };
+                self.event(id, actor, generation, ev);
+            }
+            if !matches!(status, Some(InstanceStatus::Crashed)) {
+                self.update(id, actor, generation, {
+                    let fault = fault.clone();
+                    move |r| {
+                        r.issue = Some(RuntimeIssue {
+                            code: fault.issue,
+                            detail: fault.message.clone(),
+                            hint: None,
+                        });
+                        r.message = Some(fault.message);
+                    }
+                });
             }
         }
         result
@@ -841,6 +867,13 @@ impl Runtime {
         self.update(id, actor, generation, move |r| r.port = port);
         let mut prepared = instance.clone();
         prepared.runtime.port = port;
+        handle.step("env");
+        self.ensure_shell_env()
+            .await
+            .map_err(|e| Fault::new("env", IssueCode::Other, e.to_string()))?;
+        if token.is_cancelled() {
+            return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
+        }
         handle.step("prepare");
         {
             // A preparer must observe cancellation and clean up child one-shots before Stop proceeds.
@@ -1564,16 +1597,33 @@ impl Runtime {
         );
         drop(state);
         if retry {
-            let rt = self.clone();
+            let weak = Arc::downgrade(&self.inner);
+            let shutdown = self.inner.shutdown.clone();
             let id = id.clone();
             let actor = actor.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-                let valid = {
-                    let s = actor.state.lock().unwrap();
-                    s.generation == generation && s.supervisor.retry_pending && s.supervisor.desired_up
-                };
-                if valid {
+                tokio::select! { ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(Duration::from_secs(delay))=>{} }
+                loop {
+                    let wake = actor.idle.notified();
+                    let (valid, busy) = {
+                        let s = actor.state.lock().unwrap();
+                        (
+                            s.generation == generation
+                                && s.supervisor.retry_pending
+                                && s.supervisor.desired_up,
+                            s.active.is_some(),
+                        )
+                    };
+                    if !valid {
+                        return;
+                    }
+                    if !busy {
+                        break;
+                    }
+                    tokio::select! { ()=shutdown.cancelled()=>return, ()=wake=>{} }
+                }
+                if let Some(inner) = weak.upgrade() {
+                    let rt = Runtime { inner };
                     if let Err(e) = rt.request(&id, Operation::Start, false) {
                         tracing::warn!(%id,%e,"automatic retry could not start");
                     }
@@ -1582,11 +1632,13 @@ impl Runtime {
         }
     }
     fn start_health(&self, id: InstanceId, actor: Arc<Actor>, generation: u64) {
-        let rt = self.clone();
+        let weak = Arc::downgrade(&self.inner);
+        let shutdown = self.inner.shutdown.clone();
+        let health = self.inner.config.settings.health.clone();
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(rt.inner.config.settings.health.timeout_secs))
+                .timeout(Duration::from_secs(health.timeout_secs))
                 .build()
             {
                 Ok(c) => c,
@@ -1598,15 +1650,15 @@ impl Runtime {
             let mut failures = 0u32;
             let ready = Instant::now();
             loop {
-                let delay = rt
-                    .inner
-                    .config
-                    .settings
-                    .health
+                let delay = health
                     .interval_secs
                     .saturating_mul(1u64.checked_shl(failures.min(6)).unwrap_or(u64::MAX))
                     .min(60);
-                tokio::time::sleep(Duration::from_secs(delay.max(1))).await;
+                tokio::select! { ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(Duration::from_secs(delay.max(1)))=>{} }
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let rt = Runtime { inner };
                 {
                     let s = actor.state.lock().unwrap();
                     if s.generation != generation
@@ -1648,12 +1700,42 @@ impl Runtime {
                         }
                     } else if let Some(url) = &inst.manifest.upstream_url {
                         match reqwest::Url::parse(url) {
-                            Ok(url) => match client.get(url).send().await {
-                                Ok(r) if r.status().as_u16() < 400 => Ok(Some(r.status().as_u16())),
-                                Ok(r) => Err(format!("HTTP {}", r.status())),
-                                Err(e) => Err(e.to_string()),
+                            Ok(url) => match (url.host_str(), url.port_or_known_default()) {
+                                (Some(host), Some(port)) => match tokio::time::timeout(
+                                    Duration::from_secs(health.timeout_secs),
+                                    tokio::net::TcpStream::connect((host, port)),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => Ok(None),
+                                    Ok(Err(e)) => Err(e.to_string()),
+                                    Err(_) => Err("upstream timed out".into()),
+                                },
+                                _ => Err("upstream has no host or port".into()),
                             },
                             Err(e) => Err(e.to_string()),
+                        }
+                    } else if inst.manifest.deploy.start.is_some() {
+                        match inst.runtime.port {
+                            Some(port) => match rt.probe(port, None).await {
+                                Ok(PortBinding::Free) => Err("deploy listener is absent".into()),
+                                Ok(_) => Ok(None),
+                                Err(e) => Err(e.message),
+                            },
+                            None => Err("deploy listener has no port".into()),
+                        }
+                    } else if inst.manifest.serve == ServeMode::Php {
+                        rt.inner.router.php_ready().await.map(|()| None)
+                    } else if inst.manifest.serve == ServeMode::Static {
+                        if inst
+                            .checkout
+                            .path
+                            .join(inst.manifest.root.as_deref().unwrap_or("."))
+                            .is_dir()
+                        {
+                            Ok(None)
+                        } else {
+                            Err("static site root is missing".into())
                         }
                     } else {
                         Ok(None)
@@ -1837,6 +1919,24 @@ impl Runtime {
     }
     /// Capture and persist the shell environment, falling back to manager environment on failure.
     pub async fn refresh_shell_env(&self) -> Result<EnvReport, RuntimeError> {
+        let _guard = self.inner.env_lock.lock().await;
+        self.refresh_shell_env_locked().await
+    }
+    async fn ensure_shell_env(&self) -> Result<(), RuntimeError> {
+        let _guard = self.inner.env_lock.lock().await;
+        let needs_refresh = {
+            let previous = self.inner.env_sources.lock().unwrap();
+            !self.inner.config.shell_env_file.is_file()
+                || previous
+                    .as_ref()
+                    .is_none_or(|v| shell_env::sources_changed(&self.inner.config.home, v))
+        };
+        if needs_refresh {
+            self.refresh_shell_env_locked().await?;
+        }
+        Ok(())
+    }
+    async fn refresh_shell_env_locked(&self) -> Result<EnvReport, RuntimeError> {
         let cfg = &self.inner.config;
         let shell = if cfg.settings.runtime.shell.is_empty() {
             std::env::var_os("SHELL")
@@ -1873,6 +1973,7 @@ impl Runtime {
             warning,
         };
         *self.inner.env.lock().unwrap() = report.clone();
+        *self.inner.env_sources.lock().unwrap() = Some(shell_env::source_mtimes(&cfg.home));
         Ok(report)
     }
     /// Last capture report; environment values other than PATH are not exposed.
@@ -1923,10 +2024,9 @@ impl Runtime {
                     i.runtime.status,
                     InstanceStatus::Stopped | InstanceStatus::External
                 )
+                && let Err(error) = self.request(id, Operation::Stop, true)
             {
-                if let Err(error) = self.request(id, Operation::Stop, true) {
-                    tracing::warn!(%id, %error, "disabled instance could not be stopped");
-                }
+                tracing::warn!(%id, %error, "disabled instance could not be stopped");
             }
         }
     }
@@ -2010,13 +2110,20 @@ impl Runtime {
                 && row.active == Active::Active
                 && row.sub != "exited"
             {
-                let ready = match instance.runtime.port {
-                    Some(port) => matches!(
-                        self.probe(port, Some(name.clone())).await,
-                        Ok(PortBinding::BoundByUnit { .. })
-                    ),
-                    None => true,
+                let binding = match instance.runtime.port {
+                    Some(port) => match self.probe(port, Some(name.clone())).await {
+                        Ok(PortBinding::BoundByUnit { pid, addrs }) => {
+                            Some((pid, preferred_address(&addrs, port)))
+                        }
+                        Ok(_) => None,
+                        Err(error) => {
+                            report.errors.push(format!("{id}: {}", error.message));
+                            None
+                        }
+                    },
+                    None => None,
                 };
+                let ready = instance.runtime.port.is_none() || binding.is_some();
                 let generation = {
                     let mut s = actor.state.lock().unwrap();
                     s.supervisor = SupervisorState::default();
@@ -2028,12 +2135,18 @@ impl Runtime {
                 let name2 = name.clone();
                 self.update(id, &actor, generation, move |r| {
                     r.unit = Some(name2);
-                    r.main_pid = row.main_pid;
+                    r.main_pid = binding.map(|(pid, _)| pid).or(row.main_pid);
+                    r.upstream = binding.map(|(_, addr)| addr);
                     r.started_at = row.started_at;
                 });
                 actor.snapshot.send_replace(Some(row.clone()));
                 report.adopted.push(id.clone());
                 if ready {
+                    let upstream = binding.map(|(_, addr)| addr);
+                    if let Err(error) = self.publish_route(&instance, upstream).await {
+                        self.event(id, &actor, generation, Event::RouteFailed);
+                        report.errors.push(format!("{id}: {}", error.message));
+                    }
                     self.start_health(id.clone(), actor.clone(), generation);
                 } else if let Some(port) = instance.runtime.port {
                     let rt = self.clone();
@@ -2047,6 +2160,14 @@ impl Runtime {
                             .is_ok()
                         {
                             rt.event(&id, &actor, generation, Event::Ready);
+                            if let Ok(Some(instance)) = rt.inner.store.instance(&id)
+                                && rt
+                                    .publish_route(&instance, instance.runtime.upstream)
+                                    .await
+                                    .is_err()
+                            {
+                                rt.event(&id, &actor, generation, Event::RouteFailed);
+                            }
                             rt.start_health(id, actor, generation);
                         }
                     });

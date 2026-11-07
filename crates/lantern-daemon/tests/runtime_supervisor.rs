@@ -213,6 +213,10 @@ impl InstancePreparer for HungPrepare {
     }
 }
 fn config(temp: &Temp) -> RuntimeConfig {
+    std::fs::create_dir_all(temp.0.join("cache")).unwrap();
+    if !temp.0.join("cache/env.sh").exists() {
+        std::fs::write(temp.0.join("cache/env.sh"), "export PATH='/usr/bin:/bin'\n").unwrap();
+    }
     let mut settings = Settings::default();
     settings.ports.range_start = 39100;
     settings.ports.range_end = 39190;
@@ -753,4 +757,191 @@ async fn runtime_deploy_start_restart_and_stop_use_oneshots() {
     assert_eq!(snap.status, OperationStatus::Succeeded, "{snap:?}");
     assert_eq!(*systemd.verbs.lock().unwrap(), vec!["start", "restart", "stop"]);
     assert!(!running.load(Ordering::SeqCst));
+}
+
+struct TestServices {
+    calls: Mutex<Vec<String>>,
+    backend: Arc<FakeSystemd>,
+}
+impl lantern_daemon::runtime::seams::ServiceControl for TestServices {
+    fn has(&self, name: &str) -> bool {
+        name == "redis"
+    }
+    fn ensure_running<'a>(&'a self, name: &'a str, _: Duration, _: CancellationToken) -> PrepareFuture<'a> {
+        Box::pin(async move {
+            if self.backend.calls().iter().any(|s| s.starts_with("start ")) {
+                return Err("instance started before service".into());
+            }
+            self.calls.lock().unwrap().push(name.into());
+            Ok(())
+        })
+    }
+}
+#[tokio::test]
+async fn runtime_shared_service_dependencies_run_before_spawn() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert(
+        "app",
+        &temp.0,
+        "python3 -m http.server ${PORT}",
+        &["service:redis"],
+    );
+    let backend = Arc::new(FakeSystemd::default());
+    backend.set_auto_start(true);
+    let services = Arc::new(TestServices {
+        calls: Mutex::new(vec![]),
+        backend: backend.clone(),
+    });
+    let adapters = lantern_daemon::runtime::RuntimeAdapters {
+        preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+        router: Arc::new(TestRouter::default()),
+        services: services.clone(),
+    };
+    let rt = Runtime::with_all_adapters(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        backend,
+        OperationTracker::new(EventBus::new()),
+        adapters,
+    );
+    let op = rt.start(&id, StartOpts).await.unwrap();
+    assert_eq!(completed(&op).await, OperationStatus::Succeeded);
+    assert_eq!(*services.calls.lock().unwrap(), vec!["redis"]);
+}
+
+#[tokio::test]
+async fn runtime_health_failure_and_recovery_updates_status() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let backend = Arc::new(FakeSystemd::default());
+    backend.set_auto_start(true);
+    let probe = Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready)));
+    let mut cfg = config(&temp);
+    cfg.settings.health.interval_secs = 1;
+    cfg.settings.health.fail_threshold = 1;
+    cfg.settings.health.grace_secs = 0;
+    let rt = runtime(cfg, store, probe.clone(), backend);
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    *probe.0.lock().unwrap() = ProbeMode::Waiting;
+    let failed = wait_state(&rt, &id, |s| s.status == InstanceStatus::Unhealthy).await;
+    assert_eq!(failed.health.state, lantern_core::model::HealthState::Failing);
+    *probe.0.lock().unwrap() = ProbeMode::Ready;
+    let recovered = wait_state(&rt, &id, |s| {
+        s.status == InstanceStatus::Running && s.health.state == lantern_core::model::HealthState::Healthy
+    })
+    .await;
+    assert!(recovered.health.recent.len() >= 2);
+}
+
+#[tokio::test]
+async fn runtime_explicit_cancellation_cleans_up_start() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let backend = Arc::new(FakeSystemd::default());
+    backend.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Waiting))),
+        backend.clone(),
+    );
+    let start = rt.start(&id, StartOpts).await.unwrap();
+    wait_state(&rt, &id, |s| s.unit.is_some()).await;
+    assert!(start.cancel());
+    assert_eq!(completed(&start).await, OperationStatus::Cancelled);
+    assert_eq!(rt.state(&id).unwrap().status, InstanceStatus::Stopped);
+    assert!(backend.calls().iter().any(|s| s.starts_with("stop ")));
+}
+
+#[tokio::test]
+async fn runtime_reconcile_adopts_running_unit_and_republishes() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    {
+        let mut instances = store.instances.lock().unwrap();
+        let runtime = &mut instances.get_mut(&id).unwrap().runtime;
+        runtime.port = Some(39180);
+        runtime.status = InstanceStatus::Running;
+    }
+    let backend = Arc::new(FakeSystemd::default());
+    backend.set_snapshot(running_snapshot("lantern-test-supervisor-inst-app.service"));
+    let router = Arc::new(TestRouter::default());
+    let rt = Runtime::with_adapters(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        backend.clone(),
+        OperationTracker::new(EventBus::new()),
+        Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+        router.clone(),
+    );
+    let report = rt.reconcile().await;
+    assert_eq!(report.adopted, vec![id.clone()]);
+    assert!(report.errors.is_empty(), "{report:?}");
+    let state = rt.state(&id).unwrap();
+    assert_eq!(state.status, InstanceStatus::Running);
+    assert_eq!(
+        state.upstream,
+        Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 39180)))
+    );
+    assert!(
+        router
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.starts_with("publish app Socket"))
+    );
+    assert!(!backend.calls().iter().any(|s| s.starts_with("start ")));
+}
+
+#[tokio::test]
+async fn runtime_captures_and_refreshes_shell_env_when_sources_change() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let fake = Arc::new(FakeSystemd::default());
+    fake.set_auto_start(true);
+    let mut cfg = config(&temp);
+    let fake_shell = temp.0.join("test-shell");
+    let counter = temp.0.join("captures");
+    std::fs::write(&fake_shell,format!("#!/bin/sh\nprintf x >> '{}'\nprintf '<<LANTERN_ENV_BEGIN>>PATH=/usr/bin:/bin\\0TEST_CAPTURE=value\\0<<LANTERN_ENV_END>>'\n",counter.display())).unwrap();
+    std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_file(&cfg.shell_env_file).unwrap();
+    cfg.settings.runtime.shell = fake_shell.to_string_lossy().into_owned();
+    let rt = runtime(
+        cfg.clone(),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        fake,
+    );
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    assert!(rt.env_report().captured_at.is_some());
+    assert!(
+        std::fs::read_to_string(&cfg.shell_env_file)
+            .unwrap()
+            .contains("TEST_CAPTURE='value'")
+    );
+    assert_eq!(
+        completed(&rt.stop(&id, StopOpts::default()).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    std::fs::write(temp.0.join(".bashrc"), "# changed").unwrap();
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    assert_eq!(std::fs::read_to_string(counter).unwrap(), "xx");
 }
