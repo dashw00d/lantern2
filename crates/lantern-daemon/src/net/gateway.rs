@@ -83,7 +83,8 @@ fn forwarded<'a>(state: &GatewayState, h: &'a HeaderMap) -> Option<(&'a str, Str
         return None;
     }
     match (state.https_port, authority.port_u16()) {
-        (443, None | Some(443)) => {}
+        (443, None) if raw == host => {}
+        (443, Some(443)) => {}
         (port, Some(actual)) if port == actual => {}
         _ => return None,
     }
