@@ -57,6 +57,11 @@ pub(super) struct DockerCache {
     by_inode: HashMap<u64, Option<DockerInfo>>,
 }
 impl DockerCache {
+    pub fn needs_refresh(&self, sockets: &[RawSocket], root: &ProcRoot) -> bool {
+        sockets
+            .iter()
+            .any(|s| s.uid != root.uid() && !self.by_inode.contains_key(&s.inode))
+    }
     pub fn enrich(&mut self, sockets: &[RawSocket], root: &ProcRoot) -> HashMap<u64, DockerInfo> {
         let foreign: Vec<_> = sockets.iter().filter(|s| s.uid != root.uid()).collect();
         let live: HashSet<_> = foreign.iter().map(|s| s.inode).collect();

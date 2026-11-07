@@ -128,8 +128,18 @@ impl Scanner {
         }
     }
     fn observe(&mut self, sockets: Vec<RawSocket>, now: Instant) -> Vec<Observation> {
-        let owners = self.owners.resolve(&sockets, &mut self.reader, now);
-        let docker = self.docker.enrich(&sockets, &self.reader.root);
+        let root = self.reader.root.clone();
+        let (owners, docker) = if self.docker.needs_refresh(&sockets, &root) {
+            std::thread::scope(|scope| {
+                let docker = scope.spawn(|| self.docker.enrich(&sockets, &root));
+                let owners = self.owners.resolve(&sockets, &mut self.reader, now);
+                (owners, docker.join().expect("docker enrichment worker panicked"))
+            })
+        } else {
+            let owners = self.owners.resolve(&sockets, &mut self.reader, now);
+            let docker = self.docker.enrich(&sockets, &root);
+            (owners, docker)
+        };
         sockets
             .into_iter()
             .map(|s| {
