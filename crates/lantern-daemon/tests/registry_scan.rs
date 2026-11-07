@@ -187,3 +187,30 @@ async fn registry_scan_depth_hidden_and_relocation() {
         new
     );
 }
+
+#[tokio::test]
+async fn registry_scan_listener_offer_is_confined_and_survives_scan() {
+    let t = Temp::new();
+    let app = t.mkdir("unscanned/app");
+    fs::create_dir_all(app.join(".git")).unwrap();
+    fs::write(app.join("package.json"), r#"{"dependencies":{"vite":"1"}}"#).unwrap();
+    let nested = t.mkdir("unscanned/app/node_modules/tool");
+    let mut settings = Settings::default();
+    settings.workspaces.roots = vec![t.mkdir("empty-workspace").display().to_string()];
+    let (reg, _) = RegistryHandle::open(
+        &t.dirs(),
+        settings,
+        Templates::default(),
+        t.0.clone(),
+        EventBus::new(),
+    )
+    .unwrap();
+    let suggestion = reg.offer_suggestion(&nested).unwrap().unwrap();
+    assert_eq!(suggestion.path, app);
+    assert_eq!(suggestion.framework, "vite");
+    assert_eq!(reg.offer_suggestion(&nested).unwrap(), Some(suggestion.clone()));
+    assert_eq!(reg.scan_workspace(&t.dirs()).unwrap().suggestions, [suggestion]);
+    assert!(reg.offer_suggestion(&t.0).unwrap().is_none());
+    reg.dismiss_suggestion(&app);
+    assert!(reg.offer_suggestion(&nested).unwrap().is_none());
+}

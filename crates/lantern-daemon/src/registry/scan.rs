@@ -371,14 +371,19 @@ impl RegistryHandle {
             s.dirty();
             s.publish_index();
         }
-        let suggestions: Vec<_> = scan
+        let mut combined = std::collections::BTreeMap::new();
+        for suggestion in scan
             .suggestions
             .into_iter()
-            .filter(|v| {
-                !s.file.dismissed_suggestions.contains(&v.path)
-                    && !s.file.projects.values().any(|p| p.root == v.path)
-            })
-            .collect();
+            .chain(s.listener_suggestions.values().cloned())
+        {
+            if !s.file.dismissed_suggestions.contains(&suggestion.path)
+                && !s.file.projects.values().any(|p| p.root == suggestion.path)
+            {
+                combined.insert(suggestion.path.clone(), suggestion);
+            }
+        }
+        let suggestions: Vec<_> = combined.into_values().collect();
         if suggestions != s.suggestions {
             s.suggestions = suggestions.clone();
             s.bus.publish(Event::SuggestionsChanged {
@@ -388,6 +393,92 @@ impl RegistryHandle {
         report.suggestions = suggestions;
         Ok(report)
     }
+    /// Offer an unmatched listener's cwd as a suggestion, confined to the injected home directory.
+    pub fn offer_suggestion(&self, cwd: &Path) -> Result<Option<Suggestion>, Error> {
+        let cwd = cwd.canonicalize()?;
+        let mut s = self.lock();
+        if !s.settings.workspaces.suggest {
+            return Ok(None);
+        }
+        let home = s.home.canonicalize().unwrap_or_else(|_| s.home.clone());
+        if !cwd.starts_with(&home) || cwd == home || s.checkouts.values().any(|c| cwd.starts_with(&c.path)) {
+            return Ok(None);
+        }
+        let mut manifest_root = None;
+        let mut git_root = None;
+        let mut marker_root = None;
+        for path in cwd.ancestors().take_while(|p| *p != home) {
+            if !path.starts_with(&home) {
+                break;
+            }
+            let ignored = path.strip_prefix(&home).ok().is_some_and(|relative| {
+                relative.components().any(|part| {
+                    let name = part.as_os_str().to_string_lossy();
+                    IGNORE.contains(&name.as_ref())
+                        || s.settings
+                            .workspaces
+                            .ignore
+                            .iter()
+                            .any(|item| item == name.as_ref())
+                })
+            });
+            if ignored {
+                continue;
+            }
+            if manifest_root.is_none() && manifest::find_manifest(path).is_some() {
+                manifest_root = Some(path.to_path_buf());
+            }
+            if git_root.is_none() && path.join(".git").exists() {
+                git_root = Some(path.to_path_buf());
+            }
+            if marker_root.is_none()
+                && ["package.json", "pyproject.toml", "composer.json"]
+                    .iter()
+                    .any(|f| path.join(f).is_file())
+            {
+                marker_root = Some(path.to_path_buf());
+            }
+        }
+        let Some(root) = manifest_root.or(git_root).or(marker_root) else {
+            return Ok(None);
+        };
+        if s.file.dismissed_suggestions.contains(&root) || s.file.projects.values().any(|p| p.root == root) {
+            return Ok(None);
+        }
+        if s.suggestion_checked
+            .get(&root)
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(600))
+        {
+            return Ok(s.listener_suggestions.get(&root).cloned());
+        }
+        s.suggestion_checked.insert(root.clone(), Instant::now());
+        let name = root.file_name().and_then(|v| v.to_str()).unwrap_or("");
+        let Ok(proposed_id) = ProjectId::from_name(name) else {
+            return Ok(None);
+        };
+        let detection = detect::detect_dir(&root);
+        let suggestion = Suggestion {
+            path: root.clone(),
+            proposed_id,
+            framework: detection.framework_name().into(),
+            confidence: match detection.confidence {
+                Confidence::High => ApiConfidence::High,
+                Confidence::Medium => ApiConfidence::Medium,
+                Confidence::Low => ApiConfidence::Low,
+            },
+        };
+        s.listener_suggestions.insert(root.clone(), suggestion.clone());
+        if let Some(old) = s.suggestions.iter_mut().find(|candidate| candidate.path == root) {
+            *old = suggestion.clone();
+        } else {
+            s.suggestions.push(suggestion.clone());
+        }
+        s.suggestions.sort_by(|a, b| a.path.cmp(&b.path));
+        s.bus.publish(Event::SuggestionsChanged {
+            suggestions: s.suggestions.clone(),
+        });
+        Ok(Some(suggestion))
+    }
     /// Persistently dismiss one suggestion and immediately update subscribers.
     pub fn dismiss_suggestion(&self, path: &Path) {
         let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
@@ -395,6 +486,7 @@ impl RegistryHandle {
         if s.file.dismissed_suggestions.insert(path.clone()) {
             s.dirty();
         }
+        s.listener_suggestions.remove(&path);
         let old = s.suggestions.len();
         s.suggestions.retain(|v| v.path != path);
         if old != s.suggestions.len() {

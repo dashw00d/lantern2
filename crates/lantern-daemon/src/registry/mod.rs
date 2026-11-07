@@ -96,6 +96,8 @@ struct State {
     listener_seq: u64,
     services: Vec<ServiceStatus>,
     suggestions: Vec<Suggestion>,
+    listener_suggestions: BTreeMap<PathBuf, Suggestion>,
+    suggestion_checked: BTreeMap<PathBuf, std::time::Instant>,
 }
 
 /// Cheap, thread-safe handle; all persisted and runtime mutations are serialized here.
@@ -131,6 +133,8 @@ impl RegistryHandle {
             listener_seq: 0,
             services: Vec::new(),
             suggestions: Vec::new(),
+            listener_suggestions: BTreeMap::new(),
+            suggestion_checked: BTreeMap::new(),
         };
         let ids: Vec<_> = state.file.instances.keys().cloned().collect();
         for id in ids {
