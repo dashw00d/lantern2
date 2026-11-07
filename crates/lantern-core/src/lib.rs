@@ -17,3 +17,8 @@ pub mod yaml;
 
 /// RFC 3339 UTC timestamp used throughout the domain model and on the wire.
 pub type Timestamp = jiff::Timestamp;
+
+/// XDG / `LANTERN_*_DIR` directory resolution (re-export of `settings::Dirs`).
+pub mod dirs {
+    pub use crate::settings::Dirs;
+}
