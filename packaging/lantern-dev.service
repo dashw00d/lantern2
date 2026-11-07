@@ -1,0 +1,14 @@
+[Unit]
+Description=Lantern development daemon (isolated from Lantern v1)
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/lantern daemon --dev
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=30
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
