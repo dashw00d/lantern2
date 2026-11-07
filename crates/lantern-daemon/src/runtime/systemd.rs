@@ -352,13 +352,35 @@ pub async fn run_oneshot(
     let deadline = tokio::time::sleep(spec.timeout);
     tokio::pin!(deadline);
     tokio::pin!(cancel);
-    let started = tokio::select! {
-        biased;
-        () = &mut cancel => Err(OneShotError::Cancelled),
-        () = &mut deadline => Err(OneShotError::Timeout),
-        result = backend.start(&spec.unit) => result.map_err(OneShotError::Unit),
+    // Once the start future has been polled, systemd may already have received the
+    // request. Settle it before stopping, so a delayed acknowledgement cannot start
+    // the unit after cancellation cleanup.
+    let mut start = Box::pin(backend.start(&spec.unit));
+    let mut polled = false;
+    let started = {
+        let observed_start = std::future::poll_fn(|cx| {
+            polled = true;
+            start.as_mut().poll(cx)
+        });
+        tokio::pin!(observed_start);
+        tokio::select! {
+            biased;
+            () = &mut cancel => Err(OneShotError::Cancelled),
+            () = &mut deadline => Err(OneShotError::Timeout),
+            result = &mut observed_start => result.map_err(OneShotError::Unit),
+        }
     };
     if let Err(error) = started {
+        if polled && matches!(error, OneShotError::Cancelled | OneShotError::Timeout) {
+            let settle = spec.unit.stop_timeout.saturating_add(Duration::from_secs(45));
+            if tokio::time::timeout(settle, &mut start).await.is_err() {
+                drop(start);
+                cleanup_one_shot(backend, spec).await?;
+                return Err(OneShotError::Unit(UnitError::Timeout(
+                    "one-shot start did not settle; cleanup cannot be verified".into(),
+                )));
+            }
+        }
         cleanup_one_shot(backend, spec).await?;
         return Err(error);
     }
@@ -521,9 +543,15 @@ impl UserSystemd for SystemctlBackend {
 pub struct FakeSystemd {
     snapshots: Mutex<BTreeMap<String, UnitSnapshot>>,
     calls: Mutex<Vec<String>>,
+    auto_start: std::sync::atomic::AtomicBool,
 }
 
 impl FakeSystemd {
+    /// Have subsequent starts automatically install an active running snapshot.
+    pub fn set_auto_start(&self, enabled: bool) {
+        self.auto_start
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
     /// Set or replace a snapshot returned by future polls.
     pub fn set_snapshot(&self, snapshot: UnitSnapshot) {
         self.snapshots
@@ -545,6 +573,22 @@ impl UserSystemd for FakeSystemd {
         Box::pin(async move {
             start_args(spec)?;
             self.record(format!("start {}", spec.unit));
+            if self.auto_start.load(std::sync::atomic::Ordering::SeqCst) {
+                let snapshot = UnitSnapshot {
+                    unit: spec.unit.clone(),
+                    load: Load::Loaded,
+                    active: Active::Active,
+                    sub: "running".into(),
+                    result: "success".into(),
+                    main_pid: Some(1234),
+                    exit_code: None,
+                    exit_kind: ExitCodeKind::Unknown,
+                    started_at: Some(Timestamp::now()),
+                    invocation_id: None,
+                    cgroup: None,
+                };
+                self.set_snapshot(snapshot);
+            }
             Ok(())
         })
     }

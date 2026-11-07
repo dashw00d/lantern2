@@ -151,8 +151,12 @@ pub enum Event {
     HealthRecovered,
     /// A managed unit finished stopping or was absent.
     UnitInactive,
+    /// Cleanup after a failed start could not stop the unit.
+    CleanupFailed(IssueCode),
     /// A stop deadline expired while processes were still present.
     StopTimeout,
+    /// A deploy stop left the externally managed listener alive.
+    StopIncomplete,
     /// A scheduled crash retry fired.
     RetryTimer,
     /// Discovery found a matched unmanaged listener.
@@ -362,7 +366,7 @@ pub fn transition(state: &SupervisorState, event: Event) -> (SupervisorState, Ve
             next.desired_up = false;
             finish(&mut next, &mut effects);
         }
-        Event::PlanInvalid(issue) if matches!(next.status, S::Preparing | S::Stopped) => {
+        Event::PlanInvalid(issue) if matches!(next.status, S::Preparing | S::Starting | S::Stopped) => {
             next.status = S::NeedsConfig;
             next.issue = Some(issue);
             next.desired_up = false;
@@ -430,6 +434,18 @@ pub fn transition(state: &SupervisorState, event: Event) -> (SupervisorState, Ve
                 next.status = S::Stopped;
                 finish(&mut next, &mut effects);
             }
+        }
+        Event::CleanupFailed(issue) if next.status == S::Starting => {
+            next.status = S::Stopping;
+            next.desired_up = false;
+            next.issue = Some(issue);
+            finish(&mut next, &mut effects);
+        }
+        Event::StopIncomplete if next.status == S::Stopping => {
+            next.status = S::Running;
+            next.desired_up = true;
+            next.restart_pending = false;
+            finish(&mut next, &mut effects);
         }
         Event::StopTimeout if next.status == S::Stopping => {
             next.restart_pending = false;

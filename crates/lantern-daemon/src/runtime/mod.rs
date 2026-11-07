@@ -17,3 +17,14 @@ pub mod ports;
 
 /// Pure lifecycle transitions and preemption decisions.
 pub mod state_machine;
+
+/// Consumer-defined integration seams.
+pub mod seams;
+
+/// Live runtime facade and supervisor operations.
+pub mod facade;
+
+pub use facade::{
+    DeployStatus, EnvReport, HistoryQuery, OneShotLaunch, ReconcileReport, Runtime, RuntimeAdapters,
+    RuntimeConfig, RuntimeError, RuntimeOperation, StartOpts, StopOpts,
+};
