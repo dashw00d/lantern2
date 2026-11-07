@@ -99,6 +99,28 @@ impl PortsStep<'_> {
             }
         }
     }
+    fn trusted_setcap_target(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        if self.caddy != self.paths.bundled_caddy {
+            return false;
+        }
+        let Ok(file) = fs::symlink_metadata(self.caddy) else {
+            return false;
+        };
+        if !file.file_type().is_file() {
+            return false;
+        }
+        if self.paths.fake_root.is_some() {
+            return true;
+        }
+        if file.uid() != 0 || file.mode() & 0o022 != 0 {
+            return false;
+        }
+        self.caddy.ancestors().skip(1).all(|path| {
+            fs::symlink_metadata(path)
+                .is_ok_and(|meta| meta.file_type().is_dir() && meta.uid() == 0 && meta.mode() & 0o022 == 0)
+        })
+    }
     fn has_cap(&self) -> bool {
         let spec = CommandSpec::new("/usr/sbin/getcap", [self.caddy.as_os_str()], false);
         self.runner.run(&spec).is_ok_and(|out| {
@@ -177,10 +199,8 @@ impl Step for PortsStep<'_> {
                     })
             }
             PortStrategy::Setcap => {
-                if self.caddy != self.paths.bundled_caddy
-                    || !fs::symlink_metadata(self.caddy).is_ok_and(|m| m.file_type().is_file())
-                {
-                    Err("setcap is restricted to the regular bundled Caddy executable".into())
+                if !self.trusted_setcap_target() {
+                    Err("setcap requires a regular root-owned bundled Caddy in root-owned, non-writable directories".into())
                 } else {
                     run_checked(
                         self.runner,

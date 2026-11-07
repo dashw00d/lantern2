@@ -1521,3 +1521,33 @@ fn init_persists_the_selected_policy_even_when_live_ports_are_already_open() {
     assert_eq!(cap.apply().state, OutcomeState::Changed);
     assert!(runner.state.borrow().cap);
 }
+
+#[test]
+fn setcap_refuses_user_writable_bundled_target() {
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(&f.paths.sysctl_live, b"1024");
+    f.write(&f.paths.bundled_caddy, b"untrusted");
+    let mut paths = f.paths.clone();
+    paths.fake_root = None;
+    let step = PortsStep {
+        paths: &paths,
+        runner: &runner,
+        http_port: 80,
+        https_port: 443,
+        caddy: &paths.bundled_caddy,
+        strategy: PortStrategy::Setcap,
+        from_package: false,
+    };
+    let outcome = step.apply();
+    assert_eq!(outcome.state, OutcomeState::Failed);
+    assert!(outcome.detail.contains("root-owned"));
+    assert!(
+        !runner
+            .state
+            .borrow()
+            .commands
+            .iter()
+            .any(|command| command.mutating)
+    );
+}
