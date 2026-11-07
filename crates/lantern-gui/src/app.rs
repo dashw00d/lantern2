@@ -694,6 +694,11 @@ impl App {
                     InstanceStatus::Running | InstanceStatus::Unhealthy
                 ) {
                     let url = instance.url.clone();
+                    if !url.starts_with("https://") && !url.starts_with("http://") {
+                        self.toasts
+                            .push("Only HTTP(S) instance URLs can be opened.".into());
+                        return Task::none();
+                    }
                     Task::perform(
                         async move {
                             tokio::task::spawn_blocking(move || open::that(url))
@@ -1400,5 +1405,18 @@ mod tests {
         drop(app.update(Message::LogBacklog(id, epoch, Ok(page))));
         assert_eq!(app.logs.len(), 1);
         assert_eq!(app.logs.get(0).unwrap().line, "kept");
+    }
+    #[test]
+    fn quick_switch_refuses_non_http_urls() {
+        let mut app = app();
+        complete(&mut app);
+        let mut unsafe_url = instance(InstanceStatus::Running);
+        unsafe_url.url = "file:///tmp/lantern-gui-test".into();
+        let id = unsafe_url.id.clone();
+        drop(app.update(Message::Stream(Box::new(StreamEvent::Event(
+            WireEvent::InstanceUpdated { instance: unsafe_url },
+        )))));
+        drop(app.update(Message::QuickChoose(id, false)));
+        assert!(app.toasts.iter().any(|toast| toast.contains("Only HTTP(S)")));
     }
 }
