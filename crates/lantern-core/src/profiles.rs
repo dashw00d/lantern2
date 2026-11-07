@@ -5,6 +5,7 @@ use crate::{
     template::TemplateString,
     yaml::{self, Node},
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,7 +13,7 @@ use std::{
 };
 
 /// Profile services, start targets and environment overlay.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct Profile {
     pub description: Option<String>,

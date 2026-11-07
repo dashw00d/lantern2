@@ -1,4 +1,5 @@
 //! Sparse, serializable manifest layers and lenient v1-compatible fields.
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 use std::collections::BTreeMap;
 
@@ -67,7 +68,7 @@ fn scalar_map<'de, D: Deserializer<'de>>(d: D) -> Result<Option<BTreeMap<String,
 }
 
 /// A sparse layer of manifest values; absent and explicitly empty lists differ.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct RawManifest {
     pub version: Option<u32>,
@@ -76,8 +77,10 @@ pub struct RawManifest {
     pub description: Option<String>,
     pub kind: Option<String>,
     #[serde(deserialize_with = "string_or_list")]
+    #[schemars(with = "Option<StringOrList>")]
     pub tags: Option<Vec<String>>,
     #[serde(deserialize_with = "lenient_bool")]
+    #[schemars(with = "Option<LenientBool>")]
     pub enabled: Option<bool>,
     pub repo_url: Option<String>,
     pub template: Option<String>,
@@ -90,14 +93,17 @@ pub struct RawManifest {
     pub health_endpoint: Option<String>,
     pub run: Option<RunSection>,
     #[serde(deserialize_with = "one_or_many")]
+    #[schemars(with = "Option<StringOrList>")]
     pub setup: Option<Vec<String>>,
     pub worktree: Option<WorktreeSection>,
     pub deploy: Option<DeploySection>,
     #[serde(deserialize_with = "string_or_list")]
+    #[schemars(with = "Option<StringOrList>")]
     pub depends_on: Option<Vec<String>>,
     pub features: Option<FeaturesSection>,
     pub routing: Option<RoutingSection>,
     #[serde(deserialize_with = "docs_list")]
+    #[schemars(with = "Option<DocOrList>")]
     pub docs: Option<Vec<DocEntry>>,
     pub docs_auto: Option<DocsAuto>,
     pub endpoints: Option<Vec<EndpointEntry>>,
@@ -110,29 +116,33 @@ impl RawManifest {
     }
 }
 /// Project run command and environment.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct RunSection {
     pub cmd: Option<String>,
     pub cwd: Option<String>,
     #[serde(deserialize_with = "scalar_map")]
+    #[schemars(with = "Option<BTreeMap<String, Scalar>>")]
     pub env: Option<BTreeMap<String, String>>,
     pub pre_start: Option<String>,
     pub post_stop: Option<String>,
 }
 /// Worktree copying, linking and environment overlay.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct WorktreeSection {
     #[serde(deserialize_with = "one_or_many")]
+    #[schemars(with = "Option<StringOrList>")]
     pub copy: Option<Vec<String>>,
     #[serde(deserialize_with = "one_or_many")]
+    #[schemars(with = "Option<StringOrList>")]
     pub link: Option<Vec<String>>,
     #[serde(deserialize_with = "scalar_map")]
+    #[schemars(with = "Option<BTreeMap<String, Scalar>>")]
     pub env: Option<BTreeMap<String, String>>,
 }
 /// Shell overrides for project operations.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct DeploySection {
     pub start: Option<String>,
@@ -144,36 +154,44 @@ pub struct DeploySection {
     pub env_file: Option<String>,
 }
 /// Feature switches.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct FeaturesSection {
     #[serde(deserialize_with = "lenient_bool")]
+    #[schemars(with = "Option<LenientBool>")]
     pub mailpit: Option<bool>,
     #[serde(deserialize_with = "lenient_bool")]
+    #[schemars(with = "Option<LenientBool>")]
     pub auto_start: Option<bool>,
     #[serde(deserialize_with = "lenient_bool")]
+    #[schemars(with = "Option<LenientBool>")]
     pub auto_open_browser: Option<bool>,
 }
 /// Routing and agent metadata.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct RoutingSection {
     #[serde(deserialize_with = "string_or_list")]
+    #[schemars(with = "Option<StringOrList>")]
     pub aliases: Option<Vec<String>>,
     pub paths: Option<BTreeMap<String, String>>,
     #[serde(deserialize_with = "lenient_bool")]
+    #[schemars(with = "Option<LenientBool>")]
     pub websocket: Option<bool>,
     #[serde(deserialize_with = "string_or_list")]
+    #[schemars(with = "Option<StringOrList>")]
     pub triggers: Option<Vec<String>>,
     pub risk: Option<String>,
     #[serde(deserialize_with = "lenient_bool")]
+    #[schemars(with = "Option<LenientBool>")]
     pub requires_confirmation: Option<bool>,
     pub max_concurrent: Option<u32>,
     #[serde(deserialize_with = "string_or_list")]
+    #[schemars(with = "Option<StringOrList>")]
     pub agents: Option<Vec<String>>,
 }
 /// An explicitly listed document.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged, expecting = "a document path or mapping with a path")]
 pub enum DocEntry {
     Path(String),
@@ -200,20 +218,23 @@ fn docs_list<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<DocEntry>>, D
     }
 }
 /// Documentation discovery settings.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct DocsAuto {
     #[serde(deserialize_with = "lenient_bool")]
+    #[schemars(with = "Option<LenientBool>")]
     pub enabled: Option<bool>,
     #[serde(deserialize_with = "string_or_list")]
+    #[schemars(with = "Option<StringOrList>")]
     pub patterns: Option<Vec<String>>,
     #[serde(deserialize_with = "string_or_list")]
+    #[schemars(with = "Option<StringOrList>")]
     pub ignore: Option<Vec<String>>,
     pub max_files: Option<u32>,
     pub max_bytes: Option<u64>,
 }
 /// An explicit endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EndpointEntry {
     pub method: Option<String>,
     pub path: String,
@@ -224,15 +245,50 @@ pub struct EndpointEntry {
     pub params: Option<serde_json::Value>,
 }
 /// OpenAPI discovery settings.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ApiAuto {
     #[serde(deserialize_with = "lenient_bool")]
+    #[schemars(with = "Option<LenientBool>")]
     pub enabled: Option<bool>,
     #[serde(deserialize_with = "string_or_list")]
+    #[schemars(with = "Option<StringOrList>")]
     pub sources: Option<Vec<String>>,
     #[serde(deserialize_with = "string_or_list")]
+    #[schemars(with = "Option<StringOrList>")]
     pub candidates: Option<Vec<String>>,
     pub timeout_ms: Option<u64>,
     pub max_endpoints: Option<u32>,
+}
+
+// Schema-only representations of lenient deserializers.
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(untagged)]
+enum StringOrList {
+    Single(String),
+    List(Vec<String>),
+}
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(untagged)]
+enum LenientBool {
+    Bool(bool),
+    String(String),
+    Number(u8),
+}
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(untagged)]
+enum Scalar {
+    String(String),
+    Number(f64),
+    Bool(bool),
+}
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(untagged)]
+enum DocOrList {
+    One(DocEntry),
+    List(Vec<DocEntry>),
 }

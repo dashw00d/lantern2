@@ -1,4 +1,5 @@
 //! Typed global settings with explicit environment and CLI precedence.
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -7,7 +8,7 @@ use std::{
 
 macro_rules! section {
     ($(#[$meta:meta])* $name:ident { $($field:ident: $ty:ty = $default:expr),* $(,)? }) => {
-        $(#[$meta])* #[derive(Debug,Clone,PartialEq,Serialize,Deserialize)] #[serde(default)]
+        $(#[$meta])* #[derive(Debug,Clone,PartialEq,Serialize,Deserialize,JsonSchema)] #[serde(default)]
         pub struct $name { $(pub $field:$ty),* }
         impl Default for $name { fn default()->Self { Self { $($field:$default),* } } }
     }
@@ -43,7 +44,7 @@ section!(/// PHP-FPM socket selection.
 section!(/// Shared service settings.
     ServiceSettings { enabled:bool=true, mode:String="auto".into(), port:Option<u16>=None });
 /// Shared services settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ServicesSettings {
     pub mailpit: ServiceSettings,
@@ -75,7 +76,7 @@ section!(/// Intel refresh and cache policy.
 section!(/// Editor and terminal command templates used by clients.
     ClientSettings { editor:String="auto".into(), terminal:String="auto".into() });
 /// Effective configuration, after file and environment overrides.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct Settings {
     pub daemon: DaemonSettings,
