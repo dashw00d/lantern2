@@ -1041,6 +1041,46 @@ async fn runtime_reconcile_adopts_running_unit_and_republishes() {
 }
 
 #[tokio::test]
+async fn runtime_reconcile_unready_unit_uses_elapsed_startup_time() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("old", &temp.0, "server ${PORT}", &[]);
+    store.instances.lock().unwrap().get_mut(&id).unwrap().runtime.port = Some(39180);
+    let backend = Arc::new(FakeSystemd::default());
+    let mut row = running_snapshot("lantern-test-supervisor-inst-old.service");
+    row.started_at = Some(Timestamp::from_second(Timestamp::now().as_second() - 10).unwrap());
+    backend.set_snapshot(row);
+    let rt = Runtime::with_scoped_journal(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Waiting))),
+        backend.clone(),
+        OperationTracker::new(EventBus::new()),
+        lantern_daemon::runtime::RuntimeAdapters {
+            preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+            router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+            services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+        },
+        true,
+    );
+    assert_eq!(rt.reconcile().await.adopted, vec![id.clone()]);
+    let state = tokio::time::timeout(
+        Duration::from_millis(800),
+        wait_state(&rt, &id, |s| s.status == InstanceStatus::Crashed),
+    )
+    .await
+    .expect("expired startup should time out immediately");
+    assert_eq!(state.issue.unwrap().code, IssueCode::ReadinessTimeout);
+    assert!(
+        backend
+            .calls()
+            .iter()
+            .any(|s| s == "stop lantern-test-supervisor-inst-old.service")
+    );
+    rt.shutdown_background();
+}
+
+#[tokio::test]
 async fn runtime_captures_and_refreshes_shell_env_when_sources_change() {
     use std::os::unix::fs::PermissionsExt;
     let temp = Temp::new();

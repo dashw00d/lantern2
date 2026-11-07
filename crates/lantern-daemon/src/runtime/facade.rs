@@ -1127,14 +1127,14 @@ impl Runtime {
             if !local || is_deploy {
                 self.wait_upstream(url, token).await?;
             } else if let Some(port) = port {
-                self.wait_ready(id, actor, generation, token, port, &unit.unit)
+                self.wait_ready(id, actor, generation, token, port, &unit.unit, None)
                     .await?;
             }
         } else if requires_process_port {
             if is_deploy {
                 self.wait_any_port(port.unwrap_or(0), token).await?;
             } else {
-                self.wait_ready(id, actor, generation, token, port.unwrap_or(0), &unit.unit)
+                self.wait_ready(id, actor, generation, token, port.unwrap_or(0), &unit.unit, None)
                     .await?;
             }
         } else {
@@ -1573,9 +1573,17 @@ impl Runtime {
         token: &CancellationToken,
         port: u16,
         unit: &str,
+        started_at: Option<Timestamp>,
     ) -> Result<(), Fault> {
-        let deadline =
-            Instant::now() + Duration::from_secs(self.inner.config.settings.runtime.startup_timeout_secs);
+        let timeout = Duration::from_secs(self.inner.config.settings.runtime.startup_timeout_secs);
+        let elapsed = started_at.map_or(Duration::ZERO, |start| {
+            let micros = Timestamp::now()
+                .as_microsecond()
+                .saturating_sub(start.as_microsecond())
+                .max(0);
+            Duration::from_micros(micros as u64)
+        });
+        let deadline = Instant::now() + timeout.saturating_sub(elapsed);
         let mut mismatch_since = None;
         let mut rx = actor.snapshot.subscribe();
         loop {
@@ -2678,7 +2686,7 @@ impl Runtime {
                     tokio::spawn(async move {
                         let token = CancellationToken::new();
                         if rt
-                            .wait_ready(&id, &actor, generation, &token, port, &name)
+                            .wait_ready(&id, &actor, generation, &token, port, &name, row.started_at)
                             .await
                             .is_ok()
                         {
