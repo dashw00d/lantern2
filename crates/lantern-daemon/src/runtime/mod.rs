@@ -14,3 +14,6 @@ pub mod journal;
 
 /// Pure sticky port allocation.
 pub mod ports;
+
+/// Pure lifecycle transitions and preemption decisions.
+pub mod state_machine;
