@@ -1,6 +1,7 @@
 use crate::fonts::Fonts;
 use crate::logs::{LogBuffer, ROW_HEIGHT};
 use crate::model::{Connection, Effect, Mirror};
+use crate::platform::{UiEvent, UiReceiver, tray::TraySnapshot};
 use futures_util::StreamExt;
 use iced::{
     Element, Font, Length, Subscription, Task, Theme, theme,
@@ -16,12 +17,20 @@ use lantern_core::{
 };
 use std::{
     collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-pub(crate) fn run(args: GuiArgs, fonts: Fonts, client: Client) -> iced::Result {
+pub(crate) fn run(
+    args: GuiArgs,
+    fonts: Fonts,
+    client: Client,
+    ui_rx: UiReceiver,
+    tray_tx: tokio::sync::watch::Sender<TraySnapshot>,
+) -> iced::Result {
+    let ui_key = UiKey(Arc::new(Mutex::new(Some(ui_rx))));
     iced::daemon(
-        move || App::boot(&args, fonts, client.clone()),
+        move || App::boot(&args, fonts, client.clone(), ui_key.clone(), tray_tx.clone()),
         App::update,
         App::view,
     )
@@ -79,6 +88,9 @@ struct App {
     log_loading: bool,
     log_epoch: u64,
     log_live: VecDeque<LogLine>,
+    ui_key: UiKey,
+    tray_tx: tokio::sync::watch::Sender<TraySnapshot>,
+    tray_available: Option<bool>,
 }
 #[derive(Debug, Clone)]
 enum Message {
@@ -101,9 +113,16 @@ enum Message {
     LogBacklog(InstanceId, u64, Result<LogPage, String>),
     LogScrolled(scrollable::Viewport),
     LogFollow,
+    Ui(UiEvent),
 }
 impl App {
-    fn boot(args: &GuiArgs, fonts: Fonts, client: Client) -> (Self, Task<Message>) {
+    fn boot(
+        args: &GuiArgs,
+        fonts: Fonts,
+        client: Client,
+        ui_key: UiKey,
+        tray_tx: tokio::sync::watch::Sender<TraySnapshot>,
+    ) -> (Self, Task<Message>) {
         let mut app = Self {
             window: None,
             mode: theme::Mode::Dark,
@@ -120,6 +139,9 @@ impl App {
             log_loading: false,
             log_epoch: 0,
             log_live: VecDeque::new(),
+            ui_key,
+            tray_tx,
+            tray_available: None,
         };
         let open = if args.tray { Task::none() } else { app.open() };
         (
@@ -140,6 +162,16 @@ impl App {
         self.window = Some(id);
         task.map(Message::WindowOpened)
     }
+    fn show_window(&mut self) -> Task<Message> {
+        if let Some(id) = self.window {
+            Task::batch([
+                window::gain_focus(id),
+                window::request_user_attention(id, Some(window::UserAttention::Informational)),
+            ])
+        } else {
+            self.open()
+        }
+    }
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::WindowOpened(id) => {
@@ -150,12 +182,48 @@ impl App {
                 if self.window == Some(id) {
                     self.window = None;
                 }
-                window::close(id)
+                if self.tray_available == Some(true) {
+                    window::close(id)
+                } else {
+                    iced::exit()
+                }
             }
+            Message::Ui(event) => match event {
+                UiEvent::ShowWindow(_token) => self.show_window(),
+                UiEvent::ShowTarget(target) => {
+                    match InstanceId::parse(&target) {
+                        Ok(id) => {
+                            self.log_target = Some(id);
+                            self.logs = LogBuffer::default();
+                            self.stream_generation = self.stream_generation.wrapping_add(1);
+                        }
+                        Err(error) => self.toasts.push(format!("Invalid instance: {error}")),
+                    }
+                    self.show_window()
+                }
+                UiEvent::Stop(id) => self.update(Message::Command(Command {
+                    id,
+                    kind: CommandKind::Stop,
+                })),
+                UiEvent::StartDaemon => self.update(Message::StartDaemon),
+                UiEvent::TrayAvailable(available) => {
+                    self.tray_available = Some(available);
+                    if !available {
+                        self.toasts
+                            .push("No system tray found; closing the window will quit Lantern.".into());
+                        if self.window.is_none() {
+                            return self.open();
+                        }
+                    }
+                    Task::none()
+                }
+                UiEvent::Quit => iced::exit(),
+            },
             Message::Stream(event) => {
                 if matches!(&*event, StreamEvent::Connected) {
                     if let Some(id) = self.log_target.clone() {
                         self.mirror.stream(StreamEvent::Connected);
+                        let _ = self.tray_tx.send(TraySnapshot::from_mirror(&self.mirror));
                         self.log_epoch = self.log_epoch.wrapping_add(1);
                         let epoch = self.log_epoch;
                         self.log_loading = true;
@@ -249,6 +317,7 @@ impl App {
                         }
                     }
                 }
+                let _ = self.tray_tx.send(TraySnapshot::from_mirror(&self.mirror));
                 Task::none()
             }
             Message::Command(cmd) => {
@@ -646,6 +715,7 @@ impl App {
                 ),
                 stream,
             ),
+            Subscription::run_with(self.ui_key.clone(), ui_stream),
         ];
         if !self.pending.is_empty() {
             subscriptions.push(iced::time::every(Duration::from_millis(500)).map(Message::Tick));
@@ -705,6 +775,24 @@ fn stream(key: &ClientKey) -> impl futures_util::Stream<Item = Message> + use<> 
         .map(|event| Message::Stream(Box::new(event)))
 }
 
+#[derive(Debug, Clone)]
+struct UiKey(Arc<Mutex<Option<UiReceiver>>>);
+impl std::hash::Hash for UiKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        "lantern-platform-events".hash(state);
+    }
+}
+fn ui_stream(key: &UiKey) -> impl futures_util::Stream<Item = Message> + use<> {
+    let receiver = key.0.lock().expect("UI receiver lock").take();
+    futures_util::stream::unfold(receiver, |receiver| async move {
+        let mut receiver = receiver?;
+        receiver
+            .recv()
+            .await
+            .map(|event| (Message::Ui(event), Some(receiver)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +807,8 @@ mod tests {
             base_url: Some("http://127.0.0.1:39300".into()),
         })
         .unwrap();
+        let (_, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (tray, _) = tokio::sync::watch::channel(TraySnapshot::default());
         App::boot(
             &args,
             Fonts {
@@ -726,6 +816,8 @@ mod tests {
                 mono: "monospace",
             },
             client,
+            UiKey(Arc::new(Mutex::new(Some(receiver)))),
+            tray,
         )
         .0
     }
