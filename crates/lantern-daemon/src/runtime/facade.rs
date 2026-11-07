@@ -1378,11 +1378,25 @@ impl Runtime {
                     self.inner.config.settings.ports.range_end,
                 ]);
             let range = PortRange { start, end };
+            let dns = self
+                .inner
+                .config
+                .settings
+                .dns
+                .listen
+                .parse::<SocketAddr>()
+                .map_err(|e| {
+                    Fault::new(
+                        "needs_config",
+                        IssueCode::ManifestInvalid,
+                        format!("invalid DNS listen address: {e}"),
+                    )
+                })?;
             let reserved = vec![
                 self.inner.config.settings.daemon.port,
                 self.inner.config.settings.proxy.http_port,
                 self.inner.config.settings.proxy.https_port,
-                5354,
+                dns.port(),
                 2019,
             ];
             let (port, table) = tokio::task::spawn_blocking(move || {

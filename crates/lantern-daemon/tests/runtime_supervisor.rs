@@ -358,6 +358,30 @@ async fn runtime_start_stop_and_dependency_order() {
 }
 
 #[tokio::test]
+async fn runtime_reserves_configured_dns_port() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("dns-reserved", &temp.0, "server ${PORT}", &[]);
+    let mut cfg = config(&temp);
+    cfg.settings.dns.listen = format!("127.0.0.1:{}", temp.1);
+    let rt = Runtime::with_scoped_journal(
+        cfg,
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Waiting))),
+        Arc::new(FakeSystemd::default()),
+        OperationTracker::new(EventBus::new()),
+        lantern_daemon::runtime::RuntimeAdapters {
+            preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+            router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+            services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+        },
+        true,
+    );
+    assert_eq!(rt.reserve_port(&id).await.unwrap(), temp.1 + 1);
+    rt.shutdown_background();
+}
+
+#[tokio::test]
 async fn runtime_stop_preempts_hung_start_and_identical_requests_join() {
     let temp = Temp::new();
     let store = Arc::new(Store::default());
