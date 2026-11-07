@@ -11,3 +11,6 @@ pub mod systemd;
 
 /// Journal decoding and per-instance log subscriptions.
 pub mod journal;
+
+/// Pure sticky port allocation.
+pub mod ports;
