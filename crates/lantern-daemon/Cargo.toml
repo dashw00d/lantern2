@@ -18,3 +18,4 @@ tokio = { version = "1", features = ["process", "time", "sync", "rt", "rt-multi-
 tokio-util = "0.7"
 rustix = { version = "1.1", features = ["net", "param", "process"] }
 tracing = "0.1"
+async-trait = "0.1"
