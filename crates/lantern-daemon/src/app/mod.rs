@@ -5,3 +5,6 @@ pub mod adapters;
 
 /// Demand-driven listener discovery integration.
 pub mod discovery;
+
+/// Concrete daemon API facade.
+pub mod facade;

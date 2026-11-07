@@ -120,6 +120,18 @@ async fn operation(state: &ApiState, ticket: OperationTicket, w: WaitParams) -> 
     let mut view = ticket.instance;
     if w.wait
         && op.status == OperationStatus::Succeeded
+        && view.is_none()
+        && let Some(id) = op
+            .result
+            .as_ref()
+            .and_then(|v| v.get("instance"))
+            .and_then(Value::as_str)
+        && let Ok(id) = InstanceId::parse(id)
+    {
+        view = state.facade.instance(id).await.ok();
+    }
+    if w.wait
+        && op.status == OperationStatus::Succeeded
         && let Some(id) = &op.instance
         && let Ok(fresh) = within_deadline(
             "registry",

@@ -15,7 +15,7 @@ use lantern_core::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -28,6 +28,7 @@ const DISAPPEAR: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct Discovery {
     requests: mpsc::Sender<oneshot::Sender<Result<Snapshot, String>>>,
+    cache: Arc<RwLock<Option<Snapshot>>>,
 }
 impl Discovery {
     /// Launch the scanner and return its on-demand handle.
@@ -39,8 +40,24 @@ impl Discovery {
         shutdown: CancellationToken,
     ) -> Self {
         let (requests, rx) = mpsc::channel(32);
-        tokio::spawn(run(scanner, registry, runtime, names, shutdown, rx));
-        Self { requests }
+        let cache = Arc::new(RwLock::new(None));
+        tokio::spawn(run(
+            scanner,
+            registry,
+            runtime,
+            names,
+            shutdown,
+            rx,
+            cache.clone(),
+        ));
+        Self { requests, cache }
+    }
+    /// Return the latest cached snapshot without initiating a scan.
+    pub fn cached(&self) -> Option<Snapshot> {
+        self.cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
     /// Obtain a fresh scan through the single-flight worker.
     pub async fn scan(&self) -> Result<Snapshot, String> {
@@ -70,6 +87,7 @@ async fn run(
     names: UnitNames,
     shutdown: CancellationToken,
     mut requests: mpsc::Receiver<oneshot::Sender<Result<Snapshot, String>>>,
+    cache: Arc<RwLock<Option<Snapshot>>>,
 ) {
     let clock = MonotonicClock::default();
     let mut policy = ScanPolicy::new(clock);
@@ -134,6 +152,8 @@ async fn run(
                         policy.changed();
                     }
                     latest = Some(snapshot.clone());
+                    *cache.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(snapshot.clone());
                     for tx in pending.drain(..) {
                         let _ = tx.send(Ok(snapshot.clone()));
                     }
