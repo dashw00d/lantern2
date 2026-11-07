@@ -45,10 +45,10 @@ impl GatewayBackend for GatewayAdapter {
     }
     fn instance_for_host(&self, host: &str) -> Option<GatewayInstance> {
         let id = self.router.current_plan().routes.into_iter().find_map(|route| {
-            if route.host == host {
-                if let RouteOwner::Instance(id) = route.owner {
-                    return Some(id);
-                }
+            if route.host == host
+                && let RouteOwner::Instance(id) = route.owner
+            {
+                return Some(id);
             }
             None
         })?;

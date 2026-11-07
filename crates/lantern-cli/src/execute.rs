@@ -1596,23 +1596,6 @@ async fn events(ctx: &mut Context<'_>, logs: Option<&str>) -> Result<Option<Repl
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::render_command;
-    #[test]
-    fn editor_templates_split_before_substitution_without_shell_execution() {
-        assert_eq!(
-            render_command("editor --folder '{path}'", "/tmp/a b;$(id)").unwrap(),
-            ["editor", "--folder", "/tmp/a b;$(id)"]
-        );
-        assert_eq!(
-            render_command("terminal --dir={path}", "/tmp/a b").unwrap(),
-            ["terminal", "--dir=/tmp/a b"]
-        );
-        assert!(render_command("editor 'unclosed", "/tmp").is_err());
-    }
-}
-
 async fn mcp_install(
     ctx: &Context<'_>,
     target: McpTarget,
@@ -1705,4 +1688,21 @@ async fn mcp_install(
         &json!({"url":url, "message":message, "daemon_available":available}),
         text,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_command;
+    #[test]
+    fn editor_templates_split_before_substitution_without_shell_execution() {
+        assert_eq!(
+            render_command("editor --folder '{path}'", "/tmp/a b;$(id)").unwrap(),
+            ["editor", "--folder", "/tmp/a b;$(id)"]
+        );
+        assert_eq!(
+            render_command("terminal --dir={path}", "/tmp/a b").unwrap(),
+            ["terminal", "--dir=/tmp/a b"]
+        );
+        assert!(render_command("editor 'unclosed", "/tmp").is_err());
+    }
 }

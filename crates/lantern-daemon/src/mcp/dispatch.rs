@@ -253,7 +253,7 @@ impl LanternMcp {
             .await
             .map_err(failure)?;
         if op.status == OperationStatus::Failed {
-            return Err(op.error.map_or_else(|| "operation failed".into(), |e| failure(e)));
+            return Err(op.error.map_or_else(|| "operation failed".into(), failure));
         }
         if op.status == OperationStatus::Cancelled {
             return Err("operation cancelled".into());
