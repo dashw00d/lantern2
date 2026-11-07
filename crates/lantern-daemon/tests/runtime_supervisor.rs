@@ -31,16 +31,13 @@ use lantern_daemon::runtime::{Runtime, RuntimeConfig, StartOpts, StopOpts};
 use tokio_util::sync::CancellationToken;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
-struct Temp(PathBuf);
+struct Temp(PathBuf, u16);
 impl Temp {
     fn new() -> Self {
-        let p = std::env::temp_dir().join(format!(
-            "lantern-supervisor-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("lantern-supervisor-test-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
-        Self(p)
+        Self(p, 39100 + ((seq % 33) as u16) * 3)
     }
 }
 impl Drop for Temp {
@@ -62,6 +59,8 @@ struct Store {
     leases: Mutex<BTreeMap<InstanceId, u16>>,
     activated: Mutex<BTreeMap<InstanceId, bool>>,
     changes: Mutex<Vec<(InstanceId, InstanceStatus)>>,
+    conflict_once: std::sync::atomic::AtomicBool,
+    conflict_port: std::sync::atomic::AtomicU16,
 }
 impl Store {
     fn insert(&self, name: &str, root: &Path, cmd: &str, deps: &[&str]) -> InstanceId {
@@ -144,6 +143,13 @@ impl RuntimeStore for Store {
         replacement: BTreeMap<InstanceId, u16>,
     ) -> Result<bool, StoreError> {
         let mut leases = self.leases.lock().unwrap();
+        if self.conflict_once.swap(false, Ordering::SeqCst) {
+            leases.insert(
+                InstanceId::parse("other").unwrap(),
+                self.conflict_port.load(Ordering::SeqCst),
+            );
+            return Ok(false);
+        }
         if &*leases != expected {
             return Ok(false);
         }
@@ -227,8 +233,8 @@ fn config(temp: &Temp) -> RuntimeConfig {
         std::fs::write(temp.0.join("cache/env.sh"), "export PATH='/usr/bin:/bin'\n").unwrap();
     }
     let mut settings = Settings::default();
-    settings.ports.range_start = 39100;
-    settings.ports.range_end = 39190;
+    settings.ports.range_start = temp.1;
+    settings.ports.range_end = temp.1 + 2;
     settings.runtime.startup_timeout_secs = 5;
     settings.runtime.stop_timeout_secs = 1;
     settings.runtime.backoff_base_secs = 0;
@@ -966,4 +972,237 @@ async fn runtime_captures_and_refreshes_shell_env_when_sources_change() {
         OperationStatus::Succeeded
     );
     assert_eq!(std::fs::read_to_string(counter).unwrap(), "xx");
+}
+
+struct PreparedEnvironment;
+impl InstancePreparer for PreparedEnvironment {
+    fn ensure_ready<'a>(
+        &'a self,
+        instance: &'a Instance,
+        port: Option<u16>,
+        _: CancellationToken,
+        progress: &'a lantern_daemon::operations::OpHandle,
+    ) -> PrepareFuture<'a> {
+        Box::pin(async move {
+            assert!(port.is_some());
+            progress.step("test preparation");
+            let mut manifest = (*instance.manifest).clone();
+            manifest.run.env.insert(
+                "PREPARED_VALUE".into(),
+                lantern_core::template::TemplateString::parse("manifest-updated").0,
+            );
+            manifest.run.env.insert(
+                "RUN_VALUE".into(),
+                lantern_core::template::TemplateString::parse("updated").0,
+            );
+            Ok(lantern_daemon::runtime::seams::PreparedInstance {
+                manifest: Arc::new(manifest),
+                worktree_env: BTreeMap::from([
+                    ("RUN_VALUE".into(), "from-worktree".into()),
+                    ("BRANCH_RESOURCE".into(), "branch-value".into()),
+                ]),
+            })
+        })
+    }
+}
+#[tokio::test]
+async fn runtime_uses_prepared_manifest_and_branch_environment() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let primary = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let branch = InstanceId::derived(&primary.project(), "feature").unwrap();
+    {
+        let mut all = store.instances.lock().unwrap();
+        let mut i = all.get(&primary).unwrap().clone();
+        i.id = branch.clone();
+        i.checkout.branch = Some("feature".into());
+        i.checkout.kind = CheckoutKind::Worktree;
+        all.insert(branch.clone(), i);
+    }
+    let backend = Arc::new(FakeSystemd::default());
+    backend.set_auto_start(true);
+    let rt = Runtime::with_preparer(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        backend,
+        OperationTracker::new(EventBus::new()),
+        Arc::new(PreparedEnvironment),
+    );
+    assert_eq!(
+        completed(&rt.start(&branch, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    let script = std::fs::read_to_string(
+        temp.0
+            .join("run/lantern-test-supervisor-inst-app_feature.service.sh"),
+    )
+    .unwrap();
+    assert!(script.contains("export RUN_VALUE='from-worktree'"));
+    assert!(script.contains("export PREPARED_VALUE='manifest-updated'"));
+    assert!(script.contains("export BRANCH_RESOURCE='branch-value'"));
+}
+
+#[tokio::test]
+async fn runtime_retries_atomic_lease_conflicts_without_losing_other_writes() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    store.conflict_once.store(true, Ordering::SeqCst);
+    store.conflict_port.store(temp.1, Ordering::SeqCst);
+    let backend = Arc::new(FakeSystemd::default());
+    backend.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store.clone(),
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        backend,
+    );
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    let leases = store.port_leases().unwrap();
+    assert_eq!(leases.get(&InstanceId::parse("other").unwrap()), Some(&temp.1));
+    assert_ne!(leases.get(&id), Some(&temp.1));
+}
+
+#[tokio::test]
+async fn runtime_reserves_port_before_prepare_and_keeps_it() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let fake = Arc::new(FakeSystemd::default());
+    fake.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store.clone(),
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        fake,
+    );
+    let port = rt.reserve_port(&id).await.unwrap();
+    assert_eq!(store.port_leases().unwrap().get(&id), Some(&port));
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    assert_eq!(rt.state(&id).unwrap().port, Some(port));
+}
+
+#[tokio::test]
+async fn runtime_dotenv_is_data_and_manifest_env_wins() {
+    let temp = Temp::new();
+    std::fs::write(
+        temp.0.join(".env"),
+        "FROM_FILE='literal $(id)'\nSHARED=from_file\n",
+    )
+    .unwrap();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    {
+        let mut all = store.instances.lock().unwrap();
+        let m = Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest);
+        m.deploy.env_file = Some(".env".into());
+        m.run.env.insert(
+            "SHARED".into(),
+            lantern_core::template::TemplateString::parse("from_manifest").0,
+        );
+    }
+    let fake = Arc::new(FakeSystemd::default());
+    fake.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        fake,
+    );
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    let script =
+        std::fs::read_to_string(temp.0.join("run/lantern-test-supervisor-inst-app.service.sh")).unwrap();
+    assert!(script.contains("export FROM_FILE='literal $(id)'"));
+    assert!(
+        script.find("export SHARED='from_file'").unwrap()
+            < script.find("export SHARED='from_manifest'").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn runtime_rejects_env_file_symlink_escaping_checkout() {
+    use std::os::unix::fs::symlink;
+    let temp = Temp::new();
+    let checkout = temp.0.join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(temp.0.join("outside.env"), "SECRET=value\n").unwrap();
+    symlink(temp.0.join("outside.env"), checkout.join(".env")).unwrap();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &checkout, "python3 -m http.server ${PORT}", &[]);
+    {
+        let mut all = store.instances.lock().unwrap();
+        Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest)
+            .deploy
+            .env_file = Some(".env".into());
+    }
+    let fake = Arc::new(FakeSystemd::default());
+    let rt = runtime(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        fake.clone(),
+    );
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Failed
+    );
+    assert!(!fake.calls().iter().any(|s| s.starts_with("start ")));
+}
+
+#[tokio::test]
+async fn runtime_setup_oneshot_uses_launcher_and_is_cancellable() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let backend = Arc::new(FakeSystemd::default());
+    backend.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        backend.clone(),
+    );
+    let port = rt.reserve_port(&id).await.unwrap();
+    let spec = rt
+        .prepare_oneshot(
+            &id,
+            lantern_daemon::runtime::OneShotLaunch {
+                verb: "setup".into(),
+                cwd: temp.0.clone(),
+                shell_command: lantern_core::template::TemplateString::parse("echo ${PORT}")
+                    .0
+                    .render_shell(),
+                env: BTreeMap::from([("VALUE".into(), "$(literal)".into())]),
+                timeout: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+    assert!(
+        spec.unit
+            .unit
+            .starts_with("lantern-test-supervisor-op-app-setup-")
+    );
+    let script = std::fs::read_to_string(&spec.unit.script).unwrap();
+    assert!(script.contains(&format!("export LANTERN_PORT='{port}'")));
+    assert!(script.contains("export VALUE='$(literal)'"));
+    assert!(script.contains("${LANTERN_PORT}"));
+    let op = rt.run_oneshot(spec);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !backend.calls().iter().any(|s| s.starts_with("start ")) {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(op.cancel());
+    assert_eq!(completed(&op).await, OperationStatus::Cancelled);
+    assert!(backend.calls().iter().any(|s| s.starts_with("stop ")));
 }

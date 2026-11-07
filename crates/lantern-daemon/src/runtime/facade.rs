@@ -123,6 +123,32 @@ pub struct StopOpts {
     pub cascade: bool,
 }
 
+/// Result of an on-demand deploy status command.
+#[derive(Debug, Clone)]
+pub struct DeployStatus {
+    /// Whether the command exited with code zero.
+    pub alive: bool,
+    /// Exit code reported by systemd, if available.
+    pub exit_code: Option<i32>,
+    /// Bounded output read from the operation's journal.
+    pub output: String,
+}
+
+/// Launcher inputs for a setup or deploy one-shot.
+#[derive(Debug, Clone)]
+pub struct OneShotLaunch {
+    /// `setup` or `deploy`, which determines journal stream attribution.
+    pub verb: String,
+    /// Checkout-confined working directory.
+    pub cwd: PathBuf,
+    /// Command already rewritten with `TemplateString::render_shell()`.
+    pub shell_command: String,
+    /// Literal environment values supplied by the caller.
+    pub env: BTreeMap<String, String>,
+    /// Maximum one-shot duration.
+    pub timeout: Duration,
+}
+
 /// Current shell environment capture metadata, without secret values.
 #[derive(Debug, Clone, Default)]
 pub struct EnvReport {
@@ -376,6 +402,27 @@ impl Runtime {
         backlog: usize,
     ) -> (Vec<LogLine>, broadcast::Receiver<LogLine>) {
         self.inner.logs.subscribe_logs(id, backlog)
+    }
+    /// Reserve a sticky port immediately after creating an instance record, before setup.
+    pub async fn reserve_port(&self, id: &InstanceId) -> Result<u16, RuntimeError> {
+        if self
+            .inner
+            .store
+            .instance(id)
+            .map_err(|e| RuntimeError::Other(e.to_string()))?
+            .is_none()
+        {
+            return Err(RuntimeError::NotFound(id.clone()));
+        }
+        let port = self
+            .allocate(id)
+            .await
+            .map_err(|e| RuntimeError::Other(e.message))?;
+        self.inner
+            .store
+            .update_runtime(id, Box::new(move |r| r.port = Some(port)))
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        Ok(port)
     }
     /// Start an instance and its dependencies.
     pub async fn start(&self, id: &InstanceId, _: StartOpts) -> Result<RuntimeOperation, RuntimeError> {
@@ -1133,6 +1180,7 @@ impl Runtime {
         } else {
             match manifest.serve {
                 ServeMode::Php => {
+                    let root = confined_path(&instance.checkout.path, &root)?;
                     if !root.is_dir() {
                         return Err(Fault::new(
                             "needs_config",
@@ -1148,6 +1196,7 @@ impl Runtime {
                     RouteTarget::Php(root)
                 }
                 ServeMode::Static => {
+                    let root = confined_path(&instance.checkout.path, &root)?;
                     if !root.is_dir() {
                         return Err(Fault::new(
                             "needs_config",
@@ -1341,6 +1390,7 @@ impl Runtime {
         } else {
             instance.checkout.path.join(cwd)
         };
+        let cwd = confined_path(&instance.checkout.path, &cwd)?;
         let shell_env = self
             .inner
             .config
@@ -1411,6 +1461,10 @@ impl Runtime {
                 );
             }
         }
+        let env_file = match &instance.manifest.deploy.env_file {
+            Some(path) => read_dotenv(&instance.checkout.path, path)?,
+            None => BTreeMap::new(),
+        };
         let spec = LaunchSpec {
             instance: instance.id.clone(),
             cwd: cwd.clone(),
@@ -1419,7 +1473,7 @@ impl Runtime {
             toolchain,
             runtime_env: self.inner.config.settings.runtime.env.clone(),
             variables: vars,
-            env_file: BTreeMap::new(),
+            env_file,
             run_env,
             pre_start: None,
             post_stop: None,
@@ -1867,6 +1921,169 @@ impl Runtime {
                 }
             }
         });
+    }
+    /// Build a launcher-backed setup or deploy one-shot from shell-rendered code and data.
+    pub fn prepare_oneshot(
+        &self,
+        id: &InstanceId,
+        request: OneShotLaunch,
+    ) -> Result<OneShotSpec, RuntimeError> {
+        if !matches!(request.verb.as_str(), "setup" | "deploy") {
+            return Err(RuntimeError::Other(
+                "one-shot verb must be setup or deploy".into(),
+            ));
+        }
+        let instance = self
+            .inner
+            .store
+            .instance(id)
+            .map_err(|e| RuntimeError::Other(e.to_string()))?
+            .ok_or_else(|| RuntimeError::NotFound(id.clone()))?;
+        let port = instance
+            .runtime
+            .port
+            .or_else(|| {
+                self.inner
+                    .store
+                    .port_leases()
+                    .ok()
+                    .and_then(|m| m.get(id).copied())
+            })
+            .ok_or_else(|| {
+                RuntimeError::Other("reserve the instance port before preparing a one-shot".into())
+            })?;
+        let actor = self.actor(&instance);
+        let worktree_env = actor.state.lock().unwrap().worktree_env.clone();
+        let (mut launch, mut unit) = self
+            .launch(&instance, port, request.shell_command, true, &worktree_env, false)
+            .map_err(|e| RuntimeError::Other(e.message))?;
+        let cwd = confined_path(&instance.checkout.path, &request.cwd)
+            .map_err(|e| RuntimeError::Other(e.message))?;
+        launch.cwd = cwd.clone();
+        launch.run_env.extend(request.env);
+        let text = launcher::try_render(&launch).map_err(|e| RuntimeError::Other(e.to_string()))?;
+        let name = self.inner.config.names.operation(
+            id,
+            &request.verb,
+            Timestamp::now().as_microsecond().unsigned_abs(),
+        );
+        let target = self.inner.config.run_dir.join(format!("{name}.sh"));
+        std::fs::rename(&unit.script, &target).map_err(|e| RuntimeError::Other(e.to_string()))?;
+        std::fs::write(&target, text).map_err(|e| RuntimeError::Other(e.to_string()))?;
+        unit.unit = name;
+        unit.script = target;
+        unit.cwd = cwd;
+        Ok(OneShotSpec {
+            unit,
+            timeout: request.timeout,
+            poll_interval: self.inner.config.poll_interval,
+        })
+    }
+    async fn deploy_command(
+        &self,
+        id: &InstanceId,
+        verb: &str,
+    ) -> Result<(systemd::OneShotResult, String), RuntimeError> {
+        let instance = self
+            .inner
+            .store
+            .instance(id)
+            .map_err(|e| RuntimeError::Other(e.to_string()))?
+            .ok_or_else(|| RuntimeError::NotFound(id.clone()))?;
+        let command = match verb {
+            "logs" => instance.manifest.deploy.logs.as_ref(),
+            "status" => instance.manifest.deploy.status.as_ref(),
+            _ => None,
+        }
+        .ok_or_else(|| RuntimeError::Other(format!("deploy.{verb} is not configured")))?;
+        let actor = self.actor(&instance);
+        let _guard = actor.io_lock.lock().await;
+        let spec = self.prepare_oneshot(
+            id,
+            OneShotLaunch {
+                verb: "deploy".into(),
+                cwd: instance.checkout.path.clone(),
+                shell_command: command.render_shell(),
+                env: BTreeMap::new(),
+                timeout: Duration::from_secs(15),
+            },
+        )?;
+        let unit = spec.unit.unit.clone();
+        let cancel = CancellationToken::new();
+        let result = systemd::run_oneshot(self.inner.backend.as_ref(), &spec, cancel.cancelled())
+            .await
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        let output = tokio::process::Command::new("journalctl")
+            .args([
+                "--user",
+                "--no-pager",
+                "--output=cat",
+                "--lines=1000",
+                "--user-unit",
+                &unit,
+            ])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        if !output.status.success() {
+            return Err(RuntimeError::Other(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        let bytes = &output.stdout[..output.stdout.len().min(1024 * 1024)];
+        Ok((result, String::from_utf8_lossy(bytes).into_owned()))
+    }
+    /// Run configured deploy logs and return its bounded journal output.
+    pub async fn deploy_logs(&self, id: &InstanceId) -> Result<String, RuntimeError> {
+        let (result, output) = self.deploy_command(id, "logs").await?;
+        if result.exit_kind != ExitCodeKind::Exited || result.exit_code != Some(0) {
+            return Err(RuntimeError::Other(format!(
+                "deploy.logs exited {:?}",
+                result.exit_code
+            )));
+        }
+        Ok(output)
+    }
+    /// Run configured deploy status and report its exit and bounded journal output.
+    pub async fn deploy_status(&self, id: &InstanceId) -> Result<DeployStatus, RuntimeError> {
+        let (result, output) = self.deploy_command(id, "status").await?;
+        Ok(DeployStatus {
+            alive: result.exit_kind == ExitCodeKind::Exited && result.exit_code == Some(0),
+            exit_code: result.exit_code,
+            output,
+        })
+    }
+    /// Republish routes after the networking subsystem recovers.
+    pub async fn republish_all(&self) {
+        if let Ok(instances) = self.inner.store.instances() {
+            for instance in instances.into_iter().filter(|i| {
+                matches!(
+                    i.runtime.status,
+                    InstanceStatus::Running | InstanceStatus::Unhealthy
+                )
+            }) {
+                let actor = self.actor(&instance);
+                let generation = actor.state.lock().unwrap().generation;
+                let _guard = actor.io_lock.lock().await;
+                match self.publish_route(&instance, instance.runtime.upstream).await {
+                    Ok(()) => {
+                        let mut state = actor.state.lock().unwrap();
+                        if state.generation == generation
+                            && state.supervisor.issue == Some(IssueCode::RouteFailed)
+                        {
+                            state.supervisor.issue = None;
+                            state.supervisor.message = None;
+                            self.publish_supervisor(&instance.id, &state.supervisor);
+                        }
+                    }
+                    Err(error) => {
+                        self.event(&instance.id, &actor, generation, Event::RouteFailed);
+                        tracing::warn!(id=%instance.id,message=%error.message,"route republish failed");
+                    }
+                }
+            }
+        }
     }
     /// Run a tracked, cancellable one-shot using the same journal-backed systemd primitive.
     pub fn run_oneshot(&self, spec: OneShotSpec) -> RuntimeOperation {
@@ -2346,6 +2563,115 @@ impl Runtime {
         }
         report
     }
+}
+
+fn confined_path(checkout: &std::path::Path, path: &std::path::Path) -> Result<PathBuf, Fault> {
+    let root = std::fs::canonicalize(checkout).map_err(io_fault)?;
+    let path = std::fs::canonicalize(path).map_err(io_fault)?;
+    if !path.starts_with(&root) {
+        return Err(Fault::new(
+            "needs_config",
+            IssueCode::ManifestInvalid,
+            "configured path escapes checkout",
+        ));
+    }
+    Ok(path)
+}
+fn read_dotenv(checkout: &std::path::Path, path: &str) -> Result<BTreeMap<String, String>, Fault> {
+    let full = confined_path(checkout, &checkout.join(path))?;
+    let content = std::fs::read(&full).map_err(io_fault)?;
+    if content.len() > 1024 * 1024 {
+        return Err(Fault::new(
+            "needs_config",
+            IssueCode::ManifestInvalid,
+            "dotenv file exceeds 1 MiB",
+        ));
+    }
+    let content = std::str::from_utf8(&content).map_err(|_| {
+        Fault::new(
+            "needs_config",
+            IssueCode::ManifestInvalid,
+            "dotenv file is not UTF-8",
+        )
+    })?;
+    let mut values = BTreeMap::new();
+    for (index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (key, raw) = line.split_once('=').ok_or_else(|| {
+            Fault::new(
+                "needs_config",
+                IssueCode::ManifestInvalid,
+                format!("invalid dotenv assignment on line {}", index + 1),
+            )
+        })?;
+        let key = key.trim();
+        let mut chars = key.chars();
+        if !matches!(chars.next(), Some('a'..='z' | 'A'..='Z' | '_'))
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(Fault::new(
+                "needs_config",
+                IssueCode::ManifestInvalid,
+                format!("invalid dotenv key on line {}", index + 1),
+            ));
+        }
+        let raw = raw.trim();
+        let value = if let Some(rest) = raw.strip_prefix('\'') {
+            let (v, tail) = rest.split_once('\'').ok_or_else(|| {
+                Fault::new(
+                    "needs_config",
+                    IssueCode::ManifestInvalid,
+                    format!("unterminated dotenv quote on line {}", index + 1),
+                )
+            })?;
+            if !tail.trim().is_empty() && !tail.trim().starts_with('#') {
+                return Err(Fault::new(
+                    "needs_config",
+                    IssueCode::ManifestInvalid,
+                    format!("invalid dotenv tail on line {}", index + 1),
+                ));
+            }
+            v.to_owned()
+        } else if let Some(rest) = raw.strip_prefix('"') {
+            let mut out = String::new();
+            let mut escaped = false;
+            let mut closed = false;
+            for ch in rest.chars() {
+                if escaped {
+                    out.push(match ch {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other,
+                    });
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    closed = true;
+                    break;
+                } else {
+                    out.push(ch);
+                }
+            }
+            if !closed {
+                return Err(Fault::new(
+                    "needs_config",
+                    IssueCode::ManifestInvalid,
+                    format!("unterminated dotenv quote on line {}", index + 1),
+                ));
+            }
+            out
+        } else {
+            raw.split_once(" #").map_or(raw, |(v, _)| v).trim_end().to_owned()
+        };
+        values.insert(key.to_owned(), value);
+    }
+    Ok(values)
 }
 
 fn health_url(base: &str, endpoint: &str) -> Option<reqwest::Url> {

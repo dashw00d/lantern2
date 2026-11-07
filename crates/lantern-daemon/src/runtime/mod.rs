@@ -25,6 +25,6 @@ pub mod seams;
 pub mod facade;
 
 pub use facade::{
-    EnvReport, HistoryQuery, ReconcileReport, Runtime, RuntimeAdapters, RuntimeConfig, RuntimeError,
-    RuntimeOperation, StartOpts, StopOpts,
+    DeployStatus, EnvReport, HistoryQuery, OneShotLaunch, ReconcileReport, Runtime, RuntimeAdapters,
+    RuntimeConfig, RuntimeError, RuntimeOperation, StartOpts, StopOpts,
 };
