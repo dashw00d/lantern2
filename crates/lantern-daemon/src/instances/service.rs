@@ -264,6 +264,7 @@ impl InstanceService {
                     .iter()
                     .find(|(_, r)| r.project == p.project.id && r.checkout.path == path)
                     .cloned();
+                let is_new = existing.is_none();
                 let kind = if wt.path == pr.git_root {
                     CheckoutKind::Primary
                 } else {
@@ -322,7 +323,26 @@ impl InstanceService {
                 record.checkout.path = path.clone();
                 record.checkout.kind = kind;
                 record.checkout.missing_since = None;
-                self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+                self.store
+                    .upsert(&id, record.clone())
+                    .map_err(InstanceError::Adapter)?;
+                if is_new && kind == CheckoutKind::Primary {
+                    // A registered primary is assumed prepared; no installation runs on registration.
+                    if let Ok(manifest) = self.store.manifest(&id)
+                        && manifest.usable
+                        && let (Ok(lock_hash), Ok(commands)) = (
+                            deps::lock_hash(&path, &wt.path),
+                            setup_commands(&manifest, &path, &wt.path),
+                        )
+                    {
+                        record.checkout.setup = Some(SetupStamp {
+                            lock_hash,
+                            commands_hash: deps::commands_hash(&commands),
+                            finished_at: Timestamp::now(),
+                        });
+                        self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+                    }
+                }
                 observed.insert(id.clone());
                 self.observations.lock().expect("observations lock").insert(
                     id,
@@ -536,14 +556,17 @@ impl InstanceService {
                     let rev = if branches.iter().any(|b| b.name == *name && b.remote.is_none()) {
                         format!("refs/heads/{name}")
                     } else {
-                        let remote = select_remote(&branches, name, req.remote.as_deref())?;
+                        let preferred = repo.preferred_remote().await?;
+                        let remote =
+                            select_remote(&branches, name, req.remote.as_deref(), preferred.as_deref())?;
                         format!("refs/remotes/{remote}/{name}")
                     };
                     (AddMode::Detached(rev), branch_slug(name))
                 } else if branches.iter().any(|b| b.name == *name && b.remote.is_none()) {
                     (AddMode::ExistingLocal(name.clone()), branch_slug(name))
                 } else {
-                    let remote = select_remote(&branches, name, req.remote.as_deref())?;
+                    let preferred = repo.preferred_remote().await?;
+                    let remote = select_remote(&branches, name, req.remote.as_deref(), preferred.as_deref())?;
                     (
                         AddMode::TrackRemote {
                             remote,
@@ -568,6 +591,21 @@ impl InstanceService {
                 } else {
                     String::from("HEAD")
                 };
+                if req.fetch != FetchPolicy::Never {
+                    let remote = base
+                        .split_once('/')
+                        .map(|(r, _)| r)
+                        .filter(|r| remotes.iter().any(|v| v == r));
+                    if let Some(remote) = remote {
+                        op.step("Fetching");
+                        if let Err(error) = repo.fetch(remote, Duration::from_secs(15), &cancel).await {
+                            if cancel.is_cancelled() {
+                                return Err(InstanceError::Cancelled);
+                            }
+                            tracing::warn!(%error, %remote, "could not refresh new-branch base");
+                        }
+                    }
+                }
                 (
                     AddMode::NewBranch {
                         name: name.clone(),
@@ -621,6 +659,7 @@ impl InstanceService {
         }
         let root = self.worktrees_dir.join(&p.repo_slug).join(slug);
         let project_path = root.join(&pr.subpath);
+        let previous = revived.clone();
         let mut record = revived.unwrap_or_else(|| {
             new_record(
                 &req.project,
@@ -641,7 +680,13 @@ impl InstanceService {
         std::fs::create_dir_all(root.parent().expect("managed parent"))?;
         op.step("Creating worktree");
         if let Err(e) = repo.add_worktree(&root, &mode, &cancel).await {
-            self.store.remove(&id).map_err(InstanceError::Adapter)?;
+            // A failed git call does not establish ownership of an on-disk path.
+            // Restore a revived record rather than treating a raced-in user worktree as managed.
+            if let Some(previous) = previous {
+                self.store.upsert(&id, previous).map_err(InstanceError::Adapter)?;
+            } else {
+                self.store.remove(&id).map_err(InstanceError::Adapter)?;
+            }
             return Err(e.into());
         }
         record.checkout.phase = CheckoutPhase::Ready;
@@ -676,6 +721,34 @@ impl InstanceService {
             outcome: Outcome::CreatedWorktree(mode),
             start: req.start,
         })
+    }
+    /// Compute whether the checkout's lockfiles or setup command list changed.
+    pub fn setup_stale(&self, id: &InstanceId) -> Result<bool, InstanceError> {
+        let record = self.record(id)?;
+        let project = self.project(&record.project)?;
+        let root = if let Some(repo) = project.project.repo.as_ref() {
+            strip_subpath(&record.checkout.path, &repo.subpath)?
+        } else {
+            record.checkout.path.clone()
+        };
+        let manifest = self.store.manifest(id).map_err(InstanceError::Adapter)?;
+        let hash = deps::lock_hash(&record.checkout.path, &root)?;
+        let commands = setup_commands(&manifest, &record.checkout.path, &root)?;
+        let command_hash = deps::commands_hash(&commands);
+        let changed = record
+            .checkout
+            .setup
+            .as_ref()
+            .is_none_or(|s| s.lock_hash != hash || s.commands_hash != command_hash);
+        if changed {
+            return Ok(true);
+        }
+        if record.checkout.kind != CheckoutKind::Primary && manifest.setup.is_none() {
+            return Ok(deps::default_setup(&record.checkout.path, &root)?
+                .iter()
+                .any(|d| !d.artifact.is_dir()));
+        }
+        Ok(false)
     }
     /// Ensure setup is current and return the runtime's expanded environment.
     pub async fn ensure_prepared(
@@ -904,10 +977,29 @@ impl InstanceService {
     }
 }
 
+fn setup_commands(
+    manifest: &ResolvedManifest,
+    project: &Path,
+    root: &Path,
+) -> Result<Vec<(PathBuf, String)>, InstanceError> {
+    if let Some(setup) = &manifest.setup {
+        Ok(setup
+            .iter()
+            .map(|cmd| (project.to_path_buf(), cmd.render_shell()))
+            .collect())
+    } else {
+        Ok(deps::default_setup(project, root)?
+            .into_iter()
+            .map(|d| (d.cwd, d.command))
+            .collect())
+    }
+}
+
 fn select_remote(
     branches: &[crate::git::BranchInfo],
     name: &str,
     requested: Option<&str>,
+    preferred: Option<&str>,
 ) -> Result<String, InstanceError> {
     let mut remotes: Vec<String> = branches
         .iter()
@@ -925,6 +1017,11 @@ fn select_remote(
     }
     if remotes.len() == 1 {
         return Ok(remotes.remove(0));
+    }
+    if let Some(preferred) = preferred
+        && remotes.iter().any(|v| v == preferred)
+    {
+        return Ok(preferred.into());
     }
     if remotes.iter().any(|v| v == "origin") {
         return Ok("origin".into());

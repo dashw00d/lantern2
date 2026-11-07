@@ -601,6 +601,22 @@ impl RepoHandle {
             Err(e) => Err(e),
         }
     }
+    /// Read Git's configured preferred remote for ambiguous branches.
+    pub async fn preferred_remote(&self) -> Result<Option<String>, GitError> {
+        match self
+            .run(
+                vec!["config".into(), "--get".into(), "checkout.defaultRemote".into()],
+                READ_TIMEOUT,
+                None,
+                true,
+            )
+            .await
+        {
+            Ok(value) => Ok(Some(trim(value)?)),
+            Err(GitError::Command { code: Some(1), .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     /// Resolve a revision to a commit object id without option injection.
     pub async fn resolve_commit(&self, rev: &str) -> Result<String, GitError> {
         valid_arg(rev)?;

@@ -125,4 +125,6 @@ pub use service::{
 
 /// Worktree removal and GC safety checks.
 pub mod remove;
-pub use remove::{Blocker, GcAction, GcReason, GcSuggestion, RemovalCheck, RemoveOpts, RemoveResult};
+pub use remove::{
+    Blocker, GcAction, GcApplyResult, GcReason, GcSuggestion, RemovalCheck, RemoveOpts, RemoveResult,
+};

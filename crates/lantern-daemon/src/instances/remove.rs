@@ -91,6 +91,14 @@ pub enum GcAction {
     /// Missing entry can be forgotten after retention rules.
     ForgetMissing,
 }
+/// Results of an explicit GC apply request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcApplyResult {
+    /// Managed instances removed after a clean preflight.
+    pub removed: Vec<InstanceId>,
+    /// Suggested instances left untouched, with a reason.
+    pub skipped: Vec<(InstanceId, String)>,
+}
 /// One advisory garbage collection candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcSuggestion {
@@ -312,6 +320,7 @@ impl InstanceService {
     ) -> Result<Vec<GcSuggestion>, InstanceError> {
         let p = self.project(project)?;
         let repo = self.repo(&p)?;
+        self.refresh_repo(repo.common_dir()).await?;
         let branches = repo.branches(100_000).await?;
         let default = repo.default_branch().await?;
         let mut out = Vec::new();
@@ -322,6 +331,12 @@ impl InstanceService {
             .into_iter()
             .filter(|(_, r)| r.project == *project && r.checkout.kind != CheckoutKind::Primary)
         {
+            let is_idle = r.checkout.kind == CheckoutKind::Managed
+                && matches!(
+                    self.store.status(&id).map_err(InstanceError::Adapter)?,
+                    InstanceStatus::Stopped | InstanceStatus::NeedsConfig
+                )
+                && idle(&r, idle_days);
             let reason = if r.checkout.missing_since.is_some() {
                 Some(GcReason::Missing)
             } else {
@@ -336,12 +351,12 @@ impl InstanceService {
                 } else if let (Some(b), Some(default)) = (branch, default.as_deref()) {
                     if repo.is_ancestor(&format!("refs/heads/{b}"), default).await? {
                         Some(GcReason::Merged)
-                    } else if idle(&r, idle_days) {
+                    } else if is_idle {
                         Some(GcReason::Idle)
                     } else {
                         None
                     }
-                } else if idle(&r, idle_days) {
+                } else if is_idle {
                     Some(GcReason::Idle)
                 } else {
                     None
@@ -363,6 +378,40 @@ impl InstanceService {
             }
         }
         Ok(out)
+    }
+    /// Apply only clean, managed GC suggestions; never force and never unpin user worktrees.
+    pub async fn gc_apply(
+        &self,
+        project: &lantern_core::ids::ProjectId,
+        idle_days: u64,
+    ) -> Result<GcApplyResult, InstanceError> {
+        let suggestions = self.gc_suggestions(project, idle_days).await?;
+        let mut result = GcApplyResult::default();
+        for suggestion in suggestions {
+            if suggestion.action != GcAction::Remove {
+                result
+                    .skipped
+                    .push((suggestion.instance, "not a removable managed checkout".into()));
+                continue;
+            }
+            match self.removal_check(&suggestion.instance).await {
+                Ok(check) if check.blockers.is_empty() => match self
+                    .remove_checkout(&suggestion.instance, RemoveOpts::default())
+                    .await
+                {
+                    Ok(outcome) if outcome.removed => result.removed.push(suggestion.instance),
+                    Ok(_) => result
+                        .skipped
+                        .push((suggestion.instance, "checkout was not removed".into())),
+                    Err(error) => result.skipped.push((suggestion.instance, error.to_string())),
+                },
+                Ok(check) => result
+                    .skipped
+                    .push((suggestion.instance, format!("blocked: {:?}", check.blockers))),
+                Err(error) => result.skipped.push((suggestion.instance, error.to_string())),
+            }
+        }
+        Ok(result)
     }
 }
 fn idle(r: &lantern_core::state::InstanceRecord, days: u64) -> bool {

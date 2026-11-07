@@ -803,3 +803,93 @@ async fn instances_git_user_worktree_inside_managed_directory_stays_user_owned()
     assert!(result.forgotten);
     assert!(path.is_dir());
 }
+
+#[tokio::test]
+async fn instances_gc_apply_only_clean_managed_checkouts() {
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    git_cmd(&root, &["branch", "stale-managed"]);
+    git_cmd(&root, &["branch", "stale-user"]);
+    let user = t.0.join("user-wt");
+    git_cmd(
+        &root,
+        &["worktree", "add", "--", user.to_str().unwrap(), "stale-user"],
+    );
+    let op = operation();
+    let created = service
+        .run_branch(req(BranchTarget::Branch("stale-managed".into())), &op)
+        .await
+        .unwrap();
+    let record = store
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|(i, _)| i == &created.instance)
+        .unwrap()
+        .1;
+    fs::write(record.checkout.path.join("app.txt"), "dirty").unwrap();
+    let project = ProjectId::parse("myapp").unwrap();
+    let first = service.gc_apply(&project, 0).await.unwrap();
+    assert!(first.removed.is_empty());
+    assert!(record.checkout.path.exists());
+    git_cmd(&record.checkout.path, &["restore", "--", "app.txt"]);
+    let second = service.gc_apply(&project, 0).await.unwrap();
+    assert!(second.removed.contains(&created.instance));
+    assert!(user.exists());
+    op.finish(OpOutcome::Succeeded(None));
+}
+
+#[tokio::test]
+async fn instances_primary_stamp_does_not_install_automatically() {
+    let t = Temp::new();
+    let (root, _, _, runner, service) = fixture(
+        &t,
+        "id: myapp\nrun: {cmd: 'echo ok'}\nsetup: ['printf ok > branch.txt']\n",
+    )
+    .await;
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let id = InstanceId::primary(&ProjectId::parse("myapp").unwrap());
+    assert!(!service.setup_stale(&id).unwrap());
+    fs::write(root.join("apps/web/.node-version"), "22\n").unwrap();
+    assert!(service.setup_stale(&id).unwrap());
+    let op = operation();
+    service.ensure_prepared(&id, false, &op).await.unwrap();
+    assert_eq!(runner.calls.lock().unwrap().len(), 0);
+    assert!(service.setup_stale(&id).unwrap());
+    op.finish(OpOutcome::Succeeded(None));
+}
+
+#[tokio::test]
+async fn instances_git_ambiguous_remote_uses_configured_preference() {
+    let t = Temp::new();
+    let (root, origin, _, _, service) = fixture(&t, EMPTY).await;
+    let other = t.0.join("other.git");
+    git_cmd(&t.0, &["init", "--bare", other.to_str().unwrap()]);
+    git_cmd(&root, &["remote", "add", "other", other.to_str().unwrap()]);
+    git_cmd(&root, &["push", "other", "main"]);
+    let oid = git_cmd(&root, &["rev-parse", "HEAD"]);
+    for remote in [&origin, &other] {
+        git_cmd(
+            &t.0,
+            &[
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/choice",
+                &oid,
+            ],
+        );
+    }
+    git_cmd(&root, &["fetch", "origin"]);
+    git_cmd(&root, &["fetch", "other"]);
+    git_cmd(&root, &["config", "checkout.defaultRemote", "other"]);
+    let op = operation();
+    let result = service
+        .run_branch(req(BranchTarget::Branch("choice".into())), &op)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result.outcome, Outcome::CreatedWorktree(git::AddMode::TrackRemote { remote, .. }) if remote == "other")
+    );
+    op.finish(OpOutcome::Succeeded(None));
+}
