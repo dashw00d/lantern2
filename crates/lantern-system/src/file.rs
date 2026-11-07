@@ -9,8 +9,9 @@ use std::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn atomic_write(path: &Path, data: &[u8], mode: u32) -> io::Result<bool> {
-    if fs::read(path).is_ok_and(|old| old == data)
-        && fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o777 == mode)
+    if fs::symlink_metadata(path)
+        .is_ok_and(|m| m.file_type().is_file() && m.permissions().mode() & 0o777 == mode)
+        && fs::read(path).is_ok_and(|old| old == data)
     {
         return Ok(false);
     }

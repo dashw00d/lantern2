@@ -360,3 +360,123 @@ fn doctor_is_read_only_and_reports_expected_checks() {
     assert!(!f.paths.user_unit.exists());
     assert!(!f.paths.dns_delegate.exists());
 }
+
+#[derive(Debug)]
+struct FakeStep {
+    id: &'static str,
+    root: bool,
+    done: std::cell::Cell<bool>,
+}
+impl Step for FakeStep {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn description(&self) -> &'static str {
+        "fake"
+    }
+    fn needs_root(&self) -> bool {
+        self.root
+    }
+    fn fix_command(&self) -> &'static str {
+        "fake"
+    }
+    fn check(&self) -> StepState {
+        if self.done.get() {
+            StepState::Done("done".into())
+        } else {
+            StepState::Pending("pending".into())
+        }
+    }
+    fn apply(&self) -> lantern_system::step::StepOutcome {
+        let prior = self.done.replace(true);
+        lantern_system::step::StepOutcome::new(
+            self.id,
+            if prior {
+                OutcomeState::AlreadyDone
+            } else {
+                OutcomeState::Changed
+            },
+            "fake",
+        )
+    }
+}
+#[test]
+fn init_composes_steps_with_uid_and_settings_validation() {
+    use lantern_system::init::{InitCtx, SystemInitCtx, pkexec_invocation, run_system_steps, run_user_steps};
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(&f.paths.sysctl_live, b"1024");
+    f.write(
+        &f.paths.root_cert,
+        b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+    );
+    let exe = f.paths.home.join("build/lantern");
+    f.write(&exe, b"binary");
+    let ca = FakeStep {
+        id: "ca",
+        root: false,
+        done: std::cell::Cell::new(false),
+    };
+    let trust = FakeStep {
+        id: "system_trust",
+        root: true,
+        done: std::cell::Cell::new(false),
+    };
+    let user = InitCtx {
+        paths: &f.paths,
+        runner: &runner,
+        executable: &exe,
+        certutil: Some(Path::new("/usr/bin/certutil")),
+        tray_autostart: true,
+        ca_step: Some(&ca),
+    };
+    assert!(
+        run_user_steps(&user)
+            .iter()
+            .all(|o| o.state == OutcomeState::Changed)
+    );
+    assert!(
+        run_user_steps(&user)
+            .iter()
+            .all(|o| o.state == OutcomeState::AlreadyDone)
+    );
+    let settings = lantern_core::settings::Settings::default();
+    let system = SystemInitCtx {
+        paths: &f.paths,
+        settings: &settings,
+        runner: &runner,
+        uid: 1000,
+        port_strategy: PortStrategy::Sysctl,
+        from_package: false,
+        migrate_v1: true,
+        allow_fake_cleanup: false,
+        system_trust_step: Some(&trust),
+    };
+    assert!(
+        run_system_steps(&system)
+            .iter()
+            .all(|o| o.state == OutcomeState::Changed || o.state == OutcomeState::AlreadyDone)
+    );
+    assert!(
+        run_system_steps(&system)
+            .iter()
+            .all(|o| o.state == OutcomeState::AlreadyDone)
+    );
+    let before = runner.state.borrow().commands.len();
+    let invalid = SystemInitCtx { uid: 0, ..system };
+    assert_eq!(run_system_steps(&invalid)[0].state, OutcomeState::Failed);
+    assert_eq!(runner.state.borrow().commands.len(), before);
+    let cmd = pkexec_invocation(&exe, 1000).unwrap();
+    assert_eq!(cmd.program, Path::new("/usr/bin/pkexec"));
+    assert_eq!(cmd.args[0], fs::canonicalize(&exe).unwrap().as_os_str());
+    assert_eq!(cmd.args[1..], ["init", "--system-steps", "--uid", "1000"]);
+    assert!(pkexec_invocation(&exe, 0).is_err());
+    assert!(
+        !runner
+            .state
+            .borrow()
+            .commands
+            .iter()
+            .any(|c| c.program == Path::new("/usr/bin/pkexec"))
+    );
+}
