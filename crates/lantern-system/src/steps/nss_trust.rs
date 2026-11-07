@@ -32,24 +32,19 @@ pub struct NssDatabase {
 }
 /// Discover the shared, Snap and Firefox/Flatpak NSS databases without creating them.
 pub fn discover(paths: &LanternPaths) -> Vec<NssDatabase> {
-    let home = &paths.home;
     let mut result = vec![NssDatabase {
         browser: Browser::Chrome,
-        path: home.join(".pki/nssdb"),
+        path: paths.chrome_nss.clone(),
         initialize: true,
     }];
-    if home.join("snap/chromium/current").is_dir() {
+    if paths.chromium_snap_home.is_dir() {
         result.push(NssDatabase {
             browser: Browser::Chrome,
-            path: home.join("snap/chromium/current/.pki/nssdb"),
+            path: paths.chromium_snap_nss.clone(),
             initialize: true,
         });
     }
-    for root in [
-        home.join(".mozilla/firefox"),
-        home.join("snap/firefox/common/.mozilla/firefox"),
-        home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
-    ] {
+    for root in &paths.firefox_profiles {
         if let Ok(entries) = fs::read_dir(root) {
             let mut dirs: Vec<_> = entries
                 .flatten()

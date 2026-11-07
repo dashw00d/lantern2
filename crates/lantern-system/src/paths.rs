@@ -15,6 +15,48 @@ pub struct LanternPaths {
     pub cache: PathBuf,
     /// An isolated root for system files, if supplied.
     pub fake_root: Option<PathBuf>,
+    /// Caddy storage root.
+    pub caddy_data: PathBuf,
+    /// Mailpit's data directory.
+    pub mailpit_data: PathBuf,
+    /// Redis's data directory.
+    pub redis_data: PathBuf,
+    /// Parent of per-major Postgres data directories.
+    pub postgres_data: PathBuf,
+    /// Postgres Unix socket directory for the user session.
+    pub postgres_socket: Option<PathBuf>,
+    /// Managed PHP-FPM configuration.
+    pub php_fpm_config: PathBuf,
+    /// Managed PHP-FPM socket in the user session.
+    pub php_fpm_socket: Option<PathBuf>,
+    /// Managed PHP-FPM PID file in the user session.
+    pub php_fpm_pid: Option<PathBuf>,
+    /// Shared Chrome-family NSS database.
+    pub chrome_nss: PathBuf,
+    /// Chromium Snap current home.
+    pub chromium_snap_home: PathBuf,
+    /// Chromium Snap NSS database.
+    pub chromium_snap_nss: PathBuf,
+    /// Roots containing Firefox profiles: native, Snap, Flatpak.
+    pub firefox_profiles: [PathBuf; 3],
+    /// v1 system daemon unit.
+    pub v1_daemon_unit: PathBuf,
+    /// v1 sudoers rule.
+    pub v1_sudoers: PathBuf,
+    /// v1 Caddy site directory.
+    pub v1_caddy_sites: PathBuf,
+    /// System Caddyfile checked for the v1 signature.
+    pub v1_caddyfile: PathBuf,
+    /// v1 NetworkManager DNS override.
+    pub v1_networkmanager_dns: PathBuf,
+    /// v1 dnsmasq DNS override.
+    pub v1_dnsmasq_dns: PathBuf,
+    /// Legacy installation directory.
+    pub v1_install: PathBuf,
+    /// Legacy CLI symlink.
+    pub v1_cli: PathBuf,
+    /// System directory containing CA anchors.
+    pub system_ca_dir: PathBuf,
     /// Root certificate and private key storage.
     pub ca_dir: PathBuf,
     /// Root certificate.
@@ -98,6 +140,31 @@ impl LanternPaths {
         let user_unit = home.join(".config/systemd/user/lantern.service");
         let autostart = home.join(".config/autostart/lantern-tray.desktop");
         Ok(Self {
+            caddy_data: dirs.data.join("caddy"),
+            mailpit_data: services.join("mailpit"),
+            redis_data: services.join("redis"),
+            postgres_data: services.join("postgres"),
+            postgres_socket: runtime.as_ref().map(|p| p.join("pg")),
+            php_fpm_config: dirs.state.join("php-fpm.conf"),
+            php_fpm_socket: runtime.as_ref().map(|p| p.join("php-fpm.sock")),
+            php_fpm_pid: runtime.as_ref().map(|p| p.join("php-fpm.pid")),
+            chrome_nss: home.join(".pki/nssdb"),
+            chromium_snap_home: home.join("snap/chromium/current"),
+            chromium_snap_nss: home.join("snap/chromium/current/.pki/nssdb"),
+            firefox_profiles: [
+                home.join(".mozilla/firefox"),
+                home.join("snap/firefox/common/.mozilla/firefox"),
+                home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
+            ],
+            v1_daemon_unit: system("/etc/systemd/system/lanternd.service"),
+            v1_sudoers: system("/etc/sudoers.d/lantern"),
+            v1_caddy_sites: system("/etc/caddy/sites.d"),
+            v1_caddyfile: system("/etc/caddy/Caddyfile"),
+            v1_networkmanager_dns: system("/etc/NetworkManager/dnsmasq.d/lantern.conf"),
+            v1_dnsmasq_dns: system("/etc/dnsmasq.d/lantern.conf"),
+            v1_install: system("/opt/lantern"),
+            v1_cli: system("/usr/local/bin/lantern"),
+            system_ca_dir: system("/usr/local/share/ca-certificates"),
             root_cert: ca_dir.join("root.crt"),
             root_key: ca_dir.join("root.key"),
             intermediate_cert: ca_dir.join("intermediate.crt"),

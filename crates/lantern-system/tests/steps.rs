@@ -1112,3 +1112,26 @@ fn undo_is_idempotent_and_retains_trust_unless_requested() {
             .all(|c| c.fake_root)
     );
 }
+
+#[test]
+fn paths_cover_user_service_browser_and_fake_root_locations() {
+    let f = Fixture::new();
+    assert_eq!(f.paths.caddy_data, f.paths.dirs.data.join("caddy"));
+    assert_eq!(f.paths.postgres_data, f.paths.dirs.data.join("services/postgres"));
+    assert_eq!(f.paths.php_fpm_config, f.paths.dirs.state.join("php-fpm.conf"));
+    assert_eq!(
+        f.paths.php_fpm_socket.as_ref().unwrap(),
+        &f.paths.runtime.as_ref().unwrap().join("php-fpm.sock")
+    );
+    assert_eq!(f.paths.firefox_profiles.len(), 3);
+    assert!(
+        f.paths
+            .v1_sudoers
+            .starts_with(f.paths.fake_root.as_ref().unwrap())
+    );
+    let xdg = f.paths.home.join("custom-config");
+    let paths = f.paths.clone().with_user_config_root(&xdg).unwrap();
+    assert_eq!(paths.user_unit, xdg.join("systemd/user/lantern.service"));
+    assert_eq!(paths.autostart, xdg.join("autostart/lantern-tray.desktop"));
+    assert!(paths.with_user_config_root(Path::new("../bad")).is_err());
+}

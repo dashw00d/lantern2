@@ -33,21 +33,15 @@ pub fn detect(paths: &LanternPaths) -> Vec<Artifact> {
         }
     };
     for (p, action) in [
-        (
-            "/etc/systemd/system/lanternd.service",
-            "disable and remove v1 daemon unit",
-        ),
-        ("/etc/sudoers.d/lantern", "remove v1 sudoers rule"),
-        (
-            "/etc/NetworkManager/dnsmasq.d/lantern.conf",
-            "remove NetworkManager DNS override",
-        ),
-        ("/etc/dnsmasq.d/lantern.conf", "remove dnsmasq DNS override"),
+        (&paths.v1_daemon_unit, "disable and remove v1 daemon unit"),
+        (&paths.v1_sudoers, "remove v1 sudoers rule"),
+        (&paths.v1_networkmanager_dns, "remove NetworkManager DNS override"),
+        (&paths.v1_dnsmasq_dns, "remove dnsmasq DNS override"),
     ] {
-        add(paths.system(Path::new(p)), action, false);
+        add(p.clone(), action, false);
     }
-    let sites = paths.system(Path::new("/etc/caddy/sites.d"));
-    if let Ok(entries) = fs::read_dir(&sites) {
+    let sites = &paths.v1_caddy_sites;
+    if let Ok(entries) = fs::read_dir(sites) {
         let mut found: Vec<_> = entries
             .flatten()
             .map(|e| e.path())
@@ -58,7 +52,7 @@ pub fn detect(paths: &LanternPaths) -> Vec<Artifact> {
             add(p, "remove v1 Caddy site", false);
         }
     }
-    let caddy = paths.system(Path::new("/etc/caddy/Caddyfile"));
+    let caddy = paths.v1_caddyfile.clone();
     if fs::read_to_string(&caddy).is_ok_and(|s| s.contains("import /etc/caddy/sites.d")) {
         add(
             caddy,
@@ -68,16 +62,16 @@ pub fn detect(paths: &LanternPaths) -> Vec<Artifact> {
     }
     for part in ["daemon", "desktop", "cli", "packaging"] {
         add(
-            paths.system(Path::new("/opt/lantern")).join(part),
+            paths.v1_install.join(part),
             "check package ownership before removal",
             true,
         );
     }
-    let cli = paths.system(Path::new("/usr/local/bin/lantern"));
+    let cli = paths.v1_cli.clone();
     if fs::read_link(&cli).is_ok_and(|target| target.starts_with("/opt/lantern")) {
         add(cli, "remove v1 symlink after ownership check", true);
     }
-    let trust = paths.system(Path::new("/usr/local/share/ca-certificates"));
+    let trust = paths.system_ca_dir.clone();
     if let Ok(entries) = fs::read_dir(trust) {
         let mut found: Vec<_> = entries
             .flatten()
@@ -171,11 +165,7 @@ impl Step for V1MigrateStep<'_> {
             for artifact in detect(self.paths).into_iter().filter(|a| !a.report_only) {
                 no_symlink_parents(root, &artifact.path)?;
                 let path = &artifact.path;
-                if path
-                    == &self
-                        .paths
-                        .system(Path::new("/etc/systemd/system/lanternd.service"))
-                {
+                if path == &self.paths.v1_daemon_unit {
                     run_checked(
                         self.runner,
                         &CommandSpec::new("/usr/bin/systemctl", ["disable", "--now", "lanternd"], true),
@@ -183,29 +173,21 @@ impl Step for V1MigrateStep<'_> {
                     )?;
                 }
                 fs::remove_file(path).map_err(|e| e.to_string())?;
-                if path
-                    == &self
-                        .paths
-                        .system(Path::new("/etc/systemd/system/lanternd.service"))
-                {
+                if path == &self.paths.v1_daemon_unit {
                     run_checked(
                         self.runner,
                         &CommandSpec::new("/usr/bin/systemctl", ["daemon-reload"], true),
                         self.paths.fake_root.is_some(),
                     )?;
                 }
-                if path
-                    == &self
-                        .paths
-                        .system(Path::new("/etc/NetworkManager/dnsmasq.d/lantern.conf"))
-                {
+                if path == &self.paths.v1_networkmanager_dns {
                     run_checked(
                         self.runner,
                         &CommandSpec::new("/usr/bin/nmcli", ["general", "reload", "dns-full"], true),
                         self.paths.fake_root.is_some(),
                     )?;
                 }
-                if path == &self.paths.system(Path::new("/etc/dnsmasq.d/lantern.conf")) {
+                if path == &self.paths.v1_dnsmasq_dns {
                     run_checked(
                         self.runner,
                         &CommandSpec::new("/usr/bin/systemctl", ["reload-or-restart", "dnsmasq"], true),
