@@ -21,3 +21,31 @@ pub const LIST_LISTENERS: &str = "Raw list of TCP sockets listening on localhost
 pub const LIST_TOOLS: &str = "List the tools agents can call through Lantern: projects of kind `tool` or `capability` (browser automation, data services, ...). Shows description, status, domain, risk, whether calls need confirmation, trigger keywords and endpoints. Then use `get_project_docs`, `get_project_endpoints` and `call_tool_api`. Filters: `tag`, `status`, `kind`.";
 pub const CALL_TOOL_API: &str = "Call an HTTP API of a registered project through Lantern, e.g. tool=\"browser\", method=\"POST\", path=\"/tasks/execute\", body={...}. Lantern finds the running server's address; you give the project and a path. Returns the response body (cut at `max_bytes`, default 100000). Only registered projects are reachable. Endpoints marked risk high/critical, or projects needing confirmation, are not sent until `confirm=true`: ask the user first. For calls over ~50s set `async=true` to get a `job_id`, then use `get_operation` or `get_job_result`. See `get_project_endpoints` for what exists.";
 pub const GET_JOB_RESULT: &str = "Fetch the result of an async `call_tool_api` job by `job_id`. While running: status and elapsed time. When done: the response body. On failure: the error. Jobs are kept for 1 hour after they finish. (`get_operation` returns the same job as an operation.)";
+pub const SETUP_PROJECT: &str = "Add a project folder to Lantern so the user can start and open it from the Lantern app (and agents with start_project). Pass the folder's absolute path. If it has no lantern.yaml yet, this returns a short guide and what Lantern detected there: write the file, then call setup_project again with the same path. If it has one, this validates it, adds the project (or reloads it when already added) and returns its id and any problems. Then call start_project with that id to check it really runs.";
+
+/// How to write a lantern.yaml, returned by `setup_project`.
+pub const MANIFEST_GUIDE: &str = r#"Lantern runs a project from a lantern.yaml in its root folder.
+
+Minimal file for a web app:
+
+  id: myapp                  # lowercase slug, unique in Lantern
+  name: My App
+  description: One line shown on the project's card
+  type: proxy
+  run:
+    cmd: npm run dev -- --host ${HOST} --port ${PORT} --strictPort
+  open_path: /               # where the Open button goes, e.g. /app/
+  docs: [README.md]
+
+Rules:
+- The server must listen on ${PORT} at ${HOST} (127.0.0.1). Lantern chooses the port and waits for it before it reports "running", so never hard-code a port, and pass a strict-port flag if the tool has one.
+- run.cmd is one shell line, run in the project folder (run.cwd: sub/dir to change). Use the project's own runner: npm/pnpm scripts, .venv/bin/python, ./script.sh.
+- run.env sets environment variables; ${PORT} ${HOST} ${DOMAIN} ${URL} work in values.
+- Servers that check the Host header must accept ${DOMAIN}: Vite -> run.env __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: ${DOMAIN}; Django -> add it to ALLOWED_HOSTS; a custom "loopback only" guard needs an allowlist.
+- For a detected framework you may write `template: vite` (or nextjs, astro, django, fastapi, flask, laravel, ...) instead of run.cmd; the template supplies the command.
+- Installs and builds go in setup: [npm ci] (run with `lantern setup <id> --force`, and for new branch checkouts), never in run.cmd.
+- worktree.link: [node_modules, .venv] shares heavy folders with branch checkouts.
+- health_endpoint: /health if the app has a cheap status route.
+- Something that is not a web server (a GUI app, a script) does not belong here: the user can save it under Commands in the Lantern app.
+
+Check the file with `lantern manifest check` in the folder, or call setup_project again; it reports errors with their line."#;

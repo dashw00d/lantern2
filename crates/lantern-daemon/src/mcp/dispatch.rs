@@ -181,6 +181,103 @@ impl LanternMcp {
         )
         .await
     }
+    /// Guide an agent to a valid lantern.yaml, then add (or reload) the project.
+    async fn setup_project_at(&self, raw: &str) -> ToolResult {
+        use super::descriptions::MANIFEST_GUIDE;
+        let path = std::path::PathBuf::from(raw.trim());
+        if !path.is_absolute() {
+            return Err("Pass the project folder as an absolute path, e.g. /home/me/dev/myapp.".into());
+        }
+        if !path.is_dir() {
+            return Err(format!("{} is not a folder.", path.display()));
+        }
+        let Some(manifest) = ["lantern.yaml", "lantern.yml"]
+            .iter()
+            .map(|n| path.join(n))
+            .find(|p| p.is_file())
+        else {
+            let found = lantern_core::detect::detect_dir(&path);
+            return Ok(json!({
+                "status": "needs_manifest",
+                "write_to": path.join("lantern.yaml"),
+                "detected": {
+                    "framework": format!("{:?}", found.framework).to_lowercase(),
+                    "template": found.template,
+                    "evidence": found.evidence,
+                },
+                "guide": MANIFEST_GUIDE,
+                "next": "Read the project's README and package/pyproject files to find how it starts, write lantern.yaml as the guide says, then call setup_project again with the same path.",
+            }));
+        };
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let projects = self
+            .facade
+            .projects(ProjectFilter {
+                enabled: Some("any".into()),
+                ..Default::default()
+            })
+            .await
+            .map_err(failure)?;
+        let existing = projects
+            .iter()
+            .find(|p| p.project.root == path || p.project.root.canonicalize().is_ok_and(|r| r == canonical));
+        let (id, action) = match existing {
+            Some(p) => {
+                self.facade
+                    .reload_project(
+                        p.project.id.clone(),
+                        lantern_core::api::ReloadRequest {
+                            discard_overrides: false,
+                        },
+                    )
+                    .await
+                    .map_err(failure)?;
+                (p.project.id.clone(), "reloaded")
+            }
+            None => {
+                let added = self
+                    .facade
+                    .register_project(lantern_core::api::RegisterProjectRequest {
+                        path: path.clone(),
+                        id: None,
+                        name: None,
+                        enabled: None,
+                        overrides: None,
+                        write_manifest: false,
+                    })
+                    .await
+                    .map_err(failure)?;
+                (added.project.id.clone(), "added")
+            }
+        };
+        let report = self
+            .facade
+            .manifest(InstanceId::primary(&id))
+            .await
+            .unwrap_or(Value::Null);
+        let diagnostics = report.get("diagnostics").cloned().unwrap_or_else(|| json!([]));
+        let errors = diagnostics
+            .as_array()
+            .map(|all| all.iter().filter(|d| d["severity"] == "error").count())
+            .unwrap_or(0);
+        if errors > 0 {
+            return Ok(json!({
+                "status": "manifest_has_errors",
+                "id": id,
+                "manifest": manifest,
+                "diagnostics": diagnostics,
+                "guide": MANIFEST_GUIDE,
+                "next": "Fix the errors in lantern.yaml, then call setup_project again with the same path.",
+            }));
+        }
+        Ok(json!({
+            "status": action,
+            "id": id,
+            "manifest": manifest,
+            "diagnostics": diagnostics,
+            "next": format!("Call start_project with name=\"{id}\": it waits until the server listens and returns its URL. If it fails, read get_project_logs, fix lantern.yaml and call setup_project again. The project now has a card in the Lantern app."),
+        }))
+    }
     pub(super) async fn invoke(
         &self,
         name: &str,
@@ -410,6 +507,7 @@ impl LanternMcp {
                 }
                 Ok(out)
             }
+            "setup_project" => self.setup_project_at(field(a, "path").unwrap_or_default()).await,
             "start_project" | "stop_project" | "restart_project" => {
                 let id = self.target_args(a).await?;
                 let ticket = match name {

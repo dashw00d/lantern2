@@ -93,7 +93,8 @@ async fn net_dns_real_udp_and_tcp_queries() {
     };
     assert_eq!(&reply[reply.len() - 4..], &[127, 0, 0, 1]);
     let tcp_socket = TcpSocket::new_v4().unwrap();
-    tcp_socket.bind("127.0.0.1:39996".parse().unwrap()).unwrap();
+    // Any free port: a fixed one inside the ephemeral range can be taken by an outgoing connection.
+    tcp_socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let mut tcp = tcp_socket
         .connect("127.0.0.1:39994".parse().unwrap())
         .await

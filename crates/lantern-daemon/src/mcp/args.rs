@@ -39,6 +39,12 @@ pub struct SearchProjectsArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SetupProjectArgs {
+    /// Absolute path of the project folder (where lantern.yaml is or should go).
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TargetArgs {
     /// Project name or id; an instance id also works.
     pub name: String,

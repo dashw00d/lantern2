@@ -1,6 +1,9 @@
 name: vite
 type: proxy
 run:
-  cmd: "npx vite --host ${HOST} --port ${PORT}"
+  cmd: "npx vite --host ${HOST} --port ${PORT} --strictPort"
+  env:
+    # Vite rejects Host names it does not know; Lantern serves it as ${DOMAIN}.
+    __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: "${DOMAIN}"
 routing:
   websocket: true

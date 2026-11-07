@@ -64,6 +64,20 @@ impl LanternMcp {
         .await
     }
 
+    #[tool(description = descriptions::SETUP_PROJECT, annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true))]
+    async fn setup_project(
+        &self,
+        Parameters(args): Parameters<SetupProjectArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.invoke(
+            "setup_project",
+            serde_json::to_value(args).expect("MCP arguments serialize"),
+            ctx,
+        )
+        .await
+    }
+
     #[tool(description = descriptions::START_PROJECT, annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true))]
     async fn start_project(
         &self,

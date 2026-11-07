@@ -733,6 +733,28 @@
       "idempotentHint": true,
       "readOnlyHint": false
     },
+    "description": "Add a project folder to Lantern so the user can start and open it from the Lantern app (and agents with start_project). Pass the folder's absolute path. If it has no lantern.yaml yet, this returns a short guide and what Lantern detected there: write the file, then call setup_project again with the same path. If it has one, this validates it, adds the project (or reloads it when already added) and returns its id and any problems. Then call start_project with that id to check it really runs.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "path": {
+          "description": "Absolute path of the project folder (where lantern.yaml is or should go).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "setup_project"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "readOnlyHint": false
+    },
     "description": "Run a git branch of a project side by side with the others: creates a git worktree for `branch` if there is none (new branches start from `base`, default the primary's current branch), runs setup (copies .env, installs dependencies), starts it, and returns its own URL such as https://feature-x.myapp.glow. Safe to repeat; an existing instance is reused. Can take minutes: after `wait_seconds` (default 45, max 55) you get an `operation_id` and the work continues; poll `get_operation`. `start=false` only prepares the worktree.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

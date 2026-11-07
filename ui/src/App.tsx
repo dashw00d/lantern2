@@ -133,7 +133,7 @@ export function App() {
       <header className="sticky top-0 z-20 border-b border-border bg-background/85 backdrop-blur">
         <div className="mx-auto flex h-14 max-w-6xl items-center gap-4 px-5">
           <div className="flex items-center gap-2.5">
-            <img src="/favicon.svg" alt="" className="h-7 w-7" />
+            <img src="/favicon.svg" alt="" className="h-8 w-8" />
             <span className="text-[15px] font-semibold tracking-tight">Lantern</span>
           </div>
           <div className="relative ml-2 max-w-sm flex-1">
