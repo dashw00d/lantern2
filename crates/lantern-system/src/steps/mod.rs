@@ -7,9 +7,15 @@ pub mod v1_migrate;
 
 use crate::command::{CommandOutput, CommandRunner, CommandSpec};
 
-pub(crate) fn run_checked(runner: &dyn CommandRunner, spec: &CommandSpec) -> Result<CommandOutput, String> {
+pub(crate) fn run_checked(
+    runner: &dyn CommandRunner,
+    spec: &CommandSpec,
+    fake_root: bool,
+) -> Result<CommandOutput, String> {
+    let mut protected = spec.clone();
+    protected.fake_root = fake_root;
     let out = runner
-        .run(spec)
+        .run(&protected)
         .map_err(|e| format!("{}: {e}", spec.program.display()))?;
     if !out.success {
         return Err(format!(

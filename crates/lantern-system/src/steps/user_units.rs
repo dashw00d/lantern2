@@ -127,7 +127,11 @@ impl Step for UserUnitsStep<'_> {
                 if atomic_write(&self.paths.user_unit, contents.as_bytes(), 0o644)
                     .map_err(|e| e.to_string())?
                 {
-                    run_checked(self.runner, &self.cmd(&["--user", "daemon-reload"], true))?;
+                    run_checked(
+                        self.runner,
+                        &self.cmd(&["--user", "daemon-reload"], true),
+                        self.paths.fake_root.is_some(),
+                    )?;
                 }
             }
             if self.tray_autostart {
@@ -141,6 +145,7 @@ impl Step for UserUnitsStep<'_> {
             run_checked(
                 self.runner,
                 &self.cmd(&["--user", "enable", "--now", "lantern.service"], true),
+                self.paths.fake_root.is_some(),
             )?;
             Ok(())
         })();

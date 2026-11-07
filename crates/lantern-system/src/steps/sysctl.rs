@@ -131,6 +131,7 @@ impl Step for PortsStep<'_> {
                                 ],
                                 true,
                             ),
+                            self.paths.fake_root.is_some(),
                         )
                         .map(|_| ())
                     })
@@ -151,6 +152,7 @@ impl Step for PortsStep<'_> {
                             ],
                             true,
                         ),
+                        self.paths.fake_root.is_some(),
                     )
                     .map(|_| ())
                 }

@@ -632,19 +632,52 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
             strict.push(db.path);
         }
     }
+    fn strict_doh(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+                (key == "dns_over_https"
+                    && value.get("mode").and_then(serde_json::Value::as_str) == Some("secure"))
+                    || strict_doh(value)
+            }),
+            serde_json::Value::Array(values) => values.iter().any(strict_doh),
+            _ => false,
+        }
+    }
+    let mut observed_browser_settings = false;
+    for path in [
+        ".config/google-chrome/Local State",
+        ".config/chromium/Local State",
+        "snap/chromium/current/.config/chromium/Local State",
+    ] {
+        let path = ctx.paths.home.join(path);
+        if let Ok(data) = fs::read(&path) {
+            observed_browser_settings = true;
+            if serde_json::from_slice::<serde_json::Value>(&data).is_ok_and(|v| strict_doh(&v)) {
+                strict.push(path);
+            }
+        }
+    }
+    let (doh_status, doh_detail) = if !strict.is_empty() {
+        (
+            CheckStatus::Warn,
+            format!("Strict browser DoH may bypass local DNS: {strict:?}"),
+        )
+    } else if observed_browser_settings {
+        (
+            CheckStatus::Ok,
+            "No strict DoH found in inspected browser settings".into(),
+        )
+    } else {
+        (
+            CheckStatus::Skipped,
+            "No Chrome Local State found; Firefox profiles were inspected when present".into(),
+        )
+    };
     checks.push(item(
         "browser.doh",
         "Browser DNS over HTTPS",
-        if strict.is_empty() {
-            CheckStatus::Skipped
-        } else {
-            CheckStatus::Warn
-        },
-        if strict.is_empty() {
-            "No strict Firefox DoH found; Chrome settings require review".into()
-        } else {
-            format!("Strict Firefox DoH may bypass local DNS: {strict:?}")
-        },
+        doh_status,
+        doh_detail,
         "lantern doctor",
         false,
     ));
@@ -661,24 +694,38 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
         "sudo lantern init --system-steps --migrate-v1",
         true,
     ));
-    let system_caddy = command(
-        ctx.runner,
-        Path::new("/usr/bin/systemctl"),
-        &["is-active", "caddy.service"],
-    );
+    let system_caddy = ctx.runner.run(&CommandSpec::new(
+        "/usr/bin/systemctl",
+        ["is-active", "caddy.service"],
+        false,
+    ));
+    let (caddy_status, caddy_detail) = match system_caddy {
+        Ok(output) if output.success => (CheckStatus::Fail, "system Caddy is active".to_string()),
+        Ok(output)
+            if matches!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "inactive" | "failed" | "unknown"
+            ) =>
+        {
+            (CheckStatus::Ok, "system Caddy is not active".to_string())
+        }
+        Ok(output) => (
+            CheckStatus::Skipped,
+            format!(
+                "could not inspect system Caddy: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ),
+        Err(e) => (
+            CheckStatus::Skipped,
+            format!("could not inspect system Caddy: {e}"),
+        ),
+    };
     checks.push(item(
         "conflict.caddy",
         "System Caddy",
-        if system_caddy.is_ok() {
-            CheckStatus::Fail
-        } else {
-            CheckStatus::Ok
-        },
-        if system_caddy.is_ok() {
-            "system Caddy is active"
-        } else {
-            "system Caddy is not active"
-        },
+        caddy_status,
+        caddy_detail,
         "sudo systemctl disable --now caddy",
         true,
     ));
@@ -705,21 +752,54 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
         "command -v lantern",
         false,
     ));
-    for (id, title, fix) in [
-        ("services.mailpit", "Mailpit", "lantern services"),
-        ("services.redis", "Redis", "lantern services"),
-        ("services.postgres", "Postgres", "lantern services"),
-        ("php.fpm", "PHP-FPM", "lantern services start php-fpm"),
-        ("linger", "User lingering", "loginctl enable-linger $USER"),
+    for (name, enabled) in [
+        ("mailpit", settings.services.mailpit.enabled),
+        ("redis", settings.services.redis.enabled),
+        ("postgres", settings.services.postgres.enabled),
     ] {
+        let unit = format!("lantern-svc-{name}.service");
+        let observed = user_command(ctx, &["--user", "is-active", &unit]);
+        let detail = if !enabled {
+            "disabled in settings".to_string()
+        } else {
+            match observed {
+                Ok(s) => format!("user unit {unit}: {s}"),
+                Err(_) => format!("user unit {unit} not active or unavailable"),
+            }
+        };
         checks.push(item(
-            id,
-            title,
+            &format!("services.{name}"),
+            name,
             CheckStatus::Skipped,
-            "runtime service inspection is not available",
-            fix,
+            detail,
+            "lantern services",
             false,
         ));
     }
+    checks.push(item(
+        "php.fpm",
+        "PHP-FPM",
+        CheckStatus::Skipped,
+        "PHP instance presence is not available to this context",
+        "lantern services start php-fpm",
+        false,
+    ));
+    let linger = command(
+        ctx.runner,
+        Path::new("/usr/bin/loginctl"),
+        &["show-user", "-p", "Linger", "--value"],
+    );
+    checks.push(item(
+        "linger",
+        "User lingering",
+        CheckStatus::Skipped,
+        match linger {
+            Ok(value) => format!("Linger={value}"),
+            Err(_) => "linger state unavailable".into(),
+        },
+        "loginctl enable-linger $USER",
+        false,
+    ));
+
     checks
 }

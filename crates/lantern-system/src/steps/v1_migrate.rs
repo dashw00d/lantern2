@@ -179,6 +179,7 @@ impl Step for V1MigrateStep<'_> {
                     run_checked(
                         self.runner,
                         &CommandSpec::new("/usr/bin/systemctl", ["disable", "--now", "lanternd"], true),
+                        self.paths.fake_root.is_some(),
                     )?;
                 }
                 fs::remove_file(path).map_err(|e| e.to_string())?;
@@ -190,6 +191,7 @@ impl Step for V1MigrateStep<'_> {
                     run_checked(
                         self.runner,
                         &CommandSpec::new("/usr/bin/systemctl", ["daemon-reload"], true),
+                        self.paths.fake_root.is_some(),
                     )?;
                 }
                 if path
@@ -200,12 +202,14 @@ impl Step for V1MigrateStep<'_> {
                     run_checked(
                         self.runner,
                         &CommandSpec::new("/usr/bin/nmcli", ["general", "reload", "dns-full"], true),
+                        self.paths.fake_root.is_some(),
                     )?;
                 }
                 if path == &self.paths.system(Path::new("/etc/dnsmasq.d/lantern.conf")) {
                     run_checked(
                         self.runner,
                         &CommandSpec::new("/usr/bin/systemctl", ["reload-or-restart", "dnsmasq"], true),
+                        self.paths.fake_root.is_some(),
                     )?;
                 }
             }

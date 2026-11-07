@@ -178,6 +178,7 @@ fn sysctl_and_setcap_are_selected_and_rechecked() {
         assert_eq!(step.apply().state, OutcomeState::AlreadyDone);
         let commands = &runner.state.borrow().commands;
         assert_eq!(commands.iter().filter(|c| c.mutating).count(), 1);
+        assert!(commands.iter().filter(|c| c.mutating).all(|c| c.fake_root));
         let actual = &commands.iter().find(|c| c.mutating).unwrap().program;
         assert_eq!(
             actual.file_name(),
@@ -300,6 +301,12 @@ fn real_runner_blocks_mutation_in_fake_mode() {
     let cmd = CommandSpec::new("/usr/bin/touch", ["/forbidden"], true);
     assert_eq!(
         runner.run(&cmd).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let mut fake = CommandSpec::new("/definitely-not-a-real-lantern-command", ["unused"], true);
+    fake.fake_root = true;
+    assert_eq!(
+        ProcessRunner { fake_root: false }.run(&fake).unwrap_err().kind(),
         io::ErrorKind::PermissionDenied
     );
 }

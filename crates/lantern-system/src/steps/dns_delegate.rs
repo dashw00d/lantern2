@@ -94,6 +94,7 @@ impl Step for DnsDelegateStep<'_> {
             if let Err(e) = run_checked(
                 self.runner,
                 &CommandSpec::new("/usr/bin/systemctl", ["reload", "systemd-resolved"], true),
+                self.paths.fake_root.is_some(),
             ) {
                 let restored = match original {
                     Some((data, mode)) => atomic_write(&self.paths.dns_delegate, &data, mode).map(|_| ()),

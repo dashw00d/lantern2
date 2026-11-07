@@ -187,7 +187,11 @@ impl Step for NssTrustStep<'_> {
                 if db.initialize && !db.path.join("cert9.db").exists() {
                     fs::create_dir_all(&db.path).map_err(|e| e.to_string())?;
                     let args = ["-N", "--empty-password"].map(OsString::from);
-                    run_checked(self.runner, &certutil_command(certutil, &db, &args, true))?;
+                    run_checked(
+                        self.runner,
+                        &certutil_command(certutil, &db, &args, true),
+                        self.paths.fake_root.is_some(),
+                    )?;
                 }
                 // Delete only when a certificate by this nickname exists; never ignore database errors from deletion.
                 let lookup = ["-L", "-n", "Lantern Local CA", "-a"].map(OsString::from);
@@ -198,13 +202,21 @@ impl Step for NssTrustStep<'_> {
                     .success
                 {
                     let args = ["-D", "-n", "Lantern Local CA"].map(OsString::from);
-                    run_checked(self.runner, &certutil_command(certutil, &db, &args, true))?;
+                    run_checked(
+                        self.runner,
+                        &certutil_command(certutil, &db, &args, true),
+                        self.paths.fake_root.is_some(),
+                    )?;
                 }
                 let mut args = ["-A", "-t", "C,,", "-n", "Lantern Local CA", "-i"]
                     .map(OsString::from)
                     .to_vec();
                 args.push(self.paths.root_cert.as_os_str().to_owned());
-                run_checked(self.runner, &certutil_command(certutil, &db, &args, true))?;
+                run_checked(
+                    self.runner,
+                    &certutil_command(certutil, &db, &args, true),
+                    self.paths.fake_root.is_some(),
+                )?;
             }
             Ok(())
         })();

@@ -18,6 +18,8 @@ pub struct CommandSpec {
     pub env: BTreeMap<OsString, OsString>,
     /// Whether the command changes system or user state.
     pub mutating: bool,
+    /// Prevent real mutations when this command belongs to a fake-root operation.
+    pub fake_root: bool,
 }
 impl CommandSpec {
     /// Describe a command by its absolute executable and arguments.
@@ -31,6 +33,7 @@ impl CommandSpec {
             args: args.into_iter().map(Into::into).collect(),
             env: BTreeMap::new(),
             mutating,
+            fake_root: false,
         }
     }
 }
@@ -68,7 +71,11 @@ impl CommandRunner for ProcessRunner {
                 "command must use an absolute path",
             ));
         }
-        if self.fake_root && spec.mutating {
+        if spec.mutating
+            && (self.fake_root
+                || spec.fake_root
+                || std::env::var_os("LANTERN_FAKE_ROOT").is_some_and(|v| !v.is_empty()))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "mutating commands are disabled with a fake root",
