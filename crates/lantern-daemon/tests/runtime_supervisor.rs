@@ -517,10 +517,240 @@ async fn runtime_real_systemd_discovery_logs_and_stop() {
     let stop = rt.stop(&id, StopOpts::default()).await.unwrap();
     assert_eq!(completed(&stop).await, OperationStatus::Succeeded);
     let rows = SystemctlBackend.poll(&[unit]).await.unwrap();
-    assert!(
-        rows.is_empty()
-            || rows
-                .iter()
-                .all(|r| r.load == Load::NotFound || r.active == Active::Inactive)
+    assert!(rows.is_empty() || rows.iter().all(|r| r.load == Load::NotFound));
+}
+
+#[derive(Default)]
+struct TestRouter {
+    calls: Mutex<Vec<String>>,
+    php_ok: bool,
+}
+impl lantern_daemon::runtime::seams::RuntimeRouter for TestRouter {
+    fn publish<'a>(
+        &'a self,
+        instance: &'a Instance,
+        target: lantern_daemon::runtime::seams::RouteTarget,
+    ) -> lantern_daemon::runtime::seams::RouteFuture<'a> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("publish {} {target:?}", instance.id));
+            Ok(())
+        })
+    }
+    fn unpublish<'a>(&'a self, id: &'a InstanceId) -> lantern_daemon::runtime::seams::RouteFuture<'a> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(format!("unpublish {id}"));
+            Ok(())
+        })
+    }
+    fn php_ready<'a>(&'a self) -> lantern_daemon::runtime::seams::RouteFuture<'a> {
+        Box::pin(async move {
+            if self.php_ok {
+                Ok(())
+            } else {
+                Err("php-fpm unavailable".into())
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn runtime_site_only_activation_and_reconcile_use_router() {
+    use lantern_core::model::ServeMode;
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("site", &temp.0, "unused", &[]);
+    {
+        let mut all = store.instances.lock().unwrap();
+        let i = all.get_mut(&id).unwrap();
+        let m = Arc::make_mut(&mut i.manifest);
+        m.serve = ServeMode::Static;
+        m.run.cmd = None;
+        m.root = Some(".".into());
+    }
+    let fake = Arc::new(FakeSystemd::default());
+    let router = Arc::new(TestRouter::default());
+    let make = || {
+        Runtime::with_adapters(
+            config(&temp),
+            store.clone(),
+            Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+            fake.clone(),
+            OperationTracker::new(EventBus::new()),
+            Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+            router.clone(),
+        )
+    };
+    let rt = make();
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
     );
+    assert!(store.activated(&id).unwrap());
+    assert!(fake.calls().iter().all(|s| !s.starts_with("start ")));
+    let rt2 = make();
+    let report = rt2.reconcile().await;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(rt2.state(&id).unwrap().status, InstanceStatus::Running);
+    assert_eq!(
+        router
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.starts_with("publish site"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        completed(&rt2.stop(&id, StopOpts::default()).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    assert!(!store.activated(&id).unwrap());
+    assert!(router.calls.lock().unwrap().iter().any(|s| s == "unpublish site"));
+}
+
+#[tokio::test]
+async fn runtime_php_site_requires_php_fpm_and_router() {
+    use lantern_core::model::ServeMode;
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("php", &temp.0, "unused", &[]);
+    {
+        let mut all = store.instances.lock().unwrap();
+        let m = Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest);
+        m.serve = ServeMode::Php;
+        m.run.cmd = None;
+        m.root = Some(".".into());
+    }
+    let fake = Arc::new(FakeSystemd::default());
+    let router = Arc::new(TestRouter::default());
+    let rt = Runtime::with_adapters(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        fake,
+        OperationTracker::new(EventBus::new()),
+        Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+        router,
+    );
+    let op = rt.start(&id, StartOpts).await.unwrap();
+    assert_eq!(completed(&op).await, OperationStatus::Failed);
+    assert_eq!(rt.state(&id).unwrap().status, InstanceStatus::NeedsConfig);
+}
+
+struct DeploySystemd {
+    fake: FakeSystemd,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    verbs: Mutex<Vec<String>>,
+}
+impl UserSystemd for DeploySystemd {
+    fn start<'a>(
+        &'a self,
+        spec: &'a lantern_daemon::runtime::systemd::UnitStart,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        Box::pin(async move {
+            self.fake.start(spec).await?;
+            let text = std::fs::read_to_string(&spec.script)?;
+            let verb = if text.contains("BEGINMARKER") {
+                self.running.store(true, Ordering::SeqCst);
+                "start"
+            } else if text.contains("RESTARTMARKER") {
+                self.running.store(true, Ordering::SeqCst);
+                "restart"
+            } else if text.contains("STOPMARKER") {
+                self.running.store(false, Ordering::SeqCst);
+                "stop"
+            } else {
+                "other"
+            };
+            self.verbs.lock().unwrap().push(verb.into());
+            self.fake.set_snapshot(UnitSnapshot {
+                sub: "exited".into(),
+                exit_kind: ExitCodeKind::Exited,
+                exit_code: Some(0),
+                ..running_snapshot(&spec.unit)
+            });
+            Ok(())
+        })
+    }
+    fn stop<'a>(
+        &'a self,
+        unit: &'a str,
+        timeout: Duration,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.fake.stop(unit, timeout)
+    }
+    fn reset_failed<'a>(&'a self, unit: &'a str) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.fake.reset_failed(unit)
+    }
+    fn poll<'a>(
+        &'a self,
+        units: &'a [String],
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, Vec<UnitSnapshot>> {
+        self.fake.poll(units)
+    }
+    fn list_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, Vec<String>> {
+        self.fake.list_prefix(prefix)
+    }
+}
+struct DeployProbe(Arc<std::sync::atomic::AtomicBool>);
+impl PortProbe for DeployProbe {
+    fn port_binding(&self, port: u16, _: Option<&str>) -> io::Result<PortBinding> {
+        Ok(if self.0.load(Ordering::SeqCst) {
+            PortBinding::BoundByUnit {
+                pid: 100,
+                addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))],
+            }
+        } else {
+            PortBinding::Free
+        })
+    }
+    fn unit_listeners(&self, _: &str) -> io::Result<Vec<SocketAddr>> {
+        Ok(vec![])
+    }
+}
+#[tokio::test]
+async fn runtime_deploy_start_restart_and_stop_use_oneshots() {
+    use lantern_core::template::TemplateString;
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("deploy", &temp.0, "unused", &[]);
+    {
+        let mut all = store.instances.lock().unwrap();
+        let m = Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest);
+        m.deploy.start = Some(TemplateString::parse("echo BEGINMARKER ${PORT}").0);
+        m.deploy.restart = Some(TemplateString::parse("echo RESTARTMARKER ${PORT}").0);
+        m.deploy.stop = Some(TemplateString::parse("echo STOPMARKER").0);
+    }
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let systemd = Arc::new(DeploySystemd {
+        fake: FakeSystemd::default(),
+        running: running.clone(),
+        verbs: Mutex::new(vec![]),
+    });
+    let rt = runtime(
+        config(&temp),
+        store,
+        Arc::new(DeployProbe(running.clone())),
+        systemd.clone(),
+    );
+    let start = rt.start(&id, StartOpts).await.unwrap();
+    let snap = start.wait(Duration::from_secs(8)).await.unwrap();
+    assert_eq!(snap.status, OperationStatus::Succeeded, "{snap:?}");
+    let first_port = rt.state(&id).unwrap().port;
+    let restart = rt.restart(&id).await.unwrap();
+    let snap = restart.wait(Duration::from_secs(8)).await.unwrap();
+    assert_eq!(snap.status, OperationStatus::Succeeded, "{snap:?}");
+    assert_eq!(rt.state(&id).unwrap().port, first_port);
+    let stop = rt.stop(&id, StopOpts::default()).await.unwrap();
+    let snap = stop.wait(Duration::from_secs(8)).await.unwrap();
+    assert_eq!(snap.status, OperationStatus::Succeeded, "{snap:?}");
+    assert_eq!(*systemd.verbs.lock().unwrap(), vec!["start", "restart", "stop"]);
+    assert!(!running.load(Ordering::SeqCst));
 }

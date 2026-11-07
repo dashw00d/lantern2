@@ -172,6 +172,7 @@ struct ActorState {
     generation: u64,
     retry_streak: u32,
     ready_at: Option<Instant>,
+    deploy_started: bool,
 }
 #[derive(Debug)]
 struct Actor {
@@ -193,6 +194,7 @@ impl Actor {
                 generation: 0,
                 retry_streak: 0,
                 ready_at: None,
+                deploy_started: false,
             }),
             io_lock: tokio::sync::Mutex::new(()),
             snapshot,
@@ -469,12 +471,25 @@ impl Runtime {
                 if operation == Operation::Restart
                     && matches!(self.state(&id).map(|r| r.status), Some(InstanceStatus::Stopping))
                 {
-                    match self.perform_stop(&id, &actor, generation, &token).await {
-                        Ok(_) => self.perform_start(&id, &actor, generation, &token, &handle).await,
-                        Err(e) => Err(e),
+                    let deploy_restart = self.inner.store.instance(&id).ok().flatten().is_some_and(|i| {
+                        i.manifest.deploy.start.is_some() && i.manifest.deploy.restart.is_some()
+                    });
+                    if deploy_restart {
+                        self.event(&id, &actor, generation, Event::UnitInactive);
+                        self.perform_start(&id, &actor, generation, &token, &handle, true)
+                            .await
+                    } else {
+                        match self.perform_stop(&id, &actor, generation, &token).await {
+                            Ok(_) => {
+                                self.perform_start(&id, &actor, generation, &token, &handle, false)
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
                 } else {
-                    self.perform_start(&id, &actor, generation, &token, &handle).await
+                    self.perform_start(&id, &actor, generation, &token, &handle, false)
+                        .await
                 }
             }
             Operation::Prepare => Err(Fault::new(
@@ -532,16 +547,68 @@ impl Runtime {
                 .await
                 .map_err(|e| Fault::new("route_failed", IssueCode::RouteFailed, e))?;
         }
-        let unit = self.inner.config.names.instance(id);
-        if !noop || state.unit.is_some() {
-            self.inner
+        let instance = self
+            .inner
+            .store
+            .instance(id)
+            .map_err(store_fault)?
+            .ok_or_else(|| Fault::new("not_found", IssueCode::Other, "instance disappeared"))?;
+        let deploy = instance.manifest.deploy.start.is_some();
+        let deploy_started = actor.state.lock().unwrap().deploy_started;
+        if deploy && deploy_started {
+            if let Some(command) = &instance.manifest.deploy.stop {
+                let (_, unit) =
+                    self.launch(&instance, state.port.unwrap_or(0), command.render_shell(), true)?;
+                let spec = OneShotSpec {
+                    unit,
+                    timeout: Duration::from_secs(self.inner.config.settings.runtime.deploy_timeout_secs),
+                    poll_interval: self.inner.config.poll_interval,
+                };
+                let result = systemd::run_oneshot(self.inner.backend.as_ref(), &spec, token.cancelled())
+                    .await
+                    .map_err(|e| Fault::new("deploy_stop_failed", IssueCode::Other, e.to_string()))?;
+                if result.exit_kind != ExitCodeKind::Exited || result.exit_code != Some(0) {
+                    return Err(Fault::new(
+                        "deploy_stop_failed",
+                        IssueCode::Other,
+                        format!("deploy.stop exited {:?}", result.exit_code),
+                    ));
+                }
+                if let Some(port) = state.port {
+                    let deadline = Instant::now()
+                        + Duration::from_secs(self.inner.config.settings.runtime.stop_timeout_secs);
+                    while !matches!(self.probe(port, None).await?, PortBinding::Free) {
+                        if Instant::now() >= deadline {
+                            self.event(id, actor, generation, Event::StopIncomplete);
+                            return Err(Fault::new(
+                                "stop_incomplete",
+                                IssueCode::Other,
+                                format!("deploy listener still holds port {port}"),
+                            ));
+                        }
+                        tokio::select! { ()=token.cancelled()=>return Err(Fault::new("cancelled",IssueCode::Other,"cancelled")), ()=tokio::time::sleep(self.inner.config.readiness_interval)=>{} }
+                    }
+                }
+            } else {
+                self.update(id, actor, generation, |r| {
+                    r.message = Some("no deploy.stop configured; the process may still be running".into())
+                });
+            }
+            actor.state.lock().unwrap().deploy_started = false;
+        } else if !deploy && instance.manifest.run.cmd.is_some() && (!noop || state.unit.is_some()) {
+            let unit = self.inner.config.names.instance(id);
+            if let Err(e) = self
+                .inner
                 .backend
                 .stop(
                     &unit,
                     Duration::from_secs(self.inner.config.settings.runtime.stop_timeout_secs),
                 )
                 .await
-                .map_err(|e| Fault::new("stop_timeout", IssueCode::Other, e.to_string()))?;
+            {
+                self.event(id, actor, generation, Event::StopTimeout);
+                return Err(Fault::new("stop_timeout", IssueCode::Other, e.to_string()));
+            }
             self.inner
                 .backend
                 .reset_failed(&unit)
@@ -568,6 +635,7 @@ impl Runtime {
         generation: u64,
         token: &CancellationToken,
         handle: &OpHandle,
+        deploy_restart: bool,
     ) -> Result<bool, Fault> {
         if matches!(
             self.state(id).map(|s| s.status),
@@ -575,7 +643,9 @@ impl Runtime {
         ) {
             return Ok(true);
         }
-        let result = self.start_inner(id, actor, generation, token, handle).await;
+        let result = self
+            .start_inner(id, actor, generation, token, handle, deploy_restart)
+            .await;
         if let Err(fault) = &result {
             if !token.is_cancelled() {
                 let status = self.state(id).map(|r| r.status);
@@ -614,6 +684,7 @@ impl Runtime {
         generation: u64,
         token: &CancellationToken,
         handle: &OpHandle,
+        deploy_restart: bool,
     ) -> Result<bool, Fault> {
         let instance = self
             .inner
@@ -666,7 +737,11 @@ impl Runtime {
                     format!("invalid upstream URL: {e}"),
                 )
             })?;
-        let command = m.deploy.start.as_ref().or(m.run.cmd.as_ref());
+        let command = if deploy_restart {
+            m.deploy.restart.as_ref()
+        } else {
+            m.deploy.start.as_ref().or(m.run.cmd.as_ref())
+        };
         if command.is_none() && upstream.is_none() && !matches!(m.serve, ServeMode::Php | ServeMode::Static) {
             return Err(Fault::new(
                 "needs_config",
@@ -694,7 +769,9 @@ impl Runtime {
             .as_ref()
             .is_some_and(|s| s.iter().any(|c| c.mentions("PORT")));
         let fixed_port = upstream.as_ref().and_then(|u| u.port_or_known_default());
-        let lease = if requires_process_port || setup_needs_port {
+        let lease = if deploy_restart {
+            instance.runtime.port
+        } else if requires_process_port || setup_needs_port {
             handle.step("port");
             Some(self.allocate(id).await?)
         } else {
@@ -725,7 +802,7 @@ impl Runtime {
             return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
         }
         // Recheck the lease immediately before spawn in case setup took a long time.
-        let port = if lease.is_some() {
+        let port = if lease.is_some() && !deploy_restart {
             Some(self.allocate(id).await?)
         } else {
             port
@@ -777,6 +854,17 @@ impl Runtime {
         }
         if is_deploy {
             handle.step("deploy");
+            let _guard = actor.io_lock.lock().await;
+            if token.is_cancelled() {
+                return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
+            }
+            {
+                let mut state = actor.state.lock().unwrap();
+                if state.generation != generation {
+                    return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
+                }
+                state.deploy_started = true;
+            }
             let spec = OneShotSpec {
                 unit: unit.clone(),
                 timeout: Duration::from_secs(self.inner.config.settings.runtime.deploy_timeout_secs),
@@ -835,15 +923,6 @@ impl Runtime {
         } else {
             tokio::select! { () = token.cancelled() => return Err(Fault::new("cancelled", IssueCode::Other, "cancelled")), () = tokio::time::sleep(Duration::from_secs(self.inner.config.settings.runtime.settle_secs)) => {} }
         }
-        if !self.event(id, actor, generation, Event::Ready) {
-            return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
-        }
-        {
-            let mut s = actor.state.lock().unwrap();
-            if s.generation == generation {
-                s.ready_at = Some(Instant::now());
-            }
-        }
         {
             let _guard = actor.io_lock.lock().await;
             if token.is_cancelled() {
@@ -853,7 +932,22 @@ impl Runtime {
                 .state(id)
                 .and_then(|s| s.upstream)
                 .or_else(|| port.map(|p| SocketAddr::from((Ipv4Addr::LOCALHOST, p))));
-            if let Err(error) = self.publish_route(&instance, upstream_addr).await {
+            let route = self.publish_route(&instance, upstream_addr).await;
+            let site_companion = matches!(instance.manifest.serve, ServeMode::Php | ServeMode::Static)
+                && instance.manifest.upstream_url.is_none()
+                && !is_deploy;
+            if site_companion && let Err(error) = &route {
+                self.event(id, actor, generation, Event::PlanInvalid(IssueCode::RouteFailed));
+                drop(_guard);
+                if !is_deploy {
+                    self.stop_failed_unit(actor, &unit.unit).await;
+                }
+                return Err(error.clone());
+            }
+            if !self.event(id, actor, generation, Event::Ready) {
+                return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
+            }
+            if let Err(error) = route {
                 self.event(id, actor, generation, Event::RouteFailed);
                 self.update(id, actor, generation, move |r| {
                     r.message = Some(error.message.clone());
@@ -865,6 +959,12 @@ impl Runtime {
                 });
             }
         }
+        {
+            let mut s = actor.state.lock().unwrap();
+            if s.generation == generation {
+                s.ready_at = Some(Instant::now());
+            }
+        }
         let _ = self.inner.store.record_started(id);
         self.start_health(id.clone(), actor.clone(), generation);
         Ok(false)
@@ -873,43 +973,57 @@ impl Runtime {
         let manifest = &instance.manifest;
         let root = manifest.root.as_deref().unwrap_or(".");
         let root = instance.checkout.path.join(root);
-        let target = match manifest.serve {
-            ServeMode::Php => {
-                if !root.is_dir() {
-                    return Err(Fault::new(
-                        "needs_config",
-                        IssueCode::RouteFailed,
-                        format!("site root missing: {}", root.display()),
-                    ));
-                }
-                self.inner
-                    .router
-                    .php_ready()
-                    .await
-                    .map_err(|e| Fault::new("php_unavailable", IssueCode::RouteFailed, e))?;
-                RouteTarget::Php(root)
+        let target = if manifest.upstream_url.is_some() || manifest.deploy.start.is_some() {
+            if let Some(url) = &manifest.upstream_url {
+                RouteTarget::Url(url.clone())
+            } else if let Some(addr) = upstream {
+                RouteTarget::Socket(addr)
+            } else {
+                return Err(Fault::new(
+                    "route_failed",
+                    IssueCode::RouteFailed,
+                    "no upstream address",
+                ));
             }
-            ServeMode::Static => {
-                if !root.is_dir() {
-                    return Err(Fault::new(
-                        "needs_config",
-                        IssueCode::RouteFailed,
-                        format!("site root missing: {}", root.display()),
-                    ));
+        } else {
+            match manifest.serve {
+                ServeMode::Php => {
+                    if !root.is_dir() {
+                        return Err(Fault::new(
+                            "needs_config",
+                            IssueCode::RouteFailed,
+                            format!("site root missing: {}", root.display()),
+                        ));
+                    }
+                    self.inner
+                        .router
+                        .php_ready()
+                        .await
+                        .map_err(|e| Fault::new("php_unavailable", IssueCode::RouteFailed, e))?;
+                    RouteTarget::Php(root)
                 }
-                RouteTarget::Static(root)
-            }
-            _ => {
-                if let Some(url) = &manifest.upstream_url {
-                    RouteTarget::Url(url.clone())
-                } else if let Some(addr) = upstream {
-                    RouteTarget::Socket(addr)
-                } else {
-                    return Err(Fault::new(
-                        "route_failed",
-                        IssueCode::RouteFailed,
-                        "no upstream address",
-                    ));
+                ServeMode::Static => {
+                    if !root.is_dir() {
+                        return Err(Fault::new(
+                            "needs_config",
+                            IssueCode::RouteFailed,
+                            format!("site root missing: {}", root.display()),
+                        ));
+                    }
+                    RouteTarget::Static(root)
+                }
+                _ => {
+                    if let Some(url) = &manifest.upstream_url {
+                        RouteTarget::Url(url.clone())
+                    } else if let Some(addr) = upstream {
+                        RouteTarget::Socket(addr)
+                    } else {
+                        return Err(Fault::new(
+                            "route_failed",
+                            IssueCode::RouteFailed,
+                            "no upstream address",
+                        ));
+                    }
                 }
             }
         };
@@ -1740,6 +1854,16 @@ impl Runtime {
                     valid: i.manifest.usable,
                 },
             );
+            if !i.manifest.enabled
+                && !matches!(
+                    i.runtime.status,
+                    InstanceStatus::Stopped | InstanceStatus::External
+                )
+            {
+                if let Err(error) = self.request(id, Operation::Stop, true) {
+                    tracing::warn!(%id, %error, "disabled instance could not be stopped");
+                }
+            }
         }
     }
     /// Update the external-listener status using discovery's current observation.
@@ -1878,16 +2002,27 @@ impl Runtime {
                 && instance.manifest.run.cmd.is_none()
                 && instance.manifest.deploy.start.is_none()
             {
-                report.errors.push(format!(
-                    "{id}: active site requires a router adapter for republishing"
-                ));
-                let _ = self.inner.store.update_runtime(
-                    id,
-                    Box::new(|r| {
-                        r.status = InstanceStatus::Stopped;
-                        r.message = Some("site awaiting router republish".into());
-                    }),
-                );
+                let generation = {
+                    let mut s = actor.state.lock().unwrap();
+                    s.supervisor = SupervisorState::default();
+                    s.generation = s.generation.wrapping_add(1);
+                    s.generation
+                };
+                self.event(id, &actor, generation, Event::ReconcileSite);
+                match self.publish_route(&instance, None).await {
+                    Ok(()) => {
+                        self.event(id, &actor, generation, Event::Ready);
+                        self.start_health(id.clone(), actor.clone(), generation);
+                    }
+                    Err(error) => {
+                        self.event(id, &actor, generation, Event::PlanInvalid(IssueCode::RouteFailed));
+                        let message = error.message;
+                        report.errors.push(format!("{id}: {message}"));
+                        self.update(id, &actor, generation, move |r| {
+                            r.message = Some(message);
+                        });
+                    }
+                }
             } else {
                 {
                     let mut s = actor.state.lock().unwrap();

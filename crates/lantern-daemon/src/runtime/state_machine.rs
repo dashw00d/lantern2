@@ -153,6 +153,8 @@ pub enum Event {
     UnitInactive,
     /// A stop deadline expired while processes were still present.
     StopTimeout,
+    /// A deploy stop left the externally managed listener alive.
+    StopIncomplete,
     /// A scheduled crash retry fired.
     RetryTimer,
     /// Discovery found a matched unmanaged listener.
@@ -430,6 +432,12 @@ pub fn transition(state: &SupervisorState, event: Event) -> (SupervisorState, Ve
                 next.status = S::Stopped;
                 finish(&mut next, &mut effects);
             }
+        }
+        Event::StopIncomplete if next.status == S::Stopping => {
+            next.status = S::Running;
+            next.desired_up = true;
+            next.restart_pending = false;
+            finish(&mut next, &mut effects);
         }
         Event::StopTimeout if next.status == S::Stopping => {
             next.restart_pending = false;

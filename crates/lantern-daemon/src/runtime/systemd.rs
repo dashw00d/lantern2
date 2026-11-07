@@ -352,13 +352,35 @@ pub async fn run_oneshot(
     let deadline = tokio::time::sleep(spec.timeout);
     tokio::pin!(deadline);
     tokio::pin!(cancel);
-    let started = tokio::select! {
-        biased;
-        () = &mut cancel => Err(OneShotError::Cancelled),
-        () = &mut deadline => Err(OneShotError::Timeout),
-        result = backend.start(&spec.unit) => result.map_err(OneShotError::Unit),
+    // Once the start future has been polled, systemd may already have received the
+    // request. Settle it before stopping, so a delayed acknowledgement cannot start
+    // the unit after cancellation cleanup.
+    let mut start = Box::pin(backend.start(&spec.unit));
+    let mut polled = false;
+    let started = {
+        let observed_start = std::future::poll_fn(|cx| {
+            polled = true;
+            start.as_mut().poll(cx)
+        });
+        tokio::pin!(observed_start);
+        tokio::select! {
+            biased;
+            () = &mut cancel => Err(OneShotError::Cancelled),
+            () = &mut deadline => Err(OneShotError::Timeout),
+            result = &mut observed_start => result.map_err(OneShotError::Unit),
+        }
     };
     if let Err(error) = started {
+        if polled && matches!(error, OneShotError::Cancelled | OneShotError::Timeout) {
+            let settle = spec.unit.stop_timeout.saturating_add(Duration::from_secs(45));
+            if tokio::time::timeout(settle, &mut start).await.is_err() {
+                drop(start);
+                cleanup_one_shot(backend, spec).await?;
+                return Err(OneShotError::Unit(UnitError::Timeout(
+                    "one-shot start did not settle; cleanup cannot be verified".into(),
+                )));
+            }
+        }
         cleanup_one_shot(backend, spec).await?;
         return Err(error);
     }
