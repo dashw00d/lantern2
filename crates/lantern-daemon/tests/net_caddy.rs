@@ -1,11 +1,14 @@
 use lantern_core::{dirs::Dirs, ids::InstanceId, settings::ProxySettings};
 use lantern_daemon::{
     net::{
-        caddy::{ApplyOutcome, Caddy, CaddyConfig, NetError},
+        caddy::{
+            ApplyOutcome, Caddy, CaddyConfig, CaddyStartFuture, CaddyStarter, CaddyUnit, NetError,
+            caddy_start_args,
+        },
         caddy_config::RenderCtx,
         routes::{Route, RouteOwner, RoutePlan, Target},
     },
-    runtime::systemd::FakeSystemd,
+    runtime::systemd::{FakeSystemd, UnitStart, UserSystemd},
 };
 use lantern_system::paths::LanternPaths;
 use std::{
@@ -20,6 +23,46 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixListener,
 };
+
+#[derive(Debug)]
+struct FakeStarter(Arc<FakeSystemd>);
+impl CaddyStarter for FakeStarter {
+    fn start<'a>(&'a self, unit: &'a CaddyUnit) -> CaddyStartFuture<'a> {
+        Box::pin(async move {
+            let args = caddy_start_args(unit)?;
+            assert!(args.iter().any(|arg| arg == "--property=Restart=on-failure"));
+            assert!(args.iter().any(|arg| arg == "--property=RestartSec=1s"));
+            let spec = UnitStart {
+                unit: unit.unit.clone(),
+                instance: InstanceId::parse("caddy").unwrap(),
+                slice: unit.slice.clone(),
+                cwd: unit.cwd.clone(),
+                script: unit.config.clone(),
+                post_stop: None,
+                stop_timeout: std::time::Duration::from_secs(10),
+            };
+            self.0
+                .start(&spec)
+                .await
+                .map_err(|e| NetError::Unavailable(e.to_string()))
+        })
+    }
+}
+
+#[test]
+fn net_caddy_unit_arguments_escape_specifiers() {
+    let unit = CaddyUnit {
+        unit: "lantern-test-net-a.service".into(),
+        slice: "app-lantern-test.slice".into(),
+        binary: "/tmp/cad%dy".into(),
+        config: "/tmp/config %x.json".into(),
+        cwd: "/tmp".into(),
+    };
+    let args = caddy_start_args(&unit).unwrap();
+    assert!(args.iter().any(|s| s == "/tmp/cad%%dy"));
+    assert!(args.iter().any(|s| s == "/tmp/config %%x.json"));
+    assert!(args.iter().any(|s| s == "--property=Restart=on-failure"));
+}
 
 #[tokio::test]
 async fn net_caddy_fake_admin_persists_only_accepted_configs() {
@@ -132,7 +175,8 @@ async fn net_caddy_fake_admin_persists_only_accepted_configs() {
         sd.clone(),
         paths.clone(),
     )
-    .unwrap();
+    .unwrap()
+    .with_starter(Arc::new(FakeStarter(sd.clone())));
     caddy.ensure_running().await.unwrap();
     assert!(
         sd.calls()

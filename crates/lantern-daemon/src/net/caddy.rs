@@ -4,11 +4,12 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, StatusCode, client::conn::http1};
 use hyper_util::rt::TokioIo;
-use lantern_core::ids::InstanceId;
 use lantern_system::{ca, paths::LanternPaths};
 use std::{
+    future::Future,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -21,7 +22,7 @@ use super::{
     caddy_config::{RenderCtx, render},
     routes::RoutePlan,
 };
-use crate::runtime::systemd::{Active, UnitStart, UserSystemd};
+use crate::runtime::systemd::{Active, UserSystemd};
 
 /// Network subsystem failure.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +57,126 @@ pub struct CaddyConfig {
     pub tld: String,
     /// Caddy JSON rendering inputs.
     pub render: RenderCtx,
+}
+
+/// Caddy-specific transient unit parameters.
+#[derive(Debug, Clone)]
+pub struct CaddyUnit {
+    /// Service name, including `.service`.
+    pub unit: String,
+    /// User slice name.
+    pub slice: String,
+    /// Absolute Caddy binary path.
+    pub binary: PathBuf,
+    /// Last accepted configuration path.
+    pub config: PathBuf,
+    /// Absolute working directory.
+    pub cwd: PathBuf,
+}
+/// Future returned by the Caddy-specific systemd start boundary.
+pub type CaddyStartFuture<'a> = Pin<Box<dyn Future<Output = Result<(), NetError>> + Send + 'a>>;
+/// Starts a Caddy unit with a service-appropriate restart policy.
+pub trait CaddyStarter: Send + Sync {
+    /// Start one named transient service.
+    fn start<'a>(&'a self, unit: &'a CaddyUnit) -> CaddyStartFuture<'a>;
+}
+/// Real systemd-run boundary for Caddy, distinct from dev-server launchers.
+#[derive(Debug, Clone)]
+pub struct SystemdCaddyStarter {
+    /// Absolute systemd-run executable.
+    pub systemd_run: PathBuf,
+}
+impl Default for SystemdCaddyStarter {
+    fn default() -> Self {
+        Self {
+            systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+        }
+    }
+}
+fn path_argument(path: &Path) -> Result<String, NetError> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| NetError::Invalid("non-UTF-8 path".into()))?;
+    if !path.is_absolute() || text.contains('\0') || text.contains('\n') {
+        return Err(NetError::Invalid(
+            "expected absolute NUL-free single-line path".into(),
+        ));
+    }
+    Ok(text.replace('%', "%%"))
+}
+fn valid_unit(name: &str, suffix: &str) -> bool {
+    !name.starts_with('-')
+        && name.ends_with(suffix)
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+/// Render arguments for the Caddy-specific systemd transient unit.
+pub fn caddy_start_args(unit: &CaddyUnit) -> Result<Vec<String>, NetError> {
+    if !valid_unit(&unit.unit, ".service") || !valid_unit(&unit.slice, ".slice") {
+        return Err(NetError::Invalid("invalid Caddy unit or slice".into()));
+    }
+    Ok(vec![
+        "--user".into(),
+        format!("--unit={}", unit.unit),
+        format!("--slice={}", unit.slice),
+        "--description=Lantern Caddy".into(),
+        "--collect".into(),
+        "--quiet".into(),
+        "--service-type=exec".into(),
+        "--expand-environment=no".into(),
+        "--property=Restart=on-failure".into(),
+        "--property=RestartSec=1s".into(),
+        "--property=TimeoutStopSec=10s".into(),
+        format!("--property=WorkingDirectory={}", path_argument(&unit.cwd)?),
+        "--".into(),
+        path_argument(&unit.binary)?,
+        "run".into(),
+        "--config".into(),
+        path_argument(&unit.config)?,
+    ])
+}
+fn supported_version(output: &str) -> bool {
+    let Some(token) = output.split_whitespace().next() else {
+        return false;
+    };
+    let mut parts = token.trim_start_matches('v').split(['.', '-', '+']);
+    let version = (
+        parts.next().and_then(|v| v.parse::<u32>().ok()),
+        parts.next().and_then(|v| v.parse::<u32>().ok()),
+        parts.next().and_then(|v| v.parse::<u32>().ok()),
+    );
+    matches!(version,(Some(major),Some(minor),Some(_)) if (major,minor)>=(2,8))
+}
+impl CaddyStarter for SystemdCaddyStarter {
+    fn start<'a>(&'a self, unit: &'a CaddyUnit) -> CaddyStartFuture<'a> {
+        Box::pin(async move {
+            let args = caddy_start_args(unit)?;
+            if !self.systemd_run.is_absolute() {
+                return Err(NetError::Invalid("systemd-run path must be absolute".into()));
+            }
+            let mut check = tokio::process::Command::new(&unit.binary);
+            check.arg("version").kill_on_drop(true);
+            let version = tokio::time::timeout(Duration::from_secs(5), check.output())
+                .await
+                .map_err(|_| NetError::Unavailable("Caddy version check timed out".into()))??;
+            if !version.status.success() || !supported_version(&String::from_utf8_lossy(&version.stdout)) {
+                return Err(NetError::Invalid("Caddy 2.8.0 or newer is required".into()));
+            }
+            let mut command = tokio::process::Command::new(&self.systemd_run);
+            command.args(args).kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+                .await
+                .map_err(|_| NetError::Unavailable("systemd-run timed out".into()))??;
+            if !output.status.success() {
+                return Err(NetError::Unavailable(format!(
+                    "systemd-run: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Result of a successful config synchronization.
@@ -93,6 +214,7 @@ struct Applied {
 pub struct Caddy {
     cfg: CaddyConfig,
     sd: Arc<dyn UserSystemd>,
+    starter: Arc<dyn CaddyStarter>,
     paths: LanternPaths,
     applied: Mutex<Applied>,
     lifecycle: Mutex<()>,
@@ -132,15 +254,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
         let _ = std::fs::remove_file(tmp);
     }
     result
-}
-fn shell_quote(path: &Path) -> Result<String, NetError> {
-    let s = path
-        .to_str()
-        .ok_or_else(|| NetError::Invalid("non-UTF-8 path".into()))?;
-    if !path.is_absolute() || s.contains('\0') {
-        return Err(NetError::Invalid("expected absolute NUL-free path".into()));
-    }
-    Ok(format!("'{}'", s.replace('\'', "'\\''")))
 }
 async fn request(
     socket: &Path,
@@ -195,14 +308,20 @@ impl Caddy {
                 "admin, storage and CA paths must match Lantern paths; gateway must be loopback".into(),
             ));
         }
-        shell_quote(&cfg.binary)?;
+        path_argument(&cfg.binary)?;
         Ok(Self {
             cfg,
             sd,
+            starter: Arc::new(SystemdCaddyStarter::default()),
             paths,
             applied: Mutex::new(Applied::default()),
             lifecycle: Mutex::new(()),
         })
+    }
+    /// Replace the Caddy-specific start boundary, for integration or hermetic tests.
+    pub fn with_starter(mut self, starter: Arc<dyn CaddyStarter>) -> Self {
+        self.starter = starter;
+        self
     }
     /// Ensure the unit is running and its admin endpoint answers.
     pub async fn ensure_running(&self) -> Result<(), NetError> {
@@ -231,26 +350,22 @@ impl Caddy {
                 .ok_or_else(|| NetError::Invalid("missing XDG runtime directory".into()))?;
             std::fs::create_dir_all(runtime)?;
             std::fs::set_permissions(runtime, std::fs::Permissions::from_mode(0o700))?;
-            let script = self.paths.dirs.state.join("caddy-launch.sh");
-            let command = format!(
-                "#!/bin/bash\nexec {} run --config {}\n",
-                shell_quote(&self.cfg.binary)?,
-                shell_quote(&self.paths.caddy_config)?
-            );
-            atomic_write(&script, command.as_bytes())?;
-            let spec = UnitStart {
+            if let Some(snapshot) = state.iter().find(|s| s.unit == self.cfg.unit) {
+                if snapshot.active == Active::Failed {
+                    self.sd
+                        .reset_failed(&self.cfg.unit)
+                        .await
+                        .map_err(|e| NetError::Unavailable(e.to_string()))?;
+                }
+            }
+            let unit = CaddyUnit {
                 unit: self.cfg.unit.clone(),
-                instance: InstanceId::parse("caddy").map_err(|e| NetError::Invalid(e.to_string()))?,
                 slice: self.cfg.slice.clone(),
+                binary: self.cfg.binary.clone(),
+                config: self.paths.caddy_config.clone(),
                 cwd: self.paths.dirs.state.clone(),
-                script,
-                post_stop: None,
-                stop_timeout: Duration::from_secs(10),
             };
-            self.sd
-                .start(&spec)
-                .await
-                .map_err(|e| NetError::Unavailable(e.to_string()))?;
+            self.starter.start(&unit).await?;
         }
         let until = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -339,5 +454,17 @@ impl Caddy {
             .map_err(|e| NetError::Unavailable(e.to_string()))?;
         self.applied.lock().await.json = None;
         self.ensure_running().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supported_version;
+    #[test]
+    fn net_caddy_version_check() {
+        assert!(supported_version("v2.11.9 h1:abc"));
+        assert!(supported_version("v2.8.0"));
+        assert!(!supported_version("v2.7.9"));
+        assert!(!supported_version("devel"));
     }
 }
