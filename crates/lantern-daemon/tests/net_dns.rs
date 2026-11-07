@@ -73,19 +73,19 @@ fn net_dns_wire_policy_and_malformed_inputs() {
 async fn net_dns_real_udp_and_tcp_queries() {
     let cancel = CancellationToken::new();
     let cfg = DnsConfig {
-        listen: "127.0.0.1:39710".parse().unwrap(),
+        listen: "127.0.0.1:39994".parse().unwrap(),
         tld: "glow".into(),
         ipv6: false,
     };
     let task = tokio::spawn(Dns::serve(cfg, cancel.clone()));
-    let udp = UdpSocket::bind("127.0.0.1:39711").await.unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:39995").await.unwrap();
     let q = query("app.glow", 1);
     let mut bytes = [0u8; 512];
     let mut attempts = 0;
     let reply = loop {
         attempts += 1;
         assert!(attempts <= 20, "DNS did not answer");
-        udp.send_to(&q, "127.0.0.1:39710").await.unwrap();
+        udp.send_to(&q, "127.0.0.1:39994").await.unwrap();
         if let Ok(Ok((n, _))) = timeout(Duration::from_millis(100), udp.recv_from(&mut bytes)).await {
             break bytes[..n].to_vec();
         }
@@ -93,9 +93,9 @@ async fn net_dns_real_udp_and_tcp_queries() {
     };
     assert_eq!(&reply[reply.len() - 4..], &[127, 0, 0, 1]);
     let tcp_socket = TcpSocket::new_v4().unwrap();
-    tcp_socket.bind("127.0.0.1:39712".parse().unwrap()).unwrap();
+    tcp_socket.bind("127.0.0.1:39996".parse().unwrap()).unwrap();
     let mut tcp = tcp_socket
-        .connect("127.0.0.1:39710".parse().unwrap())
+        .connect("127.0.0.1:39994".parse().unwrap())
         .await
         .unwrap();
     tcp.write_u16(q.len() as u16).await.unwrap();
