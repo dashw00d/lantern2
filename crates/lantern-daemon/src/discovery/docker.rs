@@ -34,7 +34,7 @@ fn parse_proxy(bytes: &[u8]) -> Option<Proxy> {
         match name {
             "-proto" => proto = value,
             "-host-port" => host_port = value.and_then(|v| v.parse().ok()),
-            "-host-ip" => host_ip = value.and_then(|v| v.parse().ok()),
+            "-host-ip" => host_ip = Some(value?.parse().ok()?),
             "-container-port" => container_port = value.and_then(|v| v.parse().ok()),
             _ => {
                 i += 1;
@@ -154,5 +154,8 @@ mod tests {
         assert_eq!(result.get(&8).unwrap().container_port, Some(80));
         assert!(!result.contains_key(&9));
         assert!(parse_proxy(b"docker-proxy\0-proto\0udp\0-host-port\x0039200\0").is_none());
+        assert!(
+            parse_proxy(b"docker-proxy\0-proto\0tcp\0-host-ip\0invalid\0-host-port\x0039200\0").is_none()
+        );
     }
 }

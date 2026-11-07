@@ -63,6 +63,33 @@ fn urls(s: &str) -> String {
     result.push_str(rest);
     result
 }
+fn redact_query(s: &str) -> String {
+    if !s.contains("://") {
+        return s.to_owned();
+    }
+    let Some((prefix, query)) = s.split_once('?') else {
+        return s.to_owned();
+    };
+    let (query, fragment) = query.split_once('#').map_or((query, ""), |(q, f)| (q, f));
+    let fields = query
+        .split('&')
+        .map(|field| {
+            if let Some((key, _)) = field.split_once('=')
+                && secret_key(key)
+            {
+                format!("{key}=***")
+            } else {
+                field.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    if s.contains('#') {
+        format!("{prefix}?{fields}#{fragment}")
+    } else {
+        format!("{prefix}?{fields}")
+    }
+}
 fn shorten(s: &str) -> String {
     let mut chars = s.chars();
     let result: String = chars.by_ref().take(200).collect();
@@ -77,10 +104,12 @@ pub(super) fn redact(args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len().min(41));
     let mut next_secret = false;
     for arg in args.iter().take(40) {
+        // Redact userinfo first: a secret query key can otherwise preserve the raw URL prefix.
+        let safe_url = redact_query(&urls(arg));
         let replacement = if next_secret {
             next_secret = false;
             "***".to_owned()
-        } else if let Some((key, _)) = arg.split_once('=')
+        } else if let Some((key, _)) = safe_url.split_once('=')
             && secret_key(key)
         {
             format!("{key}=***")
@@ -90,7 +119,7 @@ pub(super) fn redact(args: &[String]) -> Vec<String> {
         } else if token(arg) {
             "***".to_owned()
         } else {
-            urls(arg)
+            safe_url
         };
         out.push(shorten(&replacement));
     }
@@ -157,6 +186,15 @@ mod tests {
         assert_eq!(out[4], "***");
         assert_eq!(out[5], "***");
         assert_eq!(out[6..], args[6..]);
+        let combined = redact(&[
+            "postgres://user:password123@host/db?token=secret123".to_owned(),
+            "--dsn=postgres://user:password123@host/db".to_owned(),
+        ]);
+        assert!(!combined.join(" ").contains("password123"));
+        assert!(!combined.join(" ").contains("secret123"));
+        let query = redact(&["--url=https://u:secret123@host/?page=1&token=key123&x=ok".into()]);
+        assert!(!query[0].contains("secret123"));
+        assert!(!query[0].contains("key123"));
         let many = vec!["a".repeat(210); 41];
         let out = redact(&many);
         assert_eq!(out.len(), 41);
