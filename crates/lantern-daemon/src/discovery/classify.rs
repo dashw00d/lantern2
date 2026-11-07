@@ -172,7 +172,10 @@ pub(super) fn classify(
             ListenerClass::Infra,
             unit.trim_end_matches(".service")
                 .trim_end_matches(".scope")
-                .to_owned(),
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(120)
+                .collect(),
         );
     }
     let rules: Vec<_> = std::iter::once(proc)

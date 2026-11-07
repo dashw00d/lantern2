@@ -254,6 +254,10 @@ mod tests {
                 .unwrap(),
             holder
         );
+        assert_eq!(
+            holder.describe(),
+            "port 39203 is published by Docker (container port 80)"
+        );
     }
     #[test]
     fn discovery_user_hide_and_settings_change() {

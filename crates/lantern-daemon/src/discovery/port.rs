@@ -2,7 +2,7 @@
 use super::procinfo::normalize_unit;
 use super::scanner::Snapshot;
 use lantern_core::ids::InstanceId;
-use lantern_core::model::Listener;
+use lantern_core::model::{DockerInfo, Listener};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -45,6 +45,8 @@ pub struct PortHolder {
     pub instance: Option<InstanceId>,
     /// Human-readable process label.
     pub label: String,
+    /// Docker proxy details, if identified.
+    pub docker: Option<DockerInfo>,
 }
 impl From<&Listener> for PortHolder {
     fn from(l: &Listener) -> Self {
@@ -59,12 +61,19 @@ impl From<&Listener> for PortHolder {
             unit: l.unit.clone(),
             instance: l.matched.clone(),
             label: l.label.clone(),
+            docker: l.docker.clone(),
         }
     }
 }
 impl PortHolder {
     /// Describe the holder for a conflict message.
     pub fn describe(&self) -> String {
+        if let Some(docker) = &self.docker {
+            let suffix = docker
+                .container_port
+                .map_or_else(String::new, |port| format!(" (container port {port})"));
+            return format!("port {} is published by Docker{suffix}", self.port);
+        }
         let Some(pid) = self.pid else {
             return format!(
                 "port {} is held by a process owned by uid {} (not visible to you)",
