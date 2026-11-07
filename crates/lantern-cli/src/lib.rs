@@ -52,13 +52,35 @@ impl SystemActions for UnassembledSystem {
 
 /// Parse and run the CLI, returning the process action to the binary.
 pub fn run() -> CliAction {
-    use std::io::IsTerminal;
     use clap::Parser;
-    let cli = args::Cli::parse();
+    use std::io::IsTerminal;
+    let argv: Vec<_> = std::env::args_os().collect();
+    let cli = match args::Cli::try_parse_from(&argv) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = error.exit_code();
+            if code != 0 && argv.iter().any(|arg| arg == "--json") {
+                let failure = error::Failure::usage(error.to_string());
+                eprintln!("{}", failure.json());
+            } else {
+                let _ = error.print();
+            }
+            return CliAction::Exit(code);
+        }
+    };
     let tty = std::io::stdout().is_terminal();
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
-        Err(error) => { eprintln!("error: cannot start async runtime: {error}"); return CliAction::Exit(1); }
+        Err(error) => {
+            eprintln!("error: cannot start async runtime: {error}");
+            return CliAction::Exit(1);
+        }
     };
-    runtime.block_on(dispatch(cli, &UnassembledSystem, &mut std::io::stdout(), &mut std::io::stderr(), tty))
+    runtime.block_on(dispatch(
+        cli,
+        &UnassembledSystem,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+        tty,
+    ))
 }

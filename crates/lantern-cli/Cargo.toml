@@ -16,6 +16,7 @@ serde_json = { workspace = true }
 clap = { version = "4.6", features = ["derive", "env"] }
 clap_complete = "4.6"
 futures-util = "0.3"
+shlex = "2"
 tokio = { version = "1", features = ["rt", "time", "signal", "macros", "io-util"] }
 
 [dev-dependencies]
