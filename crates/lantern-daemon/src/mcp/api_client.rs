@@ -4,21 +4,15 @@ use super::{
     LanternMcp,
     upstream::{ToolApiClient, ToolApiResponse, UpstreamPolicy},
 };
+use crate::operations::{OpOutcome, OperationTracker};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use lantern_core::{
-    api::{EndpointEntry, Risk},
+    api::{ApiError, EndpointEntry, OperationId, OperationKind, OperationStatus, Risk},
     ids::InstanceId,
     model::InstanceStatus,
 };
 use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 #[derive(Debug)]
@@ -66,17 +60,6 @@ impl Drop for InstancePermit {
         self.0.changed.notify_one();
     }
 }
-#[derive(Debug, Clone)]
-enum JobState {
-    Running,
-    Finished(Result<Value, String>),
-}
-#[derive(Debug, Clone)]
-struct Job {
-    started: Instant,
-    finished: Option<Instant>,
-    state: JobState,
-}
 /// Shared API client state retained across stateless requests.
 #[derive(Clone)]
 pub(super) struct ApiState {
@@ -86,8 +69,7 @@ pub(super) struct ApiState {
     pub allow_critical_calls: bool,
     global: Arc<Semaphore>,
     limits: Arc<Mutex<HashMap<InstanceId, Arc<InstanceGate>>>>,
-    jobs: Arc<Mutex<HashMap<String, Job>>>,
-    sequence: Arc<AtomicU64>,
+    pub tracker: OperationTracker,
 }
 impl ApiState {
     pub fn new(
@@ -95,6 +77,7 @@ impl ApiState {
         client: Arc<dyn ToolApiClient>,
         trust_risk_metadata: bool,
         allow_critical_calls: bool,
+        tracker: OperationTracker,
     ) -> Self {
         Self {
             policy,
@@ -103,22 +86,7 @@ impl ApiState {
             allow_critical_calls,
             global: Arc::new(Semaphore::new(16)),
             limits: Arc::new(Mutex::new(HashMap::new())),
-            jobs: Arc::new(Mutex::new(HashMap::new())),
-            sequence: Arc::new(AtomicU64::new(0)),
-        }
-    }
-    async fn job(&self, id: &str) -> Result<Value, String> {
-        let mut jobs = self.jobs.lock().await;
-        jobs.retain(|_, j| j.finished.is_none_or(|t| t.elapsed() < Duration::from_secs(3600)));
-        let job = jobs
-            .get(id)
-            .ok_or("Unknown job id. Try call_tool_api with async=true.")?;
-        match &job.state {
-            JobState::Running => Ok(
-                json!({"status":"running","job_id":id,"elapsed_ms":job.started.elapsed().as_millis(),"message":"Still processing. Poll again shortly."}),
-            ),
-            JobState::Finished(Ok(result)) => Ok(json!({"status":"succeeded","job_id":id,"result":result})),
-            JobState::Finished(Err(e)) => Err(e.clone()),
+            tracker,
         }
     }
 }
@@ -218,11 +186,25 @@ fn result(response: ToolApiResponse, limit: usize) -> Result<Value, String> {
 
 impl LanternMcp {
     pub(super) async fn job_result(&self, id: &str, compat: bool) -> Result<Value, String> {
-        let value = self.api.job(id).await?;
-        if compat && value["status"] == "succeeded" {
-            Ok(value["result"].clone())
-        } else {
-            Ok(value)
+        let operation = self
+            .api
+            .tracker
+            .get(&OperationId(id.into()))
+            .ok_or("Unknown job id. Try call_tool_api with async=true.")?;
+        if operation.kind != OperationKind::ApiCall {
+            return Err("Operation is not an API job.".into());
+        }
+        match operation.status {
+            OperationStatus::Queued | OperationStatus::Running => Ok(
+                json!({"status":"running", "job_id":id, "message":"Still processing. Poll again shortly."}),
+            ),
+            OperationStatus::Succeeded if compat => Ok(operation.result.unwrap_or(Value::Null)),
+            OperationStatus::Succeeded => {
+                Ok(json!({"status":"succeeded", "job_id":id, "result":operation.result}))
+            }
+            _ => Err(operation
+                .error
+                .map_or_else(|| "API job cancelled".into(), |e| e.message)),
         }
     }
     pub(super) async fn call_api(&self, a: &Value) -> Result<Value, String> {
@@ -348,7 +330,7 @@ impl LanternMcp {
             let gate = {
                 let mut limits = self.api.limits.lock().await;
                 limits
-                    .entry(id)
+                    .entry(id.clone())
                     .or_insert_with(|| Arc::new(InstanceGate::new(n)))
                     .clone()
             };
@@ -362,47 +344,42 @@ impl LanternMcp {
         };
         let client = self.api.client.clone();
         if asynchronous {
-            let job_id = format!(
-                "mcp-job-{}-{}",
-                lantern_core::Timestamp::now().as_second(),
-                self.api.sequence.fetch_add(1, Ordering::Relaxed)
-            );
-            {
-                let mut jobs = self.api.jobs.lock().await;
-                jobs.retain(|_, j| j.finished.is_none_or(|t| t.elapsed() < Duration::from_secs(3600)));
-                if jobs.len() >= 200 {
-                    let oldest_finished = jobs
-                        .iter()
-                        .filter(|(_, job)| job.finished.is_some())
-                        .min_by_key(|(_, job)| job.finished)
-                        .map(|(id, _)| id.clone());
-                    if let Some(id) = oldest_finished {
-                        jobs.remove(&id);
-                    } else {
-                        return Err("Too many active API jobs; try again later.".into());
-                    }
-                }
-                jobs.insert(
-                    job_id.clone(),
-                    Job {
-                        started: Instant::now(),
-                        finished: None,
-                        state: JobState::Running,
-                    },
-                );
+            let active = self
+                .api
+                .tracker
+                .list()
+                .into_iter()
+                .filter(|op| {
+                    op.kind == OperationKind::ApiCall
+                        && matches!(op.status, OperationStatus::Queued | OperationStatus::Running)
+                })
+                .count();
+            if active >= 200 {
+                return Err("Too many active API jobs; try again later.".into());
             }
-            let jobs = self.api.jobs.clone();
-            let key = job_id.clone();
+            let job = self.api.tracker.begin(OperationKind::ApiCall, Some(id));
+            let job_id = job.id().to_string();
+            let cancel = job.cancel_token();
             tokio::spawn(async move {
                 let _permits = (global, per_instance);
-                let answer = match tokio::time::timeout(Duration::from_secs(900), client.send(request)).await
-                {
-                    Ok(r) => r.and_then(|r| result(r, max)),
-                    Err(_) => Err("API job timed out".into()),
+                let answer = tokio::select! {
+                    () = cancel.cancelled() => { job.finish(OpOutcome::Cancelled); return; },
+                    response = tokio::time::timeout(Duration::from_secs(900), client.send(request)) => match response {
+                        Ok(r) => r.and_then(|r| result(r, max)),
+                        Err(_) => Err("API job timed out".into()),
+                    },
                 };
-                if let Some(job) = jobs.lock().await.get_mut(&key) {
-                    job.state = JobState::Finished(answer);
-                    job.finished = Some(Instant::now());
+                match answer {
+                    Ok(value) => {
+                        job.finish(OpOutcome::Succeeded(Some(value)));
+                    }
+                    Err(message) => {
+                        job.finish(OpOutcome::Failed(ApiError {
+                            code: "api_call_failed".into(),
+                            message,
+                            details: json!({}),
+                        }));
+                    }
                 }
             });
             Ok(

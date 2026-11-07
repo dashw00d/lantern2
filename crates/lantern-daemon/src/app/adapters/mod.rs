@@ -60,6 +60,16 @@ impl RegistryAdapter {
         self.profiles_dir = Some(path);
         self
     }
+    /// Forward checkout setup staleness into the registry's live instance view.
+    pub fn set_setup_stale(&self, id: &InstanceId, stale: bool) -> Result<(), String> {
+        self.registry
+            .set_setup_stale(id, stale)
+            .map_err(|e| e.to_string())
+    }
+    /// Wait for all earlier registry mutations to be durably written.
+    pub async fn flush_registry(&self) -> Result<(), String> {
+        self.registry.flush().await
+    }
     fn active_profile(&self) -> Result<Option<lantern_core::profiles::Profile>, String> {
         let Some(name) = self.registry.active_profile() else {
             return Ok(None);
@@ -97,7 +107,11 @@ impl RegistryAdapter {
                 settings.daemon.port,
                 settings.proxy.http_port,
                 settings.proxy.https_port,
-                5354,
+                settings
+                    .dns
+                    .listen
+                    .parse::<std::net::SocketAddr>()
+                    .map_or(5354, |address| address.port()),
                 2019,
             ];
             let result = leases

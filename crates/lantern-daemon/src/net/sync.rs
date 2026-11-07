@@ -140,9 +140,22 @@ impl NetRouter {
     /// Replace the whole registry snapshot; call on boot and every relevant registry event.
     pub fn replace_instances(&self, instances: Vec<Instance>) {
         let mut state = self.inner.desired.lock().unwrap();
-        state.instances = instances.into_iter().map(|i| (i.id.clone(), i)).collect();
-        let ids: Vec<_> = state.instances.keys().cloned().collect();
-        state.targets.retain(|id, _| ids.binary_search(id).is_ok());
+        let next: BTreeMap<_, _> = instances.into_iter().map(|i| (i.id.clone(), i)).collect();
+        let stale: Vec<_> = state
+            .targets
+            .keys()
+            .filter(|id| match (state.instances.get(*id), next.get(*id)) {
+                (Some(old), Some(new)) => {
+                    old.manifest != new.manifest || old.checkout.path != new.checkout.path
+                }
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        for id in stale {
+            state.targets.remove(&id);
+        }
+        state.instances = next;
         self.inner.dirty(&mut state);
     }
     /// Set whether Mailpit is published and its live UI upstream, if running.
@@ -154,6 +167,11 @@ impl NetRouter {
     /// Snapshot the current desired plan for gateway integration.
     pub fn current_plan(&self) -> RoutePlan {
         self.inner.plan(&self.inner.desired.lock().unwrap())
+    }
+    /// Schedule another full-plan application, including after proxy recovery.
+    pub fn reconcile(&self) {
+        let mut state = self.inner.desired.lock().unwrap();
+        self.inner.dirty(&mut state);
     }
     /// Wait until the currently desired generation has been attempted by the worker.
     pub async fn flush(&self) -> Result<(), String> {
@@ -169,6 +187,12 @@ impl RuntimeRouter for NetRouter {
         Box::pin(async move {
             let generation = {
                 let mut state = self.inner.desired.lock().unwrap();
+                if let Some(current) = state.instances.get(&instance.id)
+                    && (current.manifest != instance.manifest
+                        || current.checkout.path != instance.checkout.path)
+                {
+                    return Err("instance manifest changed while publishing its route; retry".into());
+                }
                 state
                     .instances
                     .entry(instance.id.clone())

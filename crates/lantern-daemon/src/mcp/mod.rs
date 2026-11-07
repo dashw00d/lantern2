@@ -34,6 +34,8 @@ use crate::api::facade::DaemonFacade;
 pub struct McpConfig {
     /// Cancellation is owned by the daemon and shared with its HTTP server.
     pub shutdown: CancellationToken,
+    /// Shared daemon operation tracker for lifecycle and API jobs.
+    pub operations: crate::operations::OperationTracker,
     /// Destination restrictions shared by project API calls and intel fetches.
     pub upstream_policy: upstream::UpstreamPolicy,
     /// Injectable HTTP transport; it receives only policy-validated requests.
@@ -47,6 +49,7 @@ impl Default for McpConfig {
     fn default() -> Self {
         Self {
             shutdown: CancellationToken::new(),
+            operations: crate::operations::OperationTracker::new(crate::events::EventBus::new()),
             upstream_policy: upstream::UpstreamPolicy::default(),
             api_client: upstream::default_client(),
             trust_risk_metadata: false,
@@ -124,6 +127,7 @@ pub fn service(facade: Arc<dyn DaemonFacade>, config: McpConfig) -> McpService {
             config.api_client,
             config.trust_risk_metadata,
             config.allow_critical_calls,
+            config.operations,
         ),
     };
     let transport = StreamableHttpServerConfig::default()

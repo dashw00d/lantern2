@@ -134,6 +134,9 @@ fn net_route_d9_statuses_adoption_and_collisions() {
         );
     }
     app.runtime.status = InstanceStatus::Running;
+    let checkout = tempfile::tempdir().unwrap();
+    std::fs::create_dir(checkout.path().join("public")).unwrap();
+    app.checkout.path = checkout.path().to_path_buf();
     Arc::make_mut(&mut app.manifest).serve = ServeMode::Php;
     Arc::make_mut(&mut app.manifest).root = Some("public".into());
     let plan = build_plan(&PlanInput {
@@ -142,8 +145,17 @@ fn net_route_d9_statuses_adoption_and_collisions() {
         auto_adopt: false,
     });
     assert!(
-        matches!(target(&plan,"app.glow"),Target::Live{target:RouteTarget::Php(p),..} if p==&PathBuf::from("/checkout/public"))
+        matches!(target(&plan,"app.glow"),Target::Live{target:RouteTarget::Php(p),..} if p==&checkout.path().join("public").canonicalize().unwrap())
     );
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), checkout.path().join("escape")).unwrap();
+    Arc::make_mut(&mut app.manifest).root = Some("escape".into());
+    let escaped = build_plan(&PlanInput {
+        instances: &[app.clone()],
+        tld: "glow",
+        auto_adopt: false,
+    });
+    assert_eq!(target(&escaped, "app.glow"), &Target::Down);
     Arc::make_mut(&mut app.manifest).root = Some("../../outside".into());
     let invalid = build_plan(&PlanInput {
         instances: &[app.clone()],
@@ -289,5 +301,37 @@ async fn net_router_reapplies_changes_arriving_during_reload() {
     assert_eq!(plans.len(), 2);
     assert_eq!(target(&plans[0], "app.glow"), &Target::Down);
     assert!(matches!(target(&plans[1], "app.glow"), Target::Live { .. }));
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn net_router_discards_stale_target_after_manifest_change() {
+    let fake = Arc::new(Fake::default());
+    let cancel = CancellationToken::new();
+    let router = NetRouter::new(fake, "glow".into(), false, "/missing/fpm".into(), cancel.clone());
+    let checkout = tempfile::tempdir().unwrap();
+    std::fs::create_dir(checkout.path().join("public")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), checkout.path().join("escape")).unwrap();
+    let mut app = instance("app");
+    app.checkout.path = checkout.path().into();
+    app.runtime.status = InstanceStatus::Running;
+    Arc::make_mut(&mut app.manifest).serve = ServeMode::Static;
+    Arc::make_mut(&mut app.manifest).root = Some("public".into());
+    router.replace_instances(vec![app.clone()]);
+    router
+        .publish(&app, RouteTarget::Static(checkout.path().join("public")))
+        .await
+        .unwrap();
+    let stale = app.clone();
+    Arc::make_mut(&mut app.manifest).root = Some("escape".into());
+    router.replace_instances(vec![app]);
+    assert_eq!(target(&router.current_plan(), "app.glow"), &Target::Down);
+    assert!(
+        router
+            .publish(&stale, RouteTarget::Static(checkout.path().join("public")))
+            .await
+            .is_err()
+    );
     cancel.cancel();
 }

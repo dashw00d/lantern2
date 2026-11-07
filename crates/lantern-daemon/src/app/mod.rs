@@ -9,6 +9,18 @@ pub mod discovery;
 /// Concrete daemon API facade.
 pub mod facade;
 
+/// Gateway integration.
+pub mod gateway;
+
+/// Intel refresh worker.
+pub mod intel_worker;
+
+/// Read-only shared-service detection.
+pub mod services;
+
+/// Network construction and diagnostics.
+pub mod network;
+
 use self::{
     adapters::{CheckoutPreparer, RegistryAdapter, RuntimeOneShot},
     facade::AppFacade,
@@ -19,11 +31,15 @@ use crate::{
     events::EventBus,
     git::Git,
     instances::InstanceService,
+    net::{
+        dns::{Dns, DnsConfig},
+        sync::NetRouter,
+    },
     operations::OperationTracker,
     registry::{RegistryHandle, state_io::Recovery},
     runtime::{
         Runtime, RuntimeAdapters, RuntimeConfig,
-        seams::{ScannerProbe, UnavailableRouter, UnavailableServices},
+        seams::ScannerProbe,
         systemd::{SystemctlBackend, UnitNames},
     },
 };
@@ -124,6 +140,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
                 .map(|p| PathBuf::from(p).join(if args.dev { "lantern-dev" } else { "lantern" }))
         })
         .ok_or("XDG_RUNTIME_DIR or LANTERN_RUNTIME_DIR is required")?;
+    let isolated_units = args.unit_names.is_some();
     let names = args.unit_names.unwrap_or_else(|| {
         if args.dev {
             UnitNames {
@@ -135,6 +152,9 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             UnitNames::default()
         }
     });
+    if args.dev && settings.dns.listen == "127.0.0.1:5354" {
+        settings.dns.listen = "127.0.0.1:5355".into();
+    }
     let (templates, diagnostics) =
         Templates::load_dir(&dirs.config.join("templates")).map_err(|e| e.to_string())?;
     for diagnostic in diagnostics {
@@ -185,6 +205,87 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         )
         .with_missing_retention_days(u64::from(settings.worktrees.missing_retention_days)),
     );
+    let net_paths = network::paths(dirs.clone(), home.clone(), runtime_dir.clone(), cache.clone())?;
+    let php_socket = network::php_socket(&settings.php.fpm_socket);
+    let net_health = Arc::new(network::NetworkHealth::default());
+    let search_path = env.get("PATH").cloned().unwrap_or_default();
+    if network::resolve_caddy(&settings.caddy.binary, &dirs.data, &search_path).is_none() {
+        net_health.set_caddy_error(Some("caddy_missing".into()));
+    }
+    let caddy_unit = if isolated_units {
+        format!("{}caddy.service", names.operation_prefix)
+    } else if args.dev {
+        "lantern-dev-caddy.service".into()
+    } else {
+        "lantern-caddy.service".into()
+    };
+    let applier = Arc::new(network::CaddyApplier::new(
+        settings.caddy.binary.clone(),
+        search_path,
+        net_paths.clone(),
+        caddy_unit,
+        names.slice.clone(),
+        settings.domains.tld.clone(),
+        network::render(&net_paths, &settings, php_socket.clone()),
+        net_health.clone(),
+    ));
+    let router = Arc::new(NetRouter::new(
+        applier.clone(),
+        settings.domains.tld.clone(),
+        false,
+        php_socket,
+        shutdown.clone(),
+    ));
+    router.replace_instances(network::registry_instances(&registry));
+    router.set_mailpit(settings.services.mailpit.enabled, None);
+    let mut network_events = bus.subscribe();
+    let network_router = router.clone();
+    let network_registry = registry.clone();
+    let network_shutdown = shutdown.clone();
+    let network_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        let mut binary_watch = tokio::time::interval(Duration::from_secs(1));
+        let mut previous_binary = applier.binary();
+        loop {
+            tokio::select! {
+                () = network_shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    tokio::select! { () = network_shutdown.cancelled() => break, () = applier.check_health() => {} }
+                    network_router.reconcile();
+                },
+                _ = binary_watch.tick() => {
+                    let current = applier.binary();
+                    if current != previous_binary {
+                        previous_binary = current;
+                        network_router.reconcile();
+                    }
+                },
+                event = network_events.recv() => match event {
+                    Ok(lantern_core::api::Event::InstanceUpdated { .. } | lantern_core::api::Event::InstanceRemoved { .. } | lantern_core::api::Event::ProjectUpdated { .. } | lantern_core::api::Event::ProjectRemoved { .. } | lantern_core::api::Event::ListenersChanged { .. }) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => network_router.replace_instances(network::registry_instances(&network_registry)),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ => {}
+                }
+            }
+        }
+    });
+    let dns_health = net_health.clone();
+    let dns_shutdown = shutdown.clone();
+    let dns_config = settings.dns.listen.parse().map(|listen| DnsConfig {
+        listen,
+        tld: settings.domains.tld.clone(),
+        ipv6: settings.proxy.ipv6,
+    });
+    let dns_task = tokio::spawn(async move {
+        let result = match dns_config {
+            Ok(config) => Dns::serve(config, dns_shutdown).await.map_err(|e| e.to_string()),
+            Err(e) => Err(format!("invalid DNS listen address: {e}")),
+        };
+        if let Err(error) = result {
+            tracing::error!(%error, "DNS responder unavailable");
+            dns_health.set_dns_error(error);
+        }
+    });
+    let services = Arc::new(services::ServiceObserver::new(settings.clone(), !isolated_units));
     let runtime = Arc::new(Runtime::with_scoped_journal(
         RuntimeConfig {
             settings: settings.clone(),
@@ -202,8 +303,8 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         tracker.clone(),
         RuntimeAdapters {
             preparer: Arc::new(CheckoutPreparer(service.clone())),
-            router: Arc::new(UnavailableRouter),
-            services: Arc::new(UnavailableServices),
+            router: router.clone(),
+            services: services.clone(),
         },
         args.restrict_journal_to_units,
     ));
@@ -225,6 +326,29 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         names,
         shutdown.clone(),
     );
+    let policy = crate::mcp::upstream::UpstreamPolicy {
+        tld: settings.domains.tld.clone(),
+        allowed_hosts: settings.mcp.allowed_upstream_hosts.clone(),
+        infra_ports: vec![
+            settings.daemon.port,
+            settings
+                .dns
+                .listen
+                .parse::<std::net::SocketAddrV4>()
+                .map_or(5354, |addr| addr.port()),
+            2019,
+            settings.proxy.http_port,
+            settings.proxy.https_port,
+        ],
+    };
+    let intel = Arc::new(
+        crate::intel::Intel::new(
+            dirs.state.join("intel-cache.json"),
+            policy.clone(),
+            crate::mcp::upstream::default_client(),
+        )
+        .with_options(settings.intel.cache_file, settings.intel.max_openapi_bytes),
+    );
     let boot_id = format!("{}-{}", std::process::id(), Timestamp::now().as_nanosecond());
     let facade = Arc::new(
         AppFacade::new(
@@ -239,6 +363,9 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             home,
             boot_id.clone(),
         )
+        .with_services(services.clone())
+        .with_intel(intel.clone())
+        .with_network_health(net_health, isolated_units)
         .with_environment(env.clone())
         .with_system_paths(env.get("XDG_RUNTIME_DIR").map(PathBuf::from), cache.clone()),
     );
@@ -250,6 +377,11 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
     }
+    let valid_ids = registry.instances().into_iter().map(|v| v.id).collect::<Vec<_>>();
+    if let Err(error) = intel.load_cache(&valid_ids).await {
+        tracing::warn!(%error, "intel cache unavailable");
+    }
+    let intel_task = intel_worker::spawn(facade.clone(), &bus, shutdown.clone());
     if let Some(name) = registry.active_profile() {
         use crate::api::facade::DaemonFacade;
         if let Err(error) = facade.activate_profile(name).await {
@@ -268,6 +400,29 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             }
             let delay = InstanceService::refresh_interval(!git_registry.listeners().1.is_empty());
             tokio::select! { ()=git_shutdown.cancelled()=>break, ()=tokio::time::sleep(delay)=>{} }
+        }
+    });
+    let services_shutdown = shutdown.clone();
+    let services_router = router.clone();
+    let services_bus = bus.clone();
+    let service_enabled = settings.services.mailpit.enabled;
+    let services_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut previous = BTreeMap::new();
+        loop {
+            tokio::select! {
+                () = services_shutdown.cancelled() => break,
+                _ = interval.tick() => for name in ["mailpit", "redis", "postgres"] {
+                    if let Some(status) = services.status(name).await && previous.get(name) != Some(&status) {
+                        if name == "mailpit" {
+                            let upstream = (status.state == lantern_core::api::ServiceState::Running).then(|| ([127,0,0,1], status.ports["ui"]).into());
+                            services_router.set_mailpit(service_enabled, upstream);
+                        }
+                        services_bus.publish(lantern_core::api::Event::ServiceUpdated { service: status.clone() });
+                        previous.insert(name, status);
+                    }
+                }
+            }
         }
     });
     let mut errors = registry.subscribe_write_errors();
@@ -296,15 +451,39 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     {
         tracing::warn!(%error, "systemd readiness notification failed");
     }
-    let api_state = ApiState::new(
-        facade,
-        bus,
-        tracker.clone(),
-        ApiConfig::new(settings.daemon.port, settings.domains.tld, boot_id),
+    let mut api_config = ApiConfig::new(settings.daemon.port, settings.domains.tld.clone(), boot_id);
+    if settings.proxy.https_port != 443 {
+        api_config.gateway_port = Some(settings.proxy.https_port);
+    }
+    let api_state = ApiState::new(facade.clone(), bus, tracker.clone(), api_config);
+    let gateway = crate::net::gateway::router(crate::net::gateway::GatewayState {
+        backend: Arc::new(gateway::GatewayAdapter::new(
+            router,
+            registry.clone(),
+            facade.clone(),
+        )),
+        daemon_port: settings.daemon.port,
+        https_port: settings.proxy.https_port,
+        root_cert: net_paths.root_cert,
+    });
+    let mcp = crate::mcp::service(
+        facade.clone(),
+        crate::mcp::McpConfig {
+            shutdown: shutdown.clone(),
+            operations: tracker.clone(),
+            upstream_policy: policy,
+            trust_risk_metadata: true,
+            allow_critical_calls: settings.mcp.allow_critical_calls,
+            ..Default::default()
+        },
     );
-    let result = api::serve(listener, api::router(api_state), shutdown.clone())
-        .await
-        .map_err(|e| e.to_string());
+    let result = api::serve(
+        listener,
+        api::router_with_mcp(api_state, mcp).merge(gateway),
+        shutdown.clone(),
+    )
+    .await
+    .map_err(|e| e.to_string());
     if let Some(address) = env.get("NOTIFY_SOCKET")
         && let Err(error) = notify_systemd(address, b"STOPPING=1")
     {
@@ -314,6 +493,13 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     runtime.shutdown_background();
     let _ = git_task.await;
     let _ = error_task.await;
+    let _ = network_task.await;
+    let _ = dns_task.await;
+    let _ = intel_task.await;
+    if let Err(error) = intel.write_cache().await {
+        tracing::warn!(%error, "intel cache flush failed");
+    }
+    let _ = services_task.await;
     discovery.join().await;
     loop {
         let running: Vec<_> = tracker

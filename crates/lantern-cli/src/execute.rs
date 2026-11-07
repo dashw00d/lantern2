@@ -364,8 +364,17 @@ async fn execute(ctx: &mut Context<'_>, system: &dyn SystemActions) -> Result<Op
             Ok(Some(Reply::value(&url, format!("{url}\n"))?))
         }
         Command::Mcp {
-            command: McpCommand::Install { .. },
-        } => Err(Failure::unsupported("mcp install is not assembled yet")),
+            command:
+                McpCommand::Install {
+                    target,
+                    scope,
+                    force,
+                    print,
+                    config_path,
+                },
+        } => mcp_install(ctx, *target, *scope, *force, *print, config_path.as_deref())
+            .await
+            .map(Some),
         Command::MigrateV1 {
             from,
             dry_run,
@@ -1585,6 +1594,100 @@ async fn events(ctx: &mut Context<'_>, logs: Option<&str>) -> Result<Option<Repl
             _ => {}
         }
     }
+}
+
+async fn mcp_install(
+    ctx: &Context<'_>,
+    target: McpTarget,
+    scope: McpScope,
+    force: bool,
+    print: bool,
+    config_path: Option<&Path>,
+) -> Result<Reply> {
+    let host = if ctx.cli.host.is_some() || std::env::var_os("LANTERN_DAEMON_URL").is_some() {
+        ctx.host.clone()
+    } else {
+        let dirs = Dirs::from_env(&ProcessEnv).map_err(|e| Failure::new(1, "environment", e))?;
+        let home = PathBuf::from(
+            std::env::var_os("HOME").ok_or_else(|| Failure::new(1, "environment", "HOME is required"))?,
+        );
+        let settings =
+            lantern_core::settings::load(&dirs.config.join("config.toml"), &ProcessEnv, &home, None)
+                .map_err(|e| Failure::new(1, "settings", e.to_string()))?
+                .settings;
+        format!("http://127.0.0.1:{}", settings.daemon.port)
+    };
+    let parsed = reqwest::Url::parse(&host).map_err(|e| Failure::usage(e.to_string()))?;
+    if parsed.scheme() != "http"
+        || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return Err(Failure::usage(
+            "MCP installation requires an HTTP loopback daemon URL",
+        ));
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| Failure::usage("daemon port missing"))?;
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    if print || matches!(target, McpTarget::Json) {
+        let variants = [
+            ("Generic JSON", McpTarget::Json),
+            ("Claude Code", McpTarget::ClaudeCode),
+            ("Codex", McpTarget::Codex),
+            ("Cursor", McpTarget::Cursor),
+        ];
+        let text = variants
+            .into_iter()
+            .map(|(name, client)| format!("{name}:\n{}", crate::mcp_install::snippet(client, &url)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Reply::value(&json!({"url":url, "configuration":text}), text);
+    }
+    let home = PathBuf::from(
+        std::env::var_os("HOME").ok_or_else(|| Failure::new(1, "environment", "HOME is required"))?,
+    );
+    let message = if matches!(target, McpTarget::ClaudeCode) {
+        if matches!(scope, McpScope::User) && config_path.is_some() {
+            return Err(Failure::usage(
+                "Claude user configuration is managed by the Claude CLI; --config-path is not supported",
+            ));
+        }
+        crate::mcp_install::install_claude(scope, &url, force, &ctx.cwd, config_path)
+            .map_err(|e| Failure::new(1, "mcp_install", e))?
+    } else {
+        let path = config_path
+            .map(Path::to_path_buf)
+            .or_else(|| crate::mcp_install::config_path(target, scope, &home, &ctx.cwd))
+            .ok_or_else(|| Failure::usage("no client configuration path"))?;
+        let changed = crate::mcp_install::install_file(&path, target, &url, force)
+            .map_err(|e| Failure::new(1, "mcp_install", e))?;
+        format!(
+            "{} {}",
+            if changed { "Updated" } else { "Already installed:" },
+            path.display()
+        )
+    };
+    let available = match reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build() {
+        Ok(client) => client.post(&url).header("accept", "application/json, text/event-stream").json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"lantern-install","version":"1"}}})).send().await.is_ok_and(|r| r.status().is_success()),
+        Err(_) => false,
+    };
+    let text = format!(
+        "{message}\n{}\n",
+        if available {
+            "Lantern MCP initialized successfully."
+        } else {
+            "Lantern MCP is unavailable; installation was saved."
+        }
+    );
+    Reply::value(
+        &json!({"url":url, "message":message, "daemon_available":available}),
+        text,
+    )
 }
 
 #[cfg(test)]

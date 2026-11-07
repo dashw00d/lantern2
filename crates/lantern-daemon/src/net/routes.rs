@@ -122,6 +122,16 @@ fn selected(instance: &Instance, auto_adopt: bool) -> Target {
         return Target::Down;
     }
     let root = instance.checkout.path.join(relative_root);
+    // Reconstructed roots must be contained after resolving symlinks, just like
+    // roots supplied by the runtime at activation time.
+    let root = if matches!(instance.manifest.serve, ServeMode::Php | ServeMode::Static) {
+        match (instance.checkout.path.canonicalize(), root.canonicalize()) {
+            (Ok(checkout), Ok(root)) if root.starts_with(&checkout) => root,
+            _ => return Target::Down,
+        }
+    } else {
+        root
+    };
     let target = match instance.manifest.serve {
         ServeMode::Php => Some(RouteTarget::Php(root)),
         ServeMode::Static => Some(RouteTarget::Static(root)),
