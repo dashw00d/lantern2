@@ -3,6 +3,7 @@ use super::procinfo::normalize_unit;
 use super::scanner::Snapshot;
 use lantern_core::ids::InstanceId;
 use lantern_core::model::Listener;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -22,7 +23,7 @@ pub enum PortBinding {
     HeldByOther(PortHolder),
 }
 /// Public, redacted explanation of a port holder.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortHolder {
     /// TCP port.
     pub port: u16,
@@ -94,7 +95,7 @@ impl PortHolder {
     }
 }
 /// A reservation held by another process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortConflict {
     /// Instance whose reserved port is held.
     pub instance: InstanceId,

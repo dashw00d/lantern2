@@ -315,6 +315,7 @@ pub(super) mod fixture {
             fs::write(path.join("stat"), "btime 1700000000\n").unwrap();
             Self(path)
         }
+        #[allow(clippy::too_many_arguments)]
         pub fn process(
             &self,
             pid: u32,
