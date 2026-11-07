@@ -8,3 +8,6 @@ pub mod shell_env;
 
 /// systemd user-unit boundary and test fake.
 pub mod systemd;
+
+/// Journal decoding and per-instance log subscriptions.
+pub mod journal;

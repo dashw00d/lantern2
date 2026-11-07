@@ -1,0 +1,4 @@
+{"_SYSTEMD_USER_UNIT":"lantern-inst-app_feature.service","MESSAGE":[27,91,51,49,109,104,105,27,91,48,109,13,111,107,32,255],"__REALTIME_TIMESTAMP":"1760000000123456","__CURSOR":"s=1"}
+{"_SYSTEMD_USER_UNIT":"lantern-op-app_feature-setup-4.service","MESSAGE":"install done","__REALTIME_TIMESTAMP":"1760000000123457"}
+{"_SYSTEMD_USER_UNIT":"lantern-op-app_feature-deploy-9.service","MESSAGE":"deploy done","__REALTIME_TIMESTAMP":"1760000000123458"}
+{"_SYSTEMD_USER_UNIT":"lantern-inst-unrelated@x.service","MESSAGE":"ignored","__REALTIME_TIMESTAMP":"1760000000123459"}
