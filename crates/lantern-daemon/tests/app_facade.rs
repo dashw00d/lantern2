@@ -254,6 +254,21 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         "forbidden"
     );
     fs::write(temp.0.join("project/README.md"), "Original documentation").unwrap();
+    let readme = temp.0.join("project/README.md");
+    let saved_readme = temp.0.join("project/README.saved");
+    let secret = temp.0.join("secret.txt");
+    fs::write(&secret, "outside checkout").unwrap();
+    fs::rename(&readme, &saved_readme).unwrap();
+    std::os::unix::fs::symlink(&secret, &readme).unwrap();
+    assert_eq!(
+        app.doc(id.clone(), "README.md".into(), None, None)
+            .await
+            .unwrap_err()
+            .code,
+        "forbidden"
+    );
+    fs::remove_file(&readme).unwrap();
+    fs::rename(&saved_readme, &readme).unwrap();
     // A newly discovered file does not appear on GET until an explicit refresh.
     fs::write(temp.0.join("project/CHANGELOG.md"), "changes").unwrap();
     assert!(
