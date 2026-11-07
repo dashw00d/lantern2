@@ -972,6 +972,16 @@ impl InstanceService {
         self.store
             .upsert(&id, record.clone())
             .map_err(InstanceError::Adapter)?;
+        if let Err(error) = self.store.flush().await {
+            if let Some(previous) = previous.clone() {
+                self.store.upsert(&id, previous).map_err(InstanceError::Adapter)?;
+            } else {
+                self.store.remove(&id).map_err(InstanceError::Adapter)?;
+            }
+            return Err(InstanceError::Adapter(format!(
+                "worktree intent flush failed: {error}"
+            )));
+        }
         op.step("Creating worktree");
         if let Err(e) = repo.add_worktree(&root, &mode, &cancel).await {
             // A failed git call does not establish ownership of an on-disk path.

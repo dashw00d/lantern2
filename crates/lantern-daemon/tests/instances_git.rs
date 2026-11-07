@@ -107,6 +107,7 @@ struct FakeStore {
     statuses: Mutex<BTreeMap<InstanceId, InstanceStatus>>,
     port: Mutex<Option<u16>>,
     stale: Mutex<BTreeMap<InstanceId, bool>>,
+    fail_flush: std::sync::atomic::AtomicBool,
 }
 impl InstanceStore for FakeStore {
     fn project(&self, id: &ProjectId) -> Result<Option<ProjectConfig>, String> {
@@ -162,6 +163,15 @@ impl InstanceStore for FakeStore {
     fn set_setup_stale(&self, id: &InstanceId, stale: bool) -> Result<(), String> {
         self.stale.lock().unwrap().insert(id.clone(), stale);
         Ok(())
+    }
+    fn flush(&self) -> lantern_daemon::instances::InstanceStoreFlushFuture<'_> {
+        Box::pin(async move {
+            if self.fail_flush.load(Ordering::SeqCst) {
+                Err("fake flush failure".into())
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 #[derive(Default)]
@@ -735,6 +745,28 @@ async fn instances_recover_interrupted_creation_without_claiming_user_data() {
         "keep"
     );
     op.finish(OpOutcome::Succeeded(None));
+}
+
+#[tokio::test]
+async fn instances_creation_waits_for_durable_intent() {
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    git_cmd(&root, &["branch", "flush-fail"]);
+    store.fail_flush.store(true, Ordering::SeqCst);
+    let op = operation();
+    let result = service
+        .run_branch_unprepared(req(BranchTarget::Branch("flush-fail".into())), &op)
+        .await;
+    assert!(result.unwrap_err().to_string().contains("flush"));
+    assert!(!t.0.join("managed/mono/flush-fail").exists());
+    assert!(
+        !store
+            .records
+            .lock()
+            .unwrap()
+            .contains_key(&InstanceId::parse("myapp@flush-fail").unwrap())
+    );
+    op.finish(OpOutcome::Cancelled);
 }
 
 #[tokio::test]
