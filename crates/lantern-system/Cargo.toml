@@ -13,13 +13,14 @@ lantern-core = { workspace = true }
 base64 = "0.23"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-rcgen = "0.14"
+rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = { version = "0.18", features = ["verify"] }
 time = "0.3"
 sha2 = "0.11"
 hex = "0.4"
 rustix = { version = "1", features = ["fs"] }
 nix = { version = "0.30", features = ["user"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 
 [dev-dependencies]
 tempfile = "3"

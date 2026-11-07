@@ -15,7 +15,6 @@ use lantern_core::{
     settings::Settings,
 };
 use std::{
-    ffi::OsString,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
@@ -201,36 +200,58 @@ impl NetworkProbe for LocalNetworkProbe<'_> {
                     Err("system resolver did not return IPv4 loopback".into())
                 }
             }
-            Probe::TlsServing | Probe::EndToEnd => {
-                let port = self.settings.proxy.https_port;
-                let domain = format!("lantern.{tld}");
-                let mut args = vec![
-                    "-sS".into(),
-                    "--max-time".into(),
-                    "3".into(),
-                    "--noproxy".into(),
-                    "*".into(),
-                ];
-                if probe == Probe::TlsServing {
-                    args.extend([
-                        OsString::from("--cacert"),
-                        self.paths.root_cert.as_os_str().to_owned(),
-                        OsString::from("--resolve"),
-                        OsString::from(format!("{domain}:{port}:127.0.0.1")),
-                    ]);
+            Probe::TlsServing => {
+                let pem = crate::ca::read_bounded_nofollow(&self.paths.root_cert, 16 * 1024)
+                    .map_err(|e| e.to_string())?;
+                let der = nss_trust::certificate_der(&pem)?;
+                crate::ca::inspect_der(&der, tld).map_err(|e| e.to_string())?;
+                let mut roots = rustls::RootCertStore::empty();
+                roots
+                    .add(rustls::pki_types::CertificateDer::from(der))
+                    .map_err(|e| e.to_string())?;
+                let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| e.to_string())?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                let name = rustls::pki_types::ServerName::try_from(format!("lantern.{tld}"))
+                    .map_err(|e| e.to_string())?;
+                let mut tls = rustls::ClientConnection::new(std::sync::Arc::new(config), name)
+                    .map_err(|e| e.to_string())?;
+                let addr = SocketAddr::from(([127, 0, 0, 1], self.settings.proxy.https_port));
+                let mut socket =
+                    TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| e.to_string())?;
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .map_err(|e| e.to_string())?;
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .map_err(|e| e.to_string())?;
+                while tls.is_handshaking() {
+                    tls.complete_io(&mut socket).map_err(|e| e.to_string())?;
                 }
-                args.push(format!("https://{domain}:{port}/__lantern/ping").into());
+                Ok("TLS handshake verified against Lantern's root".into())
+            }
+            Probe::EndToEnd => {
+                let port = self.settings.proxy.https_port;
+                let url = format!("https://lantern.{tld}:{port}/__lantern/ping");
                 let out = self
                     .runner
-                    .run(&CommandSpec::new("/usr/bin/curl", args, false))
+                    .run(&CommandSpec::new(
+                        "/usr/bin/curl",
+                        ["-sS", "--max-time", "3", "--noproxy", "*", &url],
+                        false,
+                    ))
                     .map_err(|e| e.to_string())?;
                 if !out.success {
                     return Err(String::from_utf8_lossy(&out.stderr).trim().into());
                 }
-                if probe == Probe::EndToEnd && String::from_utf8_lossy(&out.stdout).trim() != "lantern-ok" {
+                if String::from_utf8_lossy(&out.stdout).trim() != "lantern-ok" {
                     return Err("unexpected HTTPS ping response".into());
                 }
-                Ok("HTTPS certificate and connection verified".into())
+                Ok("HTTPS system resolver and trust verified".into())
             }
         }
     }

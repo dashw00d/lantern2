@@ -1135,3 +1135,89 @@ fn paths_cover_user_service_browser_and_fake_root_locations() {
     assert_eq!(paths.autostart, xdg.join("autostart/lantern-tray.desktop"));
     assert!(paths.with_user_config_root(Path::new("../bad")).is_err());
 }
+
+#[test]
+fn constrained_root_accepts_local_tls_and_rejects_external_dns_in_memory() {
+    use rustls::{
+        ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection,
+        pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName},
+    };
+    use std::{io::Cursor, sync::Arc};
+    let f = Fixture::new();
+    lantern_system::ca::ensure_root(&f.paths, "glow").unwrap();
+    let root_pem = fs::read_to_string(&f.paths.root_cert).unwrap();
+    let root_key = rcgen::KeyPair::from_pem(&fs::read_to_string(&f.paths.root_key).unwrap()).unwrap();
+    let issuer = rcgen::Issuer::from_ca_cert_pem(&root_pem, root_key).unwrap();
+    let root_der = lantern_system::steps::nss_trust::certificate_der(root_pem.as_bytes()).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from(root_der)).unwrap();
+    let client_config = Arc::new(
+        ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    fn handshake(
+        name: &str,
+        issuer: &rcgen::Issuer<'_, rcgen::KeyPair>,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+        client_config: Arc<ClientConfig>,
+    ) -> Result<(), String> {
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(7);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, issuer).unwrap();
+        let server_config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        let mut client =
+            ClientConnection::new(client_config, ServerName::try_from(name.to_owned()).unwrap()).unwrap();
+        for _ in 0..20 {
+            if client.wants_write() {
+                let mut bytes = Vec::new();
+                client.write_tls(&mut bytes).unwrap();
+                server
+                    .read_tls(&mut Cursor::new(bytes))
+                    .map_err(|e| e.to_string())?;
+                server.process_new_packets().map_err(|e| e.to_string())?;
+            }
+            if server.wants_write() {
+                let mut bytes = Vec::new();
+                server.write_tls(&mut bytes).unwrap();
+                client
+                    .read_tls(&mut Cursor::new(bytes))
+                    .map_err(|e| e.to_string())?;
+                client.process_new_packets().map_err(|e| e.to_string())?;
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return Ok(());
+            }
+        }
+        Err("handshake did not complete".into())
+    }
+    assert!(
+        handshake(
+            "feature.app.glow",
+            &issuer,
+            provider.clone(),
+            client_config.clone()
+        )
+        .is_ok()
+    );
+    let outside = handshake("outside.example", &issuer, provider, client_config).unwrap_err();
+    assert!(
+        outside.to_lowercase().contains("nameconstraint"),
+        "unexpected error: {outside}"
+    );
+}
