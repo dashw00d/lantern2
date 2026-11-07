@@ -707,3 +707,59 @@ fn daemon_url_uses_d21_environment_and_explicit_host_wins() {
         Some("http://127.0.0.1:39598")
     );
 }
+
+#[tokio::test]
+async fn multiple_target_progress_subscribes_concurrently() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _guard = NETWORK_TESTS.lock().await;
+    let listener = bind();
+    let host = format!("http://{}", listener.local_addr().unwrap());
+    let (_, primary) = fixture();
+    let mut branch = primary.clone();
+    branch.id = InstanceId::derived(&branch.project, "feature").unwrap();
+    branch.checkout.branch = Some("feature".into());
+    let subscriptions = Arc::new(AtomicUsize::new(0));
+    let shared = subscriptions.clone();
+    let server = thread::spawn(move || {
+        let mut workers = vec![];
+        for _ in 0..8 {
+            let mut stream = accept_bounded(&listener);
+            let views = vec![primary.clone(), branch.clone()];
+            let shared = shared.clone();
+            workers.push(thread::spawn(move || {
+                let (path, _) = read_request(&mut stream);
+                let (body, mime) = if path.starts_with("GET /api HTTP") {
+                    (json!({"name":"Lantern","version":"0.2","api_version":1,"mcp":"/mcp","links":{}}).to_string(), "application/json")
+                } else if path.starts_with("GET /api/instances") { (json!({"items":views}).to_string(), "application/json") }
+                else if path.starts_with("POST /api/instances/") {
+                    let suffix = if path.contains("%40feature") { "b" } else { "a" };
+                    let mut value = operation("queued"); value["operation"]["id"] = json!(format!("op-{suffix}"));
+                    (value.to_string(), "application/json")
+                } else if path.starts_with("GET /api/events?") {
+                    shared.fetch_add(1, Ordering::SeqCst);
+                    let suffix = if path.contains("op=op-b") { "b" } else { "a" };
+                    let event = json!({"type":"operation_progress","op":format!("op-{suffix}"),"instance":"myapp","step":format!("step-{suffix}"),"done":false,"error":null});
+                    (format!("event: operation_progress\ndata: {event}\n\n"), "text/event-stream")
+                } else if path.starts_with("GET /api/operations/") {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while shared.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+                    assert_eq!(shared.load(Ordering::SeqCst), 2, "both streams must start before either operation completes");
+                    thread::sleep(Duration::from_millis(50));
+                    let mut value = operation("succeeded")["operation"].clone();
+                    value["id"] = json!(if path.contains("op-b") { "op-b" } else { "op-a" });
+                    (value.to_string(), "application/json")
+                } else { panic!("unexpected request: {path}") };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    let (code, out, err) = run(&["on", "myapp", "myapp@feature", "--no-color"], &host, true).await;
+    server.join().unwrap();
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("step-a") && err.contains("step-b"), "{err}");
+    assert_eq!(out, "op-a\nop-b\n");
+    assert_eq!(subscriptions.load(Ordering::SeqCst), 2);
+}

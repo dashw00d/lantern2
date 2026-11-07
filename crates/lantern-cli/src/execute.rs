@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::CommandFactory;
-use futures_util::{StreamExt, future::join_all};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use lantern_client::{
     Client, ClientConfig, EventsOptions, InstanceFilter, ListenerFilter, ProjectFilter, RunOptions,
     ServiceAction, StreamEvent, Wait,
@@ -735,6 +735,86 @@ enum Action {
     Stop,
     Restart,
 }
+// Each tracked operation has its own SSE subscription and authoritative REST wait.
+async fn track_operation(
+    client: &Client,
+    mut result: OperationResponse,
+    args: &WaitArgs,
+    tty: bool,
+    host: &str,
+    progress: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<OperationResponse> {
+    if tty
+        && !args.no_wait
+        && matches!(
+            result.operation.status,
+            OperationStatus::Queued | OperationStatus::Running
+        )
+    {
+        let id = result.operation.id.clone();
+        let mut events = client.events_once(EventsOptions {
+            state: false,
+            logs: vec![],
+            tail: 0,
+            op: Some(id.clone()),
+            reconnect: false,
+        });
+        let waiting = client.operation(&id, Some(Duration::from_secs(args.timeout)));
+        tokio::pin!(waiting);
+        loop {
+            tokio::select! {
+                operation = &mut waiting => { result.operation = operation.map_err(|e| Failure::from_client(e, host))?; break; }
+                event = events.next() => match event {
+                    Some(StreamEvent::Event(WireEvent::OperationProgress { instance, step, .. })) => { let _ = progress.send(format!("◐ {instance} {}", output::clean(&step, false))); }
+                    None | Some(StreamEvent::Lost { .. }) => { result.operation = waiting.await.map_err(|e| Failure::from_client(e, host))?; break; }
+                    _ => {}
+                }
+            }
+        }
+    }
+    check_operation(&result, !args.no_wait)?;
+    Ok(result)
+}
+
+async fn gather_operations<F>(
+    ctx: &mut Context<'_>,
+    mut tasks: FuturesUnordered<F>,
+    mut progress: tokio::sync::mpsc::UnboundedReceiver<String>,
+    count: usize,
+) -> Result<Vec<OperationResponse>>
+where
+    F: std::future::Future<Output = (usize, Result<OperationResponse>)>,
+{
+    let mut results = vec![None; count];
+    let mut worst: Option<Failure> = None;
+    while !tasks.is_empty() {
+        tokio::select! {
+            result = tasks.next() => if let Some((index, result)) = result {
+                match result {
+                    Ok(result) => results[index] = Some(result),
+                    Err(error) => if worst.as_ref().is_none_or(|current| current.code < error.code) { worst = Some(error); },
+                }
+            },
+            line = progress.recv() => if let Some(line) = line { writeln!(ctx.err, "{line}")?; },
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                if ctx.tty && !ctx.cli.json { writeln!(ctx.err, "Stopped waiting; operations continue in the daemon.")?; }
+                return Err(Failure::new(1, "interrupted", "stopped waiting; operations continue in the daemon"));
+            }
+        }
+    }
+    while let Ok(line) = progress.try_recv() {
+        writeln!(ctx.err, "{line}")?;
+    }
+    if let Some(error) = worst {
+        return Err(error);
+    }
+    results
+        .into_iter()
+        .map(|result| result.ok_or_else(|| Failure::new(1, "internal", "operation result missing")))
+        .collect()
+}
+
 async fn actions(
     ctx: &mut Context<'_>,
     names: &[String],
@@ -749,48 +829,43 @@ async fn actions(
         .map(|n| target::resolve(&instances, Some(n), &ctx.cwd))
         .collect::<Result<_>>()?;
     let wait = ctx.wait(args);
-    let requests = join_all(ids.iter().map(|id| {
-        let client = &client;
-        async move {
-            match action {
-                Action::Start => client.start(id, wait).await,
-                Action::Stop => client.stop(id, wait).await,
-                Action::Restart => client.restart(id, wait).await,
+    let tty = ctx.tty && !ctx.cli.json;
+    let host = ctx.host.clone();
+    let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+    let tasks: FuturesUnordered<_> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let client = client.clone();
+            let id = id.clone();
+            let args = args.clone();
+            let progress = send.clone();
+            let host = host.clone();
+            async move {
+                let result = match action {
+                    Action::Start => client.start(&id, wait).await,
+                    Action::Stop => client.stop(&id, wait).await,
+                    Action::Restart => client.restart(&id, wait).await,
+                };
+                let result = match result {
+                    Ok(response) => track_operation(&client, response, &args, tty, &host, progress).await,
+                    Err(error) => Err(Failure::from_client(error, &host)),
+                };
+                (index, result)
             }
+        })
+        .collect();
+    drop(send);
+    let completed = gather_operations(ctx, tasks, receive, ids.len()).await?;
+    if should_open && !args.no_wait {
+        for (result, id) in completed.iter().zip(&ids) {
+            let view = if let Some(view) = &result.instance {
+                view.clone()
+            } else {
+                client.instance(id).await.map_err(|e| ctx.failure(e))?
+            };
+            launch("xdg-open", &view.url)?;
         }
-    }));
-    let results = tokio::select! {
-        results = requests => results,
-        signal = tokio::signal::ctrl_c() => { signal?; if ctx.tty && !ctx.cli.json { writeln!(ctx.err, "Stopped waiting; operations continue in the daemon.")?; } return Err(Failure::new(1, "interrupted", "stopped waiting; operations continue in the daemon")); }
-    };
-    let mut completed = Vec::new();
-    let mut worst: Option<Failure> = None;
-    for (result, id) in results.into_iter().zip(&ids) {
-        let result = match result {
-            Ok(result) => finish_operation(ctx, &client, result, args).await,
-            Err(e) => Err(ctx.failure(e)),
-        };
-        match result {
-            Ok(result) => {
-                if should_open && !args.no_wait {
-                    let view = if let Some(view) = &result.instance {
-                        view.clone()
-                    } else {
-                        client.instance(id).await.map_err(|e| ctx.failure(e))?
-                    };
-                    launch("xdg-open", &view.url)?;
-                }
-                completed.push(result);
-            }
-            Err(error) => {
-                if worst.as_ref().is_none_or(|w| w.code < error.code) {
-                    worst = Some(error);
-                }
-            }
-        }
-    }
-    if let Some(error) = worst {
-        return Err(error);
     }
     if let [one] = completed.as_slice() {
         return operation_reply(one, args.no_wait);
@@ -801,6 +876,7 @@ async fn actions(
         .collect();
     Reply::value(&completed, text)
 }
+
 async fn stop_all(ctx: &mut Context<'_>, args: &OffArgs) -> Result<Reply> {
     if !args.yes {
         if !ctx.tty || ctx.cli.json {
@@ -813,40 +889,47 @@ async fn stop_all(ctx: &mut Context<'_>, args: &OffArgs) -> Result<Reply> {
         }
     }
     let client = ctx.client()?;
-    let ops = client
-        .stop_all(Wait {
-            wait: !args.wait.no_wait,
-            timeout: Some(Duration::from_secs(args.wait.timeout)),
+    let request = client.stop_all(ctx.wait(&args.wait));
+    let operations = wait_request(ctx, request).await?;
+    let count = operations.len();
+    let tty = ctx.tty && !ctx.cli.json;
+    let host = ctx.host.clone();
+    let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+    let tasks: FuturesUnordered<_> = operations
+        .into_iter()
+        .enumerate()
+        .map(|(index, operation)| {
+            let client = client.clone();
+            let args = args.wait.clone();
+            let host = host.clone();
+            let progress = send.clone();
+            async move {
+                let response = OperationResponse {
+                    operation,
+                    instance: None,
+                    created: None,
+                    forgotten: None,
+                };
+                (
+                    index,
+                    track_operation(&client, response, &args, tty, &host, progress).await,
+                )
+            }
         })
-        .await
-        .map_err(|e| ctx.failure(e))?;
-    if ops
-        .iter()
-        .any(|o| matches!(o.status, OperationStatus::Failed | OperationStatus::Cancelled))
-    {
-        return Err(Failure::new(
-            5,
-            "operation_failed",
-            "one or more stop operations failed",
-        ));
-    }
-    if !args.wait.no_wait
-        && ops
-            .iter()
-            .any(|o| matches!(o.status, OperationStatus::Running | OperationStatus::Queued))
-    {
-        return Err(Failure::new(
-            6,
-            "timeout",
-            "one or more stop operations are still running",
-        ));
-    }
-    let text = ops
+        .collect();
+    drop(send);
+    let operations = gather_operations(ctx, tasks, receive, count)
+        .await?
+        .into_iter()
+        .map(|response| response.operation)
+        .collect::<Vec<_>>();
+    let text = operations
         .iter()
         .map(|o| format!("{}  {:?}\n", o.id, o.status))
         .collect();
-    Reply::value(&api::OperationsResponse { operations: ops }, text)
+    Reply::value(&api::OperationsResponse { operations }, text)
 }
+
 fn confirm(ctx: &mut Context<'_>, prompt: &str) -> Result<bool> {
     write!(ctx.err, "{prompt} [y/N] ")?;
     ctx.err.flush()?;
