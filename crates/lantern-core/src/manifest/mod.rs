@@ -875,7 +875,7 @@ fn inferred_doc_kind(path: &str) -> String {
     .to_string()
 }
 /// An executable template together with whether it is built in.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TemplateDefinition {
     pub manifest: RawManifest,
     pub builtin: bool,
