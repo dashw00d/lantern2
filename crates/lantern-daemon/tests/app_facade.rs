@@ -209,6 +209,76 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         .await
         .unwrap();
     let id: InstanceId = project.primary;
+    // The assembled gateway must use its own origin guard, not the REST guard.
+    {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use lantern_daemon::{
+            api::{ApiConfig, ApiState},
+            app::gateway::GatewayAdapter,
+            net::{
+                gateway::{self, GatewayState},
+                routes::RoutePlan,
+                sync::{ApplyFuture, NetRouter, RouteApplier},
+            },
+        };
+        use tower::ServiceExt;
+        struct Noop;
+        impl RouteApplier for Noop {
+            fn apply<'a>(&'a self, _: &'a RoutePlan) -> ApplyFuture<'a> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let router = Arc::new(NetRouter::new(
+            Arc::new(Noop),
+            "glow".into(),
+            false,
+            temp.0.join("php.sock"),
+            shutdown.clone(),
+        ));
+        router.replace_instances(lantern_daemon::app::network::registry_instances(&registry));
+        let backend = Arc::new(GatewayAdapter::new(
+            router,
+            registry.clone(),
+            Arc::new(app.clone()),
+        ));
+        let gateway = gateway::router(GatewayState {
+            backend,
+            daemon_port: 39601,
+            https_port: 443,
+            root_cert: temp.0.join("ca.crt"),
+        });
+        let state = ApiState::new(
+            Arc::new(app.clone()),
+            EventBus::new(),
+            tracker.clone(),
+            ApiConfig::new(39601, "glow", "test"),
+        );
+        let combined = lantern_daemon::api::router(state).merge(gateway);
+        let request = Request::builder()
+            .uri("/__lantern/status")
+            .header("host", "127.0.0.1:39601")
+            .header("x-forwarded-host", "sample.glow")
+            .header("origin", "https://sample.glow")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            combined.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let forbidden = Request::builder()
+            .uri("/__lantern/status")
+            .header("host", "attacker.test")
+            .header("x-forwarded-host", "sample.glow")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            combined.oneshot(forbidden).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
     let collision = app
         .register_project(RegisterProjectRequest {
             path: temp.0.join("project"),

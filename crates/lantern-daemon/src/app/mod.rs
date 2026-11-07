@@ -9,6 +9,9 @@ pub mod discovery;
 /// Concrete daemon API facade.
 pub mod facade;
 
+/// Gateway integration.
+pub mod gateway;
+
 /// Network construction and diagnostics.
 pub mod network;
 
@@ -377,12 +380,18 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         tracing::warn!(%error, "systemd readiness notification failed");
     }
     let api_state = ApiState::new(
-        facade,
+        facade.clone(),
         bus,
         tracker.clone(),
         ApiConfig::new(settings.daemon.port, settings.domains.tld, boot_id),
     );
-    let result = api::serve(listener, api::router(api_state), shutdown.clone())
+    let gateway = crate::net::gateway::router(crate::net::gateway::GatewayState {
+        backend: Arc::new(gateway::GatewayAdapter::new(router, registry.clone(), facade)),
+        daemon_port: settings.daemon.port,
+        https_port: settings.proxy.https_port,
+        root_cert: net_paths.root_cert,
+    });
+    let result = api::serve(listener, api::router(api_state).merge(gateway), shutdown.clone())
         .await
         .map_err(|e| e.to_string());
     if let Some(address) = env.get("NOTIFY_SOCKET")
