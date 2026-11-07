@@ -7,6 +7,23 @@
     },
     "description": "Call an HTTP API of a registered project through Lantern, e.g. tool=\"browser\", method=\"POST\", path=\"/tasks/execute\", body={...}. Lantern finds the running server's address; you give the project and a path. Returns the response body (cut at `max_bytes`, default 100000). Only registered projects are reachable. Endpoints marked risk high/critical, or projects needing confirmation, are not sent until `confirm=true`: ask the user first. For calls over ~50s set `async=true` to get a `job_id`, then use `get_operation` or `get_job_result`. See `get_project_endpoints` for what exists.",
     "inputSchema": {
+      "$defs": {
+        "BodySchema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "items": true,
+              "type": "array"
+            }
+          ]
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "async": {
@@ -17,6 +34,14 @@
           ]
         },
         "body": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BodySchema"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "description": "JSON string, object or array."
         },
         "branch": {

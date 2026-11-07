@@ -208,6 +208,7 @@ pub struct CallApiArgs {
     /// Absolute path on the registered server, optionally with query.
     pub path: String,
     /// JSON string, object or array.
+    #[schemars(with = "Option<BodySchema>")]
     pub body: Option<serde_json::Value>,
     /// Run as a job.
     pub r#async: Option<bool>,
@@ -239,4 +240,14 @@ pub struct PromptArgs {
 pub struct DependencyPromptArgs {
     /// Project whose dependencies to trace.
     pub name: String,
+}
+
+// Schema-only: request bodies are forwarded as strings, JSON objects, or arrays.
+#[allow(dead_code)]
+#[derive(schemars::JsonSchema)]
+#[serde(untagged)]
+enum BodySchema {
+    String(String),
+    Object(std::collections::BTreeMap<String, serde_json::Value>),
+    Array(Vec<serde_json::Value>),
 }

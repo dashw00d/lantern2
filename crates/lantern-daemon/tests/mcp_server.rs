@@ -121,3 +121,74 @@ async fn mcp_socket_initialize_list_call_and_stateless() {
     shutdown.cancel();
     server.await.unwrap();
 }
+
+#[derive(Debug)]
+struct RiskFacade;
+#[async_trait]
+impl DaemonFacade for RiskFacade {
+    async fn projects(&self, filter: ProjectFilter) -> FacadeResult<Vec<ProjectSummary>> {
+        FakeFacade.projects(filter).await
+    }
+    async fn instance(&self, id: InstanceId) -> FacadeResult<InstanceView> {
+        FakeFacade.instance(id).await
+    }
+    async fn manifest(&self, _: InstanceId) -> FacadeResult<Value> {
+        Ok(
+            json!({"base_url":"http://127.0.0.1:39801","routing":{"risk":null,"requires_confirmation":false,"max_concurrent":1}}),
+        )
+    }
+    async fn endpoints(
+        &self,
+        _: InstanceId,
+        _: Option<String>,
+        _: Option<u32>,
+    ) -> FacadeResult<Vec<lantern_core::api::EndpointEntry>> {
+        Ok(vec![serde_json::from_value(json!({"method":"POST","path":"/danger/{id}","description":null,"category":null,"risk":"critical","body_hint":null,"params":[],"source":"manual"})).unwrap()])
+    }
+}
+#[derive(Debug, Default)]
+struct RecordingClient(std::sync::atomic::AtomicUsize);
+#[async_trait]
+impl mcp::upstream::ToolApiClient for RecordingClient {
+    async fn send(
+        &self,
+        req: mcp::upstream::ToolApiRequest,
+    ) -> Result<mcp::upstream::ToolApiResponse, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(req.addresses.iter().all(|addr| addr.ip().is_loopback()));
+        Ok(mcp::upstream::ToolApiResponse {
+            status: 200,
+            content_type: Some("application/json".into()),
+            body: b"ok".to_vec(),
+            truncated: false,
+        })
+    }
+}
+async fn api_call(router: Router, arguments: Value) -> Value {
+    let response=router.oneshot(request(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call_tool_api","arguments":arguments}}))).await.unwrap();
+    serde_json::from_slice(&to_bytes(response.into_body(), 100_000).await.unwrap()).unwrap()
+}
+#[tokio::test]
+async fn mcp_risk_and_ssrf_gates_run_before_transport() {
+    let client = Arc::new(RecordingClient::default());
+    let config = McpConfig {
+        api_client: client.clone(),
+        trust_risk_metadata: true,
+        ..Default::default()
+    };
+    let router = Router::new().nest_service("/mcp", mcp::service(Arc::new(RiskFacade), config));
+    for arguments in [
+        json!({"tool":"myapp","path":"/danger/1","method":"POST"}),
+        json!({"tool":"myapp","path":"/danger/1","method":"POST","confirm":true}),
+        json!({"tool":"myapp","path":"/%252e%252e/secret"}),
+        json!({"tool":"myapp","path":"//169.254.169.254"}),
+        json!({"tool":"myapp","path":"/ok","method":"TRACE"}),
+    ] {
+        let response = api_call(router.clone(), arguments).await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+    }
+    assert_eq!(client.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let response = api_call(router, json!({"tool":"myapp","path":"/ok","method":"GET"})).await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert_eq!(client.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

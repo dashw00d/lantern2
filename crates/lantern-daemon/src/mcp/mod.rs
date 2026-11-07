@@ -1,10 +1,12 @@
 //! Stateless MCP transport over the daemon facade.
 
+mod api_client;
 mod args;
 mod descriptions;
 mod dispatch;
 mod resources;
 mod tools;
+pub mod upstream;
 
 use std::{sync::Arc, time::Duration};
 
@@ -28,10 +30,38 @@ use tokio_util::sync::CancellationToken;
 use crate::api::facade::DaemonFacade;
 
 /// Configuration for the mountable MCP service.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct McpConfig {
     /// Cancellation is owned by the daemon and shared with its HTTP server.
     pub shutdown: CancellationToken,
+    /// Destination restrictions shared by project API calls and intel fetches.
+    pub upstream_policy: upstream::UpstreamPolicy,
+    /// Injectable HTTP transport; it receives only policy-validated requests.
+    pub api_client: Arc<dyn upstream::ToolApiClient>,
+    /// Enable API calls only after the facade preserves all risk metadata, including critical.
+    pub trust_risk_metadata: bool,
+    /// User setting permitting critical calls after explicit confirmation.
+    pub allow_critical_calls: bool,
+}
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            shutdown: CancellationToken::new(),
+            upstream_policy: upstream::UpstreamPolicy::default(),
+            api_client: upstream::default_client(),
+            trust_risk_metadata: false,
+            allow_critical_calls: false,
+        }
+    }
+}
+impl std::fmt::Debug for McpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpConfig")
+            .field("upstream_policy", &self.upstream_policy)
+            .field("trust_risk_metadata", &self.trust_risk_metadata)
+            .field("allow_critical_calls", &self.allow_critical_calls)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Cheap per-request MCP handler.
@@ -40,6 +70,7 @@ pub struct LanternMcp {
     facade: Arc<dyn DaemonFacade>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
+    api: api_client::ApiState,
 }
 
 impl std::fmt::Debug for LanternMcp {
@@ -88,6 +119,12 @@ pub fn service(facade: Arc<dyn DaemonFacade>, config: McpConfig) -> McpService {
         facade,
         tool_router: LanternMcp::tool_router(),
         prompt_router: LanternMcp::prompt_router(),
+        api: api_client::ApiState::new(
+            config.upstream_policy,
+            config.api_client,
+            config.trust_risk_metadata,
+            config.allow_critical_calls,
+        ),
     };
     let transport = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
