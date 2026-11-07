@@ -446,6 +446,10 @@ impl Caddy {
             last_error: state.last_error.clone(),
         }
     }
+    /// Invalidate the locally remembered config after a unit restart.
+    pub async fn invalidate(&self) {
+        self.applied.lock().await.json = None;
+    }
     /// Restart only the configured unit and wait for its admin endpoint.
     pub async fn restart(&self) -> Result<(), NetError> {
         self.sd

@@ -139,6 +139,7 @@ pub struct CaddyApplier {
     pub render: RenderCtx,
     pub health: Arc<NetworkHealth>,
     manager: AsyncMutex<Option<(PathBuf, Arc<Caddy>)>>,
+    last_pid: AsyncMutex<Option<u32>>,
 }
 impl std::fmt::Debug for CaddyApplier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -169,10 +170,51 @@ impl CaddyApplier {
             render,
             health,
             manager: AsyncMutex::new(None),
+            last_pid: AsyncMutex::new(None),
+        }
+    }
+    /// Resolve the currently usable executable without starting it.
+    pub fn binary(&self) -> Option<PathBuf> {
+        resolve_caddy(&self.configured, &self.paths.dirs.data, &self.search_path)
+    }
+    /// Inspect the configured unit and invalidate the last config after a restart.
+    pub async fn check_health(&self) {
+        if self.binary().is_none() {
+            self.health.set_caddy_error(Some("caddy_missing".into()));
+            return;
+        }
+        let manager = self
+            .manager
+            .lock()
+            .await
+            .as_ref()
+            .map(|(_, manager)| manager.clone());
+        let Some(manager) = manager else { return };
+        let status = manager.status().await;
+        let mut last_pid = self.last_pid.lock().await;
+        if *last_pid != status.pid || !status.running || !status.admin_ok {
+            manager.invalidate().await;
+            *last_pid = status.pid;
+        }
+        if !status.running || !status.admin_ok {
+            self.health.set_caddy_error(Some(
+                status
+                    .last_error
+                    .unwrap_or_else(|| "Caddy unit or admin endpoint is unavailable".into()),
+            ));
+        }
+        if let Some(pid) = status.pid
+            && std::fs::read_link(format!("/proc/{pid}/exe"))
+                .is_ok_and(|path| path.to_string_lossy().ends_with(" (deleted)"))
+        {
+            if let Err(error) = manager.restart().await {
+                self.health.set_caddy_error(Some(error.to_string()));
+            }
+            *last_pid = None;
         }
     }
     async fn apply_plan(&self, plan: &RoutePlan) -> Result<(), String> {
-        let Some(binary) = resolve_caddy(&self.configured, &self.paths.dirs.data, &self.search_path) else {
+        let Some(binary) = self.binary() else {
             self.health.set_caddy_error(Some("caddy_missing".into()));
             // Absence must not block a project's lifecycle; the desired route is retained.
             return Ok(());

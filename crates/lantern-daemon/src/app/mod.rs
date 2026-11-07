@@ -230,7 +230,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         net_health.clone(),
     ));
     let router = Arc::new(NetRouter::new(
-        applier,
+        applier.clone(),
         settings.domains.tld.clone(),
         false,
         php_socket,
@@ -244,10 +244,22 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     let network_shutdown = shutdown.clone();
     let network_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
+        let mut binary_watch = tokio::time::interval(Duration::from_secs(1));
+        let mut previous_binary = applier.binary();
         loop {
             tokio::select! {
                 () = network_shutdown.cancelled() => break,
-                _ = interval.tick() => network_router.reconcile(),
+                _ = interval.tick() => {
+                    tokio::select! { () = network_shutdown.cancelled() => break, () = applier.check_health() => {} }
+                    network_router.reconcile();
+                },
+                _ = binary_watch.tick() => {
+                    let current = applier.binary();
+                    if current != previous_binary {
+                        previous_binary = current;
+                        network_router.reconcile();
+                    }
+                },
                 event = network_events.recv() => match event {
                     Ok(lantern_core::api::Event::InstanceUpdated { .. } | lantern_core::api::Event::InstanceRemoved { .. } | lantern_core::api::Event::ProjectUpdated { .. } | lantern_core::api::Event::ProjectRemoved { .. } | lantern_core::api::Event::ListenersChanged { .. }) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => network_router.replace_instances(network::registry_instances(&network_registry)),
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
