@@ -1,0 +1,6 @@
+description: All services and enabled projects
+services: [redis, postgres, mailpit]
+auto_start: ["*"]
+env: {}
+port_range: [29900, 29999]
+stop_others: false
