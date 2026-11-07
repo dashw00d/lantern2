@@ -1,0 +1,526 @@
+use std::collections::BTreeMap;
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use lantern_core::Timestamp;
+use lantern_core::api::OperationStatus;
+use lantern_core::detect::Detection;
+use lantern_core::ids::{InstanceId, ProjectId};
+use lantern_core::manifest::{self, ResolveInput, TemplateDefinition, TemplateLookup, raw::RawManifest};
+use lantern_core::model::{
+    Checkout, CheckoutKind, Instance, InstanceStatus, IssueCode, Project, ProjectKind, ProjectSource,
+    RuntimeState,
+};
+use lantern_core::settings::Settings;
+use lantern_daemon::discovery::{
+    PortBinding, Scanner, hide::HideSettings, matcher::CheckoutIndex, procinfo::ProcRoot,
+};
+use lantern_daemon::events::EventBus;
+use lantern_daemon::operations::OperationTracker;
+use lantern_daemon::runtime::seams::{
+    InstancePreparer, PortProbe, PrepareFuture, RuntimeStore, ScannerProbe, StoreError,
+};
+use lantern_daemon::runtime::systemd::{
+    Active, ExitCodeKind, FakeSystemd, Load, SystemctlBackend, UnitNames, UnitSnapshot, UserSystemd,
+};
+use lantern_daemon::runtime::{Runtime, RuntimeConfig, StartOpts, StopOpts};
+use tokio_util::sync::CancellationToken;
+
+static SEQ: AtomicU64 = AtomicU64::new(0);
+struct Temp(PathBuf);
+impl Temp {
+    fn new() -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "lantern-supervisor-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        Self(p)
+    }
+}
+impl Drop for Temp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+struct NoTemplates;
+impl TemplateLookup for NoTemplates {
+    fn get(&self, _: &str) -> Option<TemplateDefinition> {
+        None
+    }
+}
+
+#[derive(Default)]
+struct Store {
+    instances: Mutex<BTreeMap<InstanceId, Instance>>,
+    projects: Mutex<BTreeMap<ProjectId, Project>>,
+    leases: Mutex<BTreeMap<InstanceId, u16>>,
+    activated: Mutex<BTreeMap<InstanceId, bool>>,
+    changes: Mutex<Vec<(InstanceId, InstanceStatus)>>,
+}
+impl Store {
+    fn insert(&self, name: &str, root: &Path, cmd: &str, deps: &[&str]) -> InstanceId {
+        let id = ProjectId::parse(name).unwrap();
+        let iid = InstanceId::primary(&id);
+        let input = format!(
+            "id: {name}\ntype: proxy\nrun:\n  cmd: {cmd:?}\n{}",
+            if deps.is_empty() {
+                String::new()
+            } else {
+                format!("depends_on: [{}]\n", deps.join(", "))
+            }
+        );
+        let parsed = manifest::parse_manifest(&input, "lantern.yaml");
+        assert!(parsed.usable, "{:?}", parsed.diagnostics);
+        let resolved = manifest::resolve(ResolveInput {
+            dir_name: name,
+            is_primary: true,
+            primary: Some(&parsed),
+            checkout: None,
+            overrides: &RawManifest::default(),
+            templates: &NoTemplates,
+            detection: &Detection::default(),
+            settings: &Settings::default(),
+        });
+        assert!(resolved.usable, "{:?}", resolved.diagnostics);
+        let project = Project {
+            id: id.clone(),
+            aliases: vec![],
+            name: name.into(),
+            root: root.into(),
+            repo: None,
+            kind: ProjectKind::Project,
+            enabled: true,
+            tags: vec![],
+            registered_at: Timestamp::now(),
+            source: ProjectSource::Manual,
+        };
+        let instance = Instance {
+            id: iid.clone(),
+            project: id.clone(),
+            checkout: Checkout {
+                path: root.into(),
+                git_root: None,
+                kind: CheckoutKind::Primary,
+                branch: None,
+                head: None,
+                dirty: None,
+                locked: None,
+                missing: false,
+            },
+            domain: format!("{name}.test"),
+            manifest: Arc::new(resolved),
+            runtime: RuntimeState::default(),
+            pinned: false,
+            adopt: false,
+            setup_stale: false,
+        };
+        self.projects.lock().unwrap().insert(id, project);
+        self.instances.lock().unwrap().insert(iid.clone(), instance);
+        iid
+    }
+}
+impl RuntimeStore for Store {
+    fn instance(&self, id: &InstanceId) -> Result<Option<Instance>, StoreError> {
+        Ok(self.instances.lock().unwrap().get(id).cloned())
+    }
+    fn instances(&self) -> Result<Vec<Instance>, StoreError> {
+        Ok(self.instances.lock().unwrap().values().cloned().collect())
+    }
+    fn project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError> {
+        Ok(self.projects.lock().unwrap().get(id).cloned())
+    }
+    fn port_leases(&self) -> Result<BTreeMap<InstanceId, u16>, StoreError> {
+        Ok(self.leases.lock().unwrap().clone())
+    }
+    fn set_port_leases(&self, l: BTreeMap<InstanceId, u16>) -> Result<(), StoreError> {
+        *self.leases.lock().unwrap() = l;
+        Ok(())
+    }
+    fn update_runtime(
+        &self,
+        id: &InstanceId,
+        f: Box<dyn FnOnce(&mut RuntimeState) + Send>,
+    ) -> Result<(), StoreError> {
+        let mut map = self.instances.lock().unwrap();
+        let i = map.get_mut(id).ok_or_else(|| StoreError("missing".into()))?;
+        let before = i.runtime.status;
+        f(&mut i.runtime);
+        if i.runtime.status != before {
+            self.changes.lock().unwrap().push((id.clone(), i.runtime.status));
+        }
+        Ok(())
+    }
+    fn activated(&self, id: &InstanceId) -> Result<bool, StoreError> {
+        Ok(self.activated.lock().unwrap().get(id).copied().unwrap_or(false))
+    }
+    fn set_activated(&self, id: &InstanceId, v: bool) -> Result<(), StoreError> {
+        self.activated.lock().unwrap().insert(id.clone(), v);
+        Ok(())
+    }
+    fn record_started(&self, _: &InstanceId) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn resolve_dependency(&self, name: &str) -> Result<Option<InstanceId>, StoreError> {
+        Ok(ProjectId::parse(name)
+            .ok()
+            .map(|p| InstanceId::primary(&p))
+            .filter(|i| self.instances.lock().unwrap().contains_key(i)))
+    }
+}
+#[derive(Clone, Copy)]
+enum ProbeMode {
+    Ready,
+    Waiting,
+    Wrong,
+}
+struct FakeProbe(Mutex<ProbeMode>);
+impl PortProbe for FakeProbe {
+    fn port_binding(&self, port: u16, unit: Option<&str>) -> io::Result<PortBinding> {
+        Ok(match (unit, *self.0.lock().unwrap()) {
+            (Some(_), ProbeMode::Ready) => PortBinding::BoundByUnit {
+                pid: 1234,
+                addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))],
+            },
+            _ => PortBinding::Free,
+        })
+    }
+    fn unit_listeners(&self, _: &str) -> io::Result<Vec<SocketAddr>> {
+        Ok(if matches!(*self.0.lock().unwrap(), ProbeMode::Wrong) {
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 39198))]
+        } else {
+            vec![]
+        })
+    }
+}
+struct HungPrepare;
+impl InstancePreparer for HungPrepare {
+    fn ensure_ready<'a>(
+        &'a self,
+        _: &'a Instance,
+        _: Option<u16>,
+        cancel: CancellationToken,
+    ) -> PrepareFuture<'a> {
+        Box::pin(async move {
+            cancel.cancelled().await;
+            Err("cancelled".into())
+        })
+    }
+}
+fn config(temp: &Temp) -> RuntimeConfig {
+    let mut settings = Settings::default();
+    settings.ports.range_start = 39100;
+    settings.ports.range_end = 39190;
+    settings.runtime.startup_timeout_secs = 5;
+    settings.runtime.stop_timeout_secs = 1;
+    settings.runtime.backoff_base_secs = 0;
+    settings.runtime.backoff_cap_secs = 0;
+    settings.runtime.max_retries = 2;
+    settings.health.interval_secs = 60;
+    RuntimeConfig {
+        settings,
+        run_dir: temp.0.join("run"),
+        shell_env_file: temp.0.join("cache/env.sh"),
+        home: temp.0.clone(),
+        names: UnitNames {
+            instance_prefix: "lantern-test-supervisor-inst-".into(),
+            operation_prefix: "lantern-test-supervisor-op-".into(),
+            slice: "app-lantern-test.slice".into(),
+        },
+        poll_interval: Duration::from_millis(20),
+        readiness_interval: Duration::from_millis(20),
+        mismatch_after: Duration::from_millis(60),
+    }
+}
+fn runtime(
+    config: RuntimeConfig,
+    store: Arc<Store>,
+    probe: Arc<dyn PortProbe>,
+    backend: Arc<dyn UserSystemd>,
+) -> Runtime {
+    Runtime::new(
+        config,
+        store,
+        probe,
+        backend,
+        OperationTracker::new(EventBus::new()),
+    )
+}
+async fn wait_state(
+    rt: &Runtime,
+    id: &InstanceId,
+    predicate: impl Fn(&RuntimeState) -> bool,
+) -> RuntimeState {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let state = rt.state(id).unwrap();
+        if predicate(&state) {
+            return state;
+        }
+        assert!(Instant::now() < deadline, "timed out in state {state:?}");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+async fn completed(op: &lantern_daemon::runtime::RuntimeOperation) -> OperationStatus {
+    op.wait(Duration::from_secs(8)).await.unwrap().status
+}
+fn running_snapshot(unit: &str) -> UnitSnapshot {
+    UnitSnapshot {
+        unit: unit.into(),
+        load: Load::Loaded,
+        active: Active::Active,
+        sub: "running".into(),
+        result: "success".into(),
+        main_pid: Some(1234),
+        exit_code: None,
+        exit_kind: ExitCodeKind::Unknown,
+        started_at: Some(Timestamp::now()),
+        invocation_id: None,
+        cgroup: None,
+    }
+}
+fn exit_snapshot(unit: &str, code: i32) -> UnitSnapshot {
+    UnitSnapshot {
+        active: Active::Failed,
+        sub: "failed".into(),
+        result: "exit-code".into(),
+        main_pid: None,
+        exit_code: Some(code),
+        exit_kind: ExitCodeKind::Exited,
+        ..running_snapshot(unit)
+    }
+}
+
+#[tokio::test]
+async fn runtime_start_stop_and_dependency_order() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let db = store.insert("db", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let app = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &["db"]);
+    let fake = Arc::new(FakeSystemd::default());
+    fake.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store.clone(),
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        fake.clone(),
+    );
+    let op = rt.start(&app, StartOpts).await.unwrap();
+    assert_eq!(completed(&op).await, OperationStatus::Succeeded);
+    assert_eq!(rt.state(&db).unwrap().status, InstanceStatus::Running);
+    assert_eq!(rt.state(&app).unwrap().status, InstanceStatus::Running);
+    let calls = fake.calls();
+    let a = calls
+        .iter()
+        .position(|s| s == "start lantern-test-supervisor-inst-db.service")
+        .unwrap();
+    let b = calls
+        .iter()
+        .position(|s| s == "start lantern-test-supervisor-inst-app.service")
+        .unwrap();
+    assert!(a < b, "{calls:?}");
+    let app_port = rt.state(&app).unwrap().port;
+    let stop = rt.stop(&app, StopOpts::default()).await.unwrap();
+    assert_eq!(completed(&stop).await, OperationStatus::Succeeded);
+    assert_eq!(rt.state(&app).unwrap().status, InstanceStatus::Stopped);
+    assert_eq!(rt.state(&app).unwrap().port, app_port);
+    assert_eq!(rt.state(&db).unwrap().status, InstanceStatus::Running);
+    let all = rt.stop_all().await.unwrap();
+    assert_eq!(completed(&all).await, OperationStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn runtime_stop_preempts_hung_start_and_identical_requests_join() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let fake = Arc::new(FakeSystemd::default());
+    let rt = Runtime::with_preparer(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        fake.clone(),
+        OperationTracker::new(EventBus::new()),
+        Arc::new(HungPrepare),
+    );
+    let start = rt.start(&id, StartOpts).await.unwrap();
+    wait_state(&rt, &id, |s| s.status == InstanceStatus::Preparing).await;
+    let joined = rt.start(&id, StartOpts).await.unwrap();
+    assert_eq!(start.id, joined.id);
+    assert!(rt.restart(&id).await.is_err());
+    let stop = rt.stop(&id, StopOpts::default()).await.unwrap();
+    assert_eq!(completed(&stop).await, OperationStatus::Succeeded);
+    assert_eq!(completed(&start).await, OperationStatus::Cancelled);
+    assert_eq!(rt.state(&id).unwrap().status, InstanceStatus::Stopped);
+    assert!(!fake.calls().iter().any(|s| s.starts_with("start ")));
+}
+
+#[tokio::test]
+async fn runtime_port_mismatch_stops_the_unit() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let fake = Arc::new(FakeSystemd::default());
+    fake.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Wrong))),
+        fake.clone(),
+    );
+    let op = rt.start(&id, StartOpts).await.unwrap();
+    assert_eq!(completed(&op).await, OperationStatus::Failed);
+    let s = rt.state(&id).unwrap();
+    assert_eq!(s.status, InstanceStatus::NeedsConfig);
+    assert_eq!(s.issue.unwrap().code, IssueCode::PortMismatch);
+    assert!(fake.calls().iter().any(|s| s.starts_with("stop ")));
+}
+
+#[tokio::test]
+async fn runtime_crash_retries_and_stops_at_crash_loop() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let fake = Arc::new(FakeSystemd::default());
+    fake.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        fake.clone(),
+    );
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    let unit = "lantern-test-supervisor-inst-app.service";
+    for restart in 0..=2 {
+        fake.set_snapshot(exit_snapshot(unit, 1));
+        if restart < 2 {
+            wait_state(&rt, &id, |s| {
+                s.status == InstanceStatus::Running && s.restarts == restart + 1
+            })
+            .await;
+        }
+    }
+    let s = wait_state(&rt, &id, |s| {
+        s.status == InstanceStatus::Crashed
+            && s.issue.as_ref().is_some_and(|i| i.code == IssueCode::CrashLoop)
+    })
+    .await;
+    assert_eq!(s.restarts, 2);
+    assert_eq!(fake.calls().iter().filter(|c| c.starts_with("start ")).count(), 3);
+}
+
+#[tokio::test]
+async fn runtime_deterministic_exits_are_not_retried() {
+    for code in [78, 126, 127] {
+        let temp = Temp::new();
+        let store = Arc::new(Store::default());
+        let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+        let fake = Arc::new(FakeSystemd::default());
+        fake.set_auto_start(true);
+        let rt = runtime(
+            config(&temp),
+            store,
+            Arc::new(FakeProbe(Mutex::new(ProbeMode::Waiting))),
+            fake.clone(),
+        );
+        let op = rt.start(&id, StartOpts).await.unwrap();
+        wait_state(&rt, &id, |s| s.unit.is_some()).await;
+        fake.set_snapshot(exit_snapshot("lantern-test-supervisor-inst-app.service", code));
+        assert_eq!(completed(&op).await, OperationStatus::Failed);
+        let s = wait_state(&rt, &id, |s| s.status == InstanceStatus::Crashed).await;
+        assert_eq!(
+            s.issue.unwrap().code,
+            if code == 78 {
+                IssueCode::ToolchainMissing
+            } else {
+                IssueCode::CommandNotFound
+            }
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(fake.calls().iter().filter(|s| s.starts_with("start ")).count(), 1);
+    }
+}
+
+struct RealGuard {
+    unit: String,
+}
+impl Drop for RealGuard {
+    fn drop(&mut self) {
+        for action in ["stop", "reset-failed"] {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", action, "--", &self.unit])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "real system: creates a dedicated transient test unit in app-lantern-test.slice"]
+async fn runtime_real_systemd_discovery_logs_and_stop() {
+    use tokio::io::AsyncWriteExt;
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert(
+        "e2e",
+        &temp.0,
+        "python3 -m http.server ${PORT} --bind 127.0.0.1",
+        &[],
+    );
+    let cfg = config(&temp);
+    let unit = cfg.names.instance(&id);
+    let _guard = RealGuard { unit: unit.clone() };
+    let scanner = Scanner::new(
+        ProcRoot::default(),
+        CheckoutIndex::new([], temp.0.clone()),
+        HideSettings::default(),
+    );
+    let rt = runtime(
+        cfg,
+        store,
+        Arc::new(ScannerProbe::new(scanner)),
+        Arc::new(SystemctlBackend),
+    );
+    let (_, mut lines) = rt.subscribe_logs(&id, 0);
+    let op = rt.start(&id, StartOpts).await.unwrap();
+    let result = op.wait(Duration::from_secs(25)).await.unwrap();
+    assert_eq!(result.status, OperationStatus::Succeeded, "{result:?}");
+    let state = rt.state(&id).unwrap();
+    assert_eq!(state.status, InstanceStatus::Running);
+    let port = state.port.unwrap();
+    assert!((39100..=39199).contains(&port));
+    let mut socket = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    socket.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+    let line = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let l = lines.recv().await.unwrap();
+            if l.line.contains("GET /") {
+                break l;
+            }
+        }
+    })
+    .await
+    .expect("journal follower did not deliver HTTP access log");
+    assert_eq!(line.instance, id);
+    let stop = rt.stop(&id, StopOpts::default()).await.unwrap();
+    assert_eq!(completed(&stop).await, OperationStatus::Succeeded);
+    let rows = SystemctlBackend.poll(&[unit]).await.unwrap();
+    assert!(
+        rows.is_empty()
+            || rows
+                .iter()
+                .all(|r| r.load == Load::NotFound || r.active == Active::Inactive)
+    );
+}

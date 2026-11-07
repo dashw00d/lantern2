@@ -521,9 +521,15 @@ impl UserSystemd for SystemctlBackend {
 pub struct FakeSystemd {
     snapshots: Mutex<BTreeMap<String, UnitSnapshot>>,
     calls: Mutex<Vec<String>>,
+    auto_start: std::sync::atomic::AtomicBool,
 }
 
 impl FakeSystemd {
+    /// Have subsequent starts automatically install an active running snapshot.
+    pub fn set_auto_start(&self, enabled: bool) {
+        self.auto_start
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
     /// Set or replace a snapshot returned by future polls.
     pub fn set_snapshot(&self, snapshot: UnitSnapshot) {
         self.snapshots
@@ -545,6 +551,22 @@ impl UserSystemd for FakeSystemd {
         Box::pin(async move {
             start_args(spec)?;
             self.record(format!("start {}", spec.unit));
+            if self.auto_start.load(std::sync::atomic::Ordering::SeqCst) {
+                let snapshot = UnitSnapshot {
+                    unit: spec.unit.clone(),
+                    load: Load::Loaded,
+                    active: Active::Active,
+                    sub: "running".into(),
+                    result: "success".into(),
+                    main_pid: Some(1234),
+                    exit_code: None,
+                    exit_kind: ExitCodeKind::Unknown,
+                    started_at: Some(Timestamp::now()),
+                    invocation_id: None,
+                    cgroup: None,
+                };
+                self.set_snapshot(snapshot);
+            }
             Ok(())
         })
     }

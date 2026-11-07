@@ -674,9 +674,21 @@ impl Runtime {
         let mut prepared = instance.clone();
         prepared.runtime.port = port;
         handle.step("prepare");
-        tokio::select! {
-            () = token.cancelled() => return Err(Fault::new("cancelled", IssueCode::Other, "cancelled")),
-            result = self.inner.preparer.ensure_ready(&prepared, port, token.clone()) => result.map_err(|e| Fault::new("setup_failed", IssueCode::SetupFailed, e))?,
+        {
+            // A preparer must observe cancellation and clean up child one-shots before Stop proceeds.
+            let _guard = actor.io_lock.lock().await;
+            let prepare = self.inner.preparer.ensure_ready(&prepared, port, token.clone());
+            tokio::pin!(prepare);
+            tokio::select! {
+                () = token.cancelled() => {
+                    let limit = Duration::from_secs(self.inner.config.settings.runtime.stop_timeout_secs.saturating_add(15));
+                    if tokio::time::timeout(limit, &mut prepare).await.is_err() {
+                        tracing::error!(%id, "preparer failed to finish cancellation cleanup");
+                    }
+                    return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
+                }
+                result = &mut prepare => result.map_err(|e| Fault::new("setup_failed", IssueCode::SetupFailed, e))?,
+            }
         }
         if token.is_cancelled() {
             return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
@@ -706,6 +718,12 @@ impl Runtime {
         let command = command.expect("checked above");
         let is_deploy = m.deploy.start.is_some();
         let (launch, unit) = self.launch(&instance, port.unwrap_or(0), command.render_shell(), is_deploy)?;
+        // A retry must not consume an exit observation from the previous invocation.
+        self.update(id, actor, generation, |r| {
+            r.unit = None;
+            r.next_retry_at = None;
+        });
+        actor.snapshot.send_replace(None);
         self.event(
             id,
             actor,
@@ -1882,7 +1900,8 @@ async fn poll_loop(weak: Weak<Inner>) {
         };
         let delay = inner.config.poll_interval;
         let instances = inner.store.instances().unwrap_or_default();
-        let names: Vec<_> = instances
+        let rt = Runtime { inner: inner.clone() };
+        let targets: Vec<_> = instances
             .iter()
             .filter(|i| {
                 matches!(
@@ -1890,27 +1909,33 @@ async fn poll_loop(weak: Weak<Inner>) {
                     InstanceStatus::Starting | InstanceStatus::Running | InstanceStatus::Unhealthy
                 )
             })
-            .filter_map(|i| i.runtime.unit.clone())
+            .filter_map(|i| {
+                let unit = i.runtime.unit.clone()?;
+                let actor = rt.actor(i);
+                let generation = actor.state.lock().unwrap().generation;
+                Some((unit, i.id.clone(), actor, generation))
+            })
             .collect();
+        let names: Vec<_> = targets.iter().map(|(unit, _, _, _)| unit.clone()).collect();
         if !names.is_empty() {
             match inner.backend.poll(&names).await {
                 Ok(rows) => {
-                    let rt = Runtime { inner: inner.clone() };
                     for row in rows {
-                        if let Some(instance) = instances
-                            .iter()
-                            .find(|i| i.runtime.unit.as_deref() == Some(row.unit.as_str()))
+                        if let Some((_, id, actor, generation)) =
+                            targets.iter().find(|(unit, _, _, _)| *unit == row.unit)
                         {
-                            let actor = rt.actor(instance);
-                            actor.snapshot.send_replace(Some(row.clone()));
+                            let status = {
+                                let guard = actor.state.lock().unwrap();
+                                if guard.generation != *generation {
+                                    continue;
+                                }
+                                actor.snapshot.send_replace(Some(row.clone()));
+                                guard.supervisor.status
+                            };
                             if exited(&row)
-                                && matches!(
-                                    instance.runtime.status,
-                                    InstanceStatus::Running | InstanceStatus::Unhealthy
-                                )
+                                && matches!(status, InstanceStatus::Running | InstanceStatus::Unhealthy)
                             {
-                                let generation = actor.state.lock().unwrap().generation;
-                                rt.handle_exit(&instance.id, &actor, generation, &row, false);
+                                rt.handle_exit(id, actor, *generation, &row, false);
                             }
                         }
                     }
@@ -1918,6 +1943,7 @@ async fn poll_loop(weak: Weak<Inner>) {
                 Err(e) => tracing::warn!(%e,"systemd poll failed"),
             }
         }
+        drop(rt);
         let shutdown = inner.shutdown.clone();
         drop(inner);
         tokio::select! { ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(delay)=>{} }
