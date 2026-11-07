@@ -131,12 +131,15 @@ impl InstanceService {
                 other.common_dir == pr.common_dir
                     && strip_subpath(&r.checkout.path, &other.subpath).is_ok_and(|x| x == root)
             }) {
+                if r.checkout.kind != CheckoutKind::Managed && !blockers.contains(&Blocker::NotManaged) {
+                    blockers.push(Blocker::NotManaged);
+                }
                 materialized.extend(r.checkout.materialized);
                 let status = self.store.status(&sibling).map_err(InstanceError::Adapter)?;
-                if !matches!(status, InstanceStatus::Stopped | InstanceStatus::NeedsConfig) {
-                    if !blockers.contains(&Blocker::Running) {
-                        blockers.push(Blocker::Running);
-                    }
+                if !matches!(status, InstanceStatus::Stopped | InstanceStatus::NeedsConfig)
+                    && !blockers.contains(&Blocker::Running)
+                {
+                    blockers.push(Blocker::Running);
                 }
             }
         }
@@ -157,9 +160,7 @@ impl InstanceService {
             dirty = status
                 .changed
                 .into_iter()
-                .filter(|c| {
-                    c.kind != '?' || !materialized.iter().any(|p| c.path == *p || c.path.starts_with(p))
-                })
+                .filter(|c| c.kind != '?' || !materialized.contains(&c.path))
                 .collect();
             if in_progress(&root)? {
                 dirty.push(ChangedPath {
@@ -188,9 +189,43 @@ impl InstanceService {
             unpushed,
             orphaned,
             has_submodules,
-            worktree_env: BTreeMap::new(),
+            worktree_env: self.removal_environment(id, &record, &p, observation.as_ref())?,
             branch,
         })
+    }
+    fn removal_environment(
+        &self,
+        id: &InstanceId,
+        record: &lantern_core::state::InstanceRecord,
+        p: &super::ProjectConfig,
+        obs: Option<&super::CheckoutObservation>,
+    ) -> Result<BTreeMap<String, String>, InstanceError> {
+        if record.checkout.kind == CheckoutKind::Primary {
+            return Ok(BTreeMap::new());
+        }
+        let manifest = self.store.manifest(id).map_err(InstanceError::Adapter)?;
+        let domain = lantern_core::ids::instance_domain(&p.primary_domain, id.slug());
+        let branch = obs
+            .and_then(|o| o.worktree.branch.clone())
+            .or_else(|| obs.and_then(|o| o.worktree.head.as_deref().map(lantern_core::ids::detached_slug)));
+        let context = lantern_core::template::VarContext {
+            port: self.store.port(id).map_err(InstanceError::Adapter)?.unwrap_or(0),
+            host: "127.0.0.1".parse().expect("loopback"),
+            url: format!("https://{domain}"),
+            domain,
+            project: p.project.id.clone(),
+            instance: id.clone(),
+            branch,
+            branch_slug: id.slug().map(str::to_owned),
+            checkout: record.checkout.path.clone(),
+            primary: p.project.root.clone(),
+        };
+        Ok(manifest
+            .worktree
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.render_data(&context)))
+            .collect())
     }
     /// Remove a verified managed checkout or only unpin a user-made worktree.
     pub async fn remove_checkout(
@@ -313,10 +348,10 @@ impl InstanceService {
                 }
             };
             if let Some(reason) = reason {
-                let action = if reason == GcReason::Missing {
-                    GcAction::ForgetMissing
-                } else if r.checkout.kind == CheckoutKind::Worktree {
+                let action = if r.checkout.kind == CheckoutKind::Worktree {
                     GcAction::Unpin
+                } else if reason == GcReason::Missing {
+                    GcAction::ForgetMissing
                 } else {
                     GcAction::Remove
                 };

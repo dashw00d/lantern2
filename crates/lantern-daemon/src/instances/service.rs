@@ -120,6 +120,7 @@ pub struct InstanceService {
     pub(crate) setup_slots: Semaphore,
     pub(crate) mutation: Mutex<()>,
     observations: StdMutex<HashMap<InstanceId, CheckoutObservation>>,
+    prepare_locks: StdMutex<HashMap<InstanceId, Arc<Mutex<()>>>>,
     refresh: StdMutex<HashMap<PathBuf, RefreshState>>,
 }
 impl std::fmt::Debug for InstanceService {
@@ -149,6 +150,7 @@ impl InstanceService {
             setup_slots: Semaphore::new(max_concurrent_setups.max(1)),
             mutation: Mutex::new(()),
             observations: StdMutex::new(HashMap::new()),
+            prepare_locks: StdMutex::new(HashMap::new()),
             refresh: StdMutex::new(HashMap::new()),
         }
     }
@@ -183,26 +185,27 @@ impl InstanceService {
     }
     /// Poll fingerprint and refresh on change, on force, or every twelfth tick.
     pub async fn tick(&self, common_dir: &Path, force: bool) -> Result<bool, InstanceError> {
-        let known: Vec<PathBuf> = self
-            .observations
-            .lock()
-            .expect("observations lock")
-            .values()
-            .filter_map(|o| {
-                let r = std::fs::canonicalize(o.worktree.path.join(".git")).ok()?;
-                if r.starts_with(common_dir) {
-                    Some(o.worktree.path.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut known = Vec::new();
+        for (_, record) in self.store.records().map_err(InstanceError::Adapter)? {
+            if let Some(project) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+                && let Some(repo) = project.project.repo.as_ref()
+                && repo.common_dir == common_dir
+                && let Ok(root) = strip_subpath(&record.checkout.path, &repo.subpath)
+            {
+                known.push(root);
+            }
+        }
+        known.sort();
+        known.dedup();
         let fp = self.git.repo(common_dir.to_path_buf()).fingerprint(&known);
         let should = {
             let mut all = self.refresh.lock().expect("refresh lock");
             let state = all.entry(common_dir.to_path_buf()).or_default();
             state.ticks += 1;
-            force || fp.is_none() || state.fp != fp || state.ticks % 12 == 0
+            force || fp.is_none() || state.fp != fp || state.ticks.is_multiple_of(12)
         };
         if should {
             self.refresh_repo(common_dir).await?;
@@ -226,6 +229,24 @@ impl InstanceService {
             .projects_in_repo(common)
             .map_err(InstanceError::Adapter)?;
         projects.sort_by(|a, b| a.project.id.cmp(&b.project.id));
+        // Only a persisted Lantern-created record proves management; directory location alone
+        // cannot justify deleting a user-created worktree. Sibling projects share that provenance.
+        let mut managed_roots = HashSet::new();
+        for (_, record) in self.store.records().map_err(InstanceError::Adapter)? {
+            if record.checkout.kind != CheckoutKind::Managed {
+                continue;
+            }
+            if let Some(project) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+                && let Some(repo) = project.project.repo.as_ref()
+                && repo.common_dir == common
+                && let Ok(root) = strip_subpath(&record.checkout.path, &repo.subpath)
+            {
+                managed_roots.insert(root);
+            }
+        }
         let mut observed = HashSet::new();
         let mut trees = trees;
         trees.sort_by(|a, b| a.path.cmp(&b.path));
@@ -249,7 +270,13 @@ impl InstanceService {
                     existing
                         .as_ref()
                         .map(|(_, r)| r.checkout.kind)
-                        .unwrap_or(CheckoutKind::Worktree)
+                        .unwrap_or_else(|| {
+                            if managed_roots.contains(&wt.path) {
+                                CheckoutKind::Managed
+                            } else {
+                                CheckoutKind::Worktree
+                            }
+                        })
                 };
                 let desired = if kind == CheckoutKind::Primary {
                     None
@@ -267,6 +294,7 @@ impl InstanceService {
                         let (new, revived) =
                             self.allocate(&p, desired.as_deref().unwrap_or("checkout"), Some(&id), false)?;
                         if new != id {
+                            self.observations.lock().expect("observations lock").remove(&id);
                             if revived.is_some() {
                                 self.store.remove(&id).map_err(InstanceError::Adapter)?;
                             } else {
@@ -375,11 +403,11 @@ impl InstanceService {
                 if Some(other) == exclude || *other == id || r.checkout.missing_since.is_some() {
                     continue;
                 }
-                if let Some(op) = self.store.project(&r.project).map_err(InstanceError::Adapter)? {
-                    if instance_domain(&op.primary_domain, other.slug()) == domain {
-                        occupied = true;
-                        break;
-                    }
+                if let Some(op) = self.store.project(&r.project).map_err(InstanceError::Adapter)?
+                    && instance_domain(&op.primary_domain, other.slug()) == domain
+                {
+                    occupied = true;
+                    break;
                 }
             }
             if occupied || (managed && self.worktrees_dir.join(&p.repo_slug).join(&slug).exists()) {
@@ -576,6 +604,21 @@ impl InstanceService {
         };
         let (id, revived) = self.allocate(&p, &desired, None, true)?;
         let slug = id.slug().expect("derived id");
+        if Path::new(&p.repo_slug).components().count() != 1
+            || !matches!(
+                Path::new(&p.repo_slug).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(InstanceError::UnsafePath("invalid repository slug".into()));
+        }
+        if pr
+            .subpath
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(InstanceError::UnsafePath("invalid project subpath".into()));
+        }
         let root = self.worktrees_dir.join(&p.repo_slug).join(slug);
         let project_path = root.join(&pr.subpath);
         let mut record = revived.unwrap_or_else(|| {
@@ -645,7 +688,28 @@ impl InstanceService {
         if cancel.is_cancelled() {
             return Err(InstanceError::Cancelled);
         }
+        let lock = {
+            self.prepare_locks
+                .lock()
+                .expect("prepare locks")
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _prepare_guard = tokio::select! {
+            _ = cancel.cancelled() => return Err(InstanceError::Cancelled),
+            guard = lock.lock() => guard,
+        };
         let mut record = self.record(id)?;
+        if let Some(repo) = self.project(&record.project)?.project.repo {
+            self.refresh_repo(&repo.common_dir).await?;
+            record = self.record(id)?;
+        }
+        if record.checkout.phase == CheckoutPhase::Creating {
+            return Err(InstanceError::Refused(
+                "interrupted worktree creation needs recovery".into(),
+            ));
+        }
         let p = self.project(&record.project)?;
         let pr = p.project.repo.as_ref();
         let root = if let Some(pr) = pr {
@@ -655,6 +719,15 @@ impl InstanceService {
         };
         if !record.checkout.path.is_dir() {
             return Err(InstanceError::Refused("checkout_missing".into()));
+        }
+        if let Some(pr) = pr
+            && root.join(".gitmodules").exists()
+        {
+            let repo = self.git.repo(pr.common_dir.clone());
+            if repo.submodules_need_init(&root).await? {
+                op.step("Initializing submodules");
+                repo.submodule_init(&root, &cancel).await?;
+            }
         }
         op.step("Reading manifest");
         let manifest = self.store.manifest(id).map_err(InstanceError::Adapter)?;
@@ -759,7 +832,7 @@ impl InstanceService {
         if record.checkout.kind != CheckoutKind::Primary {
             let primary_root = pr.map(|r| r.git_root.as_path()).unwrap_or(&p.project.root);
             op.step("Copying files");
-            let copied = files::materialize(
+            let (copied, copy_result) = files::materialize(
                 primary_root,
                 &p.project.root,
                 &root,
@@ -767,15 +840,16 @@ impl InstanceService {
                 &manifest.worktree.copy,
                 false,
                 &cancel,
-            )?;
+            );
             record.checkout.materialized.extend(copied);
             record.checkout.materialized.sort();
             record.checkout.materialized.dedup();
             self.store
                 .upsert(id, record.clone())
                 .map_err(InstanceError::Adapter)?;
+            copy_result?;
             op.step("Linking files");
-            let linked = files::materialize(
+            let (linked, link_result) = files::materialize(
                 primary_root,
                 &p.project.root,
                 &root,
@@ -783,13 +857,14 @@ impl InstanceService {
                 &manifest.worktree.link,
                 true,
                 &cancel,
-            )?;
+            );
             record.checkout.materialized.extend(linked);
             record.checkout.materialized.sort();
             record.checkout.materialized.dedup();
             self.store
                 .upsert(id, record.clone())
                 .map_err(InstanceError::Adapter)?;
+            link_result?;
         }
         if !commands.is_empty() {
             op.step("Waiting for a free setup slot");

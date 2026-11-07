@@ -28,9 +28,16 @@ pub enum GitError {
     /// Ref is not safe or valid.
     #[error("invalid ref: {0}")]
     InvalidRef(String),
-    /// Git returned nonzero, retaining its diagnostic.
-    #[error("git failed ({code:?}): {stderr}")]
-    Command { code: Option<i32>, stderr: String },
+    /// Git rejected a branch name, preserving its diagnostic.
+    #[error("invalid branch {name}: {stderr}")]
+    InvalidBranch { name: String, stderr: String },
+    /// Git returned nonzero, retaining its diagnostic and classified failure.
+    #[error("git failed ({code:?}, {kind:?}): {stderr}")]
+    Command {
+        code: Option<i32>,
+        stderr: String,
+        kind: GitFailureKind,
+    },
     /// Output is malformed.
     #[error("invalid git output: {0}")]
     Parse(String),
@@ -40,6 +47,41 @@ pub enum GitError {
     /// Operation was cancelled.
     #[error("git cancelled")]
     Cancelled,
+}
+
+/// Best-effort classification of a nonzero git command; stderr remains authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitFailureKind {
+    /// Branch is already checked out in another worktree.
+    BranchCheckedOut,
+    /// Branch already exists.
+    BranchExists,
+    /// Destination path already exists.
+    PathExists,
+    /// Git reports a locked worktree.
+    Locked,
+    /// Ref does not resolve.
+    RefNotFound,
+    /// Unclassified error.
+    Other,
+}
+fn classify_failure(stderr: &str) -> GitFailureKind {
+    if stderr.contains("is already used by worktree") || stderr.contains("is already checked out at") {
+        GitFailureKind::BranchCheckedOut
+    } else if stderr.contains("branch named") && stderr.contains("already exists") {
+        GitFailureKind::BranchExists
+    } else if stderr.contains("already exists") {
+        GitFailureKind::PathExists
+    } else if stderr.contains("is locked") {
+        GitFailureKind::Locked
+    } else if stderr.contains("invalid reference")
+        || stderr.contains("not a valid object name")
+        || stderr.contains("Needed a single revision")
+    {
+        GitFailureKind::RefNotFound
+    } else {
+        GitFailureKind::Other
+    }
 }
 
 /// Git executable and detected version.
@@ -321,9 +363,11 @@ impl Git {
                 .map_err(|_| GitError::Timeout)??
         };
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             return Err(GitError::Command {
                 code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                kind: classify_failure(&stderr),
+                stderr,
             });
         }
         Ok(output.stdout)
@@ -497,7 +541,10 @@ impl RepoHandle {
         .await
         .map(|_| ())
         .map_err(|e| match e {
-            GitError::Command { .. } => GitError::InvalidRef(name.into()),
+            GitError::Command { stderr, .. } => GitError::InvalidBranch {
+                name: name.into(),
+                stderr,
+            },
             other => other,
         })
     }
@@ -584,7 +631,7 @@ impl RepoHandle {
                         "--porcelain=v2".into(),
                         "--branch".into(),
                         "-z".into(),
-                        "--untracked-files=normal".into(),
+                        "--untracked-files=all".into(),
                     ],
                     READ_TIMEOUT,
                     None,
@@ -677,7 +724,7 @@ impl RepoHandle {
         let target = match mode {
             AddMode::ExistingLocal(name) => {
                 self.validate_branch(name).await?;
-                format!("refs/heads/{name}")
+                name.clone()
             }
             AddMode::TrackRemote { remote, branch } => {
                 self.validate_branch(branch).await?;
@@ -738,6 +785,20 @@ impl RepoHandle {
         let mut a: Vec<OsString> = vec!["worktree".into(), "repair".into(), "--".into()];
         a.extend(paths.iter().map(|p| p.as_os_str().to_owned()));
         self.run(a, WRITE_TIMEOUT, None, false).await.map(|_| ())
+    }
+    /// Determine whether any recorded submodule is uninitialized.
+    pub async fn submodules_need_init(&self, root: &Path) -> Result<bool, GitError> {
+        let raw = self
+            .git
+            .run(
+                Some(root),
+                &["submodule".into(), "status".into(), "--recursive".into()],
+                READ_TIMEOUT,
+                None,
+                true,
+            )
+            .await?;
+        Ok(raw.split(|b| *b == b'\n').any(|line| line.first() == Some(&b'-')))
     }
     /// Initialize submodules in a checkout.
     pub async fn submodule_init(&self, root: &Path, cancel: &CancellationToken) -> Result<(), GitError> {
