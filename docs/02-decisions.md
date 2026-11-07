@@ -348,6 +348,24 @@ case**, and the code follows it:
 - `ResolvedRun` gains `pre_start`, `post_stop` and `startup_timeout` (10 §3.2). Until then the
   runtime treats them as absent.
 
+**Found in wave 5** (the code follows these):
+- **D14 is confirmed by the owner (2026-11-06): sysctl** `net.ipv4.ip_unprivileged_port_start=80`,
+  written to `/etc/sysctl.d/` by `sudo lantern init --system-steps` and applied live. `doctor`'s
+  `ports.bind` passes when the live threshold is ≤ min(http, https) or the selected Caddy has
+  `cap_net_bind_service=ep`. `--ports=setcap` applies only to a root-owned
+  `/usr/lib/lantern/caddy` that is also the configured `[caddy].binary`; it never grants the
+  capability to a user-writable file. Packaging (M6) decides whether to set that default.
+- Caddy resolution order: `[caddy].binary` → `$LANTERN_DATA_DIR/bin/caddy` → `PATH`. `--dev`
+  defaults `LANTERN_DATA_DIR` to `~/.local/share/lantern-dev`, with no extra `data/` component.
+- Spike S5 partly passed with upstream Caddy 2.11.9: HTTPS for `<project>.<tld>` and
+  `feature-x.<project>.<tld>` verifies against the name-constrained Lantern CA alone, a
+  WebSocket survives `POST /load`, and Caddy recovers its routes after SIGKILL. The browser
+  (Firefox Snap, Chrome) and Vite HMR parts of S5 are still unverified.
+- `session.systemd` is the user manager's health (`running` = ok, `degraded` = warn).
+  Whether `lantern.service` is enabled is a separate check, `session.unit`.
+- Spike S1's API checks are done: iced 0.14 `daemon`, ksni 0.3.7 and zbus 5.19 single
+  instance build and run headless. The Plasma hands-on part and the budgets are still open.
+
 **v1's self-registered `lantern` project:** parsing accepts `id: lantern`, so v1 manifests still
 load (C5). Resolution reports `reserved_id` and the project is not usable. `migrate-v1` **skips
 it with a note**, because self-registration was dropped (15 §3.10).
