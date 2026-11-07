@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 lantern-core = { workspace = true }
 lantern-cli = { workspace = true }
+lantern-gui = { workspace = true }
 lantern-daemon = { workspace = true }
 lantern-system = { workspace = true }
 serde_json = { workspace = true }

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Lantern
+Comment=Manage local development servers
+Exec=lantern gui
+Icon=dev.lantern.Lantern
+Terminal=false
+Categories=Development;
+DBusActivatable=true
+StartupNotify=true
