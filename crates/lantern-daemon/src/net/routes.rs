@@ -16,6 +16,8 @@ pub const RESERVED_LABELS: [&str; 2] = ["lantern", "mailpit"];
 pub enum RouteOwner {
     /// Registered instance.
     Instance(InstanceId),
+    /// A named shared service.
+    Service(&'static str),
     /// The Lantern daemon hostname.
     Gateway,
 }
@@ -173,6 +175,26 @@ pub fn build_plan(input: &PlanInput<'_>) -> RoutePlan {
     }
     plan.routes.sort_by(|a, b| a.host.cmp(&b.host));
     plan
+}
+
+/// Add the Mailpit UI hostname, serving its stopped page when the service is down.
+pub fn add_mailpit(plan: &mut RoutePlan, tld: &str, upstream: Option<SocketAddr>) {
+    let host = format!("mailpit.{tld}");
+    if !valid_host(tld) || tld.contains('.') || !valid_host(&host) {
+        plan.skipped.push((host, "invalid TLD".into()));
+        return;
+    }
+    plan.routes.retain(|route| route.host != host);
+    let target = upstream.map_or(Target::Down, |addr| Target::Live {
+        target: RouteTarget::Socket(normalize_upstream(addr)),
+        tls: false,
+    });
+    plan.routes.push(Route {
+        host,
+        owner: RouteOwner::Service("mailpit"),
+        target,
+    });
+    plan.routes.sort_by(|a, b| a.host.cmp(&b.host));
 }
 
 /// Format an instance URL with a nonstandard HTTPS port when needed.

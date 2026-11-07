@@ -187,13 +187,14 @@ async fn page(State(s): State<GatewayState>, h: HeaderMap) -> Response {
         return forbidden();
     };
     let hosts = s.backend.known_hosts();
-    let instance = if hosts.contains(&host) {
+    let known = hosts.contains(&host);
+    let instance = if known {
         s.backend.instance_for_host(&host)
     } else {
         None
     };
     let is_error = one(&h, "x-lantern-error-status").is_some_and(|v| matches!(v, "502" | "503" | "504"));
-    let code = if instance.is_none() {
+    let code = if !known {
         StatusCode::NOT_FOUND
     } else if is_error {
         StatusCode::BAD_GATEWAY
@@ -222,6 +223,12 @@ async fn page(State(s): State<GatewayState>, h: HeaderMap) -> Response {
                 .unwrap_or_else(|| format!("Run lantern on {}", instance.id));
             (title, detail, true, instance.status == InstanceStatus::Starting)
         }
+        None if known => (
+            format!("{host} is unavailable"),
+            "Check the service status in Lantern.".into(),
+            false,
+            false,
+        ),
         None => (
             format!("Unknown host: {host}"),
             format!("Known hosts: {}", hosts.join(", ")),

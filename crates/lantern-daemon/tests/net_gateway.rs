@@ -21,7 +21,7 @@ struct Backend {
 }
 impl GatewayBackend for Backend {
     fn known_hosts(&self) -> Vec<String> {
-        vec!["app.glow".into(), "lantern.glow".into()]
+        vec!["app.glow".into(), "lantern.glow".into(), "mailpit.glow".into()]
     }
     fn instance_for_host(&self, host: &str) -> Option<GatewayInstance> {
         (host == "app.glow").then(|| GatewayInstance {
@@ -144,6 +144,16 @@ async fn net_gateway_guard_and_escaped_nonce_pages() {
     assert_eq!(
         default_port.oneshot(bad_port).await.unwrap().status(),
         StatusCode::FORBIDDEN
+    );
+    let service = Request::builder()
+        .uri("/__lantern/page")
+        .header("host", "localhost:39720")
+        .header("x-forwarded-host", "mailpit.glow:39721")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(service).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
     let unknown = Request::builder()
         .uri("/__lantern/page")

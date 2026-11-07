@@ -10,7 +10,7 @@ use lantern_core::{
 };
 use lantern_daemon::{
     net::{
-        routes::{PlanInput, RouteOwner, RoutePlan, Target, build_plan},
+        routes::{PlanInput, RouteOwner, RoutePlan, Target, add_mailpit, build_plan},
         sync::{ApplyFuture, NetRouter, RouteApplier},
     },
     runtime::seams::{RouteTarget, RuntimeRouter},
@@ -160,6 +160,17 @@ fn net_route_d9_statuses_adoption_and_collisions() {
         tld: "glow",
         auto_adopt: false,
     });
+    let mut services = plan.clone();
+    add_mailpit(&mut services, "glow", None);
+    assert_eq!(target(&services, "mailpit.glow"), &Target::Down);
+    add_mailpit(&mut services, "glow", Some("127.0.0.1:39732".parse().unwrap()));
+    assert!(matches!(
+        target(&services, "mailpit.glow"),
+        Target::Live {
+            target: RouteTarget::Socket(_),
+            ..
+        }
+    ));
     assert_eq!(plan.skipped.len(), 2);
     assert!(matches!(&plan.routes[0].owner,RouteOwner::Instance(id) if id.as_str()=="app"));
 }

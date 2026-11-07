@@ -7,6 +7,7 @@ use lantern_core::{
 use std::{
     collections::BTreeMap,
     future::Future,
+    net::SocketAddr,
     path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -17,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     caddy::Caddy,
-    routes::{PlanInput, RouteOwner, RoutePlan, Target, build_plan},
+    routes::{PlanInput, RouteOwner, RoutePlan, Target, add_mailpit, build_plan},
 };
 use crate::runtime::seams::{RouteFuture, RouteTarget, RuntimeRouter};
 
@@ -42,6 +43,7 @@ impl RouteApplier for Caddy {
 struct Desired {
     instances: BTreeMap<InstanceId, Instance>,
     targets: BTreeMap<InstanceId, RouteTarget>,
+    mailpit: Option<Option<SocketAddr>>,
     generation: u64,
 }
 struct Inner {
@@ -61,6 +63,9 @@ impl Inner {
             tld: &self.tld,
             auto_adopt: self.auto_adopt,
         });
+        if let Some(upstream) = desired.mailpit {
+            add_mailpit(&mut plan, &self.tld, upstream);
+        }
         for route in &mut plan.routes {
             if let RouteOwner::Instance(id) = &route.owner
                 && let Some(instance) = desired.instances.get(id)
@@ -138,6 +143,12 @@ impl NetRouter {
         state.instances = instances.into_iter().map(|i| (i.id.clone(), i)).collect();
         let ids: Vec<_> = state.instances.keys().cloned().collect();
         state.targets.retain(|id, _| ids.binary_search(id).is_ok());
+        self.inner.dirty(&mut state);
+    }
+    /// Set whether Mailpit is published and its live UI upstream, if running.
+    pub fn set_mailpit(&self, enabled: bool, upstream: Option<SocketAddr>) {
+        let mut state = self.inner.desired.lock().unwrap();
+        state.mailpit = enabled.then_some(upstream);
         self.inner.dirty(&mut state);
     }
     /// Snapshot the current desired plan for gateway integration.
