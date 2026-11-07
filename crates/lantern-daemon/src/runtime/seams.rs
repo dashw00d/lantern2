@@ -87,18 +87,10 @@ impl PortProbe for ScannerProbe {
             .port_binding(port, expected_unit)
     }
     fn unit_listeners(&self, unit: &str) -> io::Result<Vec<SocketAddr>> {
-        let snapshot = self
-            .0
+        self.0
             .lock()
             .map_err(|_| io::Error::other("scanner lock poisoned"))?
-            .scan()?;
-        Ok(snapshot
-            .listeners
-            .into_iter()
-            .chain(snapshot.hidden)
-            .filter(|l| l.unit.as_deref() == Some(unit))
-            .map(|l| l.addr)
-            .collect())
+            .unit_listeners(unit)
     }
 }
 
