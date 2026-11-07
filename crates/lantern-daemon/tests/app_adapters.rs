@@ -112,7 +112,14 @@ async fn app_adapters_allocate_before_setup_and_compare_leases_atomically() {
     assert!(RuntimeStore::compare_port_leases(&adapter, &expected, changed.clone()).unwrap());
     assert!(!RuntimeStore::compare_port_leases(&adapter, &expected, expected.clone()).unwrap());
     assert_eq!(RuntimeStore::port_leases(&adapter).unwrap(), changed);
-    registry.flush().await.unwrap();
+    adapter.set_setup_stale(&id, true).unwrap();
+    assert!(registry.instance(&id).unwrap().setup_stale);
+    adapter.flush_registry().await.unwrap();
+    assert!(
+        fs::read_to_string(dirs.state.join("state.json"))
+            .unwrap()
+            .contains("sample@branch")
+    );
 }
 
 #[tokio::test]
