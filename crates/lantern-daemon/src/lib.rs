@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod app;
+pub mod console;
 pub mod discovery;
 pub mod events;
 pub mod git;

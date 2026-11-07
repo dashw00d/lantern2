@@ -100,6 +100,8 @@ pub struct RawManifest {
     pub upstream_url: Option<String>,
     pub base_url: Option<String>,
     pub health_endpoint: Option<String>,
+    /// Path the Open button goes to, such as `/app/`.
+    pub open_path: Option<String>,
     pub run: Option<RunSection>,
     #[serde(deserialize_with = "one_or_many")]
     #[schemars(with = "Option<StringOrList>")]

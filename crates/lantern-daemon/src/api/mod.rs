@@ -105,6 +105,12 @@ fn guarded_router(state: ApiState, mcp: Option<crate::mcp::McpService>) -> Route
         .layer(middleware::from_fn_with_state(config, guard::check))
         .layer(middleware::from_fn(guard::headers))
 }
+/// Put a router behind the same Host/Origin guard and browser-safety headers as the API.
+pub fn guarded(router: Router, config: ApiConfig) -> Router {
+    router
+        .layer(middleware::from_fn_with_state(config, guard::check))
+        .layer(middleware::from_fn(guard::headers))
+}
 /// Serve the listener until cancellation, closing SSE streams before graceful shutdown completes.
 pub async fn serve(listener: TcpListener, router: Router, shutdown: CancellationToken) -> io::Result<()> {
     let router = router.layer(Extension(shutdown.clone()));

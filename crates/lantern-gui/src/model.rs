@@ -225,6 +225,8 @@ pub(crate) mod tests {
                 id: project,
                 serve: ServeMode::Proxy,
                 run_cmd: Some("npm start".into()),
+                open_path: None,
+                description: None,
                 diagnostics: DiagnosticCounts {
                     errors: 0,
                     warnings: 0,

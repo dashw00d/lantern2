@@ -138,6 +138,7 @@ const ROOT: &[&str] = &[
     "upstream_url",
     "base_url",
     "health_endpoint",
+    "open_path",
     "run",
     "setup",
     "worktree",
@@ -377,6 +378,14 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
             Severity::Error,
             "bad_value",
             "health_endpoint",
+            "expected a path beginning with /".into(),
+        );
+    }
+    if raw.open_path.as_deref().is_some_and(|s| !s.starts_with('/')) {
+        add(
+            Severity::Error,
+            "bad_value",
+            "open_path",
             "expected a path beginning with /".into(),
         );
     }
@@ -932,6 +941,9 @@ pub struct ResolvedManifest {
     pub upstream_url: Option<String>,
     pub base_url: Option<String>,
     pub health_endpoint: Option<String>,
+    /// Path the Open button goes to, such as `/app/`.
+    #[serde(default)]
+    pub open_path: Option<String>,
     pub run: ResolvedRun,
     pub setup: Option<Vec<TemplateString>>,
     pub worktree: WorktreeSpec,
@@ -1374,6 +1386,7 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
         upstream_url: nonblank(raw.upstream_url),
         base_url: nonblank(raw.base_url),
         health_endpoint: raw.health_endpoint,
+        open_path: nonblank(raw.open_path),
         run: ResolvedRun {
             cmd: nonblank(run.cmd).map(t),
             cwd: t(run.cwd.unwrap_or_else(|| ".".into())),

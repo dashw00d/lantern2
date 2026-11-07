@@ -156,6 +156,10 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             UnitNames::default()
         }
     });
+    // Saved commands run as `<prefix>cmd-<id>.service` next to instance units.
+    let launcher_prefix = names.instance_prefix.replacen("-inst-", "-cmd-", 1);
+    let launcher_slice = names.slice.clone();
+    let launcher_home = home.clone();
     if args.dev && settings.dns.listen == "127.0.0.1:5354" {
         settings.dns.listen = "127.0.0.1:5355".into();
     }
@@ -459,6 +463,13 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     if settings.proxy.https_port != 443 {
         api_config.gateway_port = Some(settings.proxy.https_port);
     }
+    let launchers = Arc::new(crate::console::launchers::Launchers::load(
+        dirs.config.join("launchers.json"),
+        launcher_home,
+        launcher_prefix,
+        launcher_slice,
+    ));
+    let console = api::guarded(crate::console::router(launchers), api_config.clone());
     let api_state = ApiState::new(facade.clone(), bus, tracker.clone(), api_config);
     let gateway = crate::net::gateway::router(crate::net::gateway::GatewayState {
         backend: Arc::new(gateway::GatewayAdapter::new(
@@ -483,7 +494,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     );
     let result = api::serve(
         listener,
-        api::router_with_mcp(api_state, mcp).merge(gateway),
+        api::router_with_mcp(api_state, mcp).merge(gateway).merge(console),
         shutdown.clone(),
     )
     .await

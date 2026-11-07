@@ -24,6 +24,8 @@ impl ResolvedManifest {
             serve: self.serve,
             // The source text, never a rendered value: rendering could embed env data.
             run_cmd: self.run.cmd.as_ref().map(|c| c.source().to_string()),
+            open_path: self.open_path.clone(),
+            description: self.description.clone(),
             diagnostics: counts,
             manifest_rev: manifest_rev.into(),
         }

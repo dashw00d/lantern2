@@ -69,7 +69,7 @@ wire_struct! { /// Diagnostic totals grouped by severity.
     DiagnosticCounts { errors: u32, warnings: u32, info: u32 }
 }
 wire_struct! { /// Safe, compact manifest information published on the event bus.
-    ManifestSummary { id: ProjectId, serve: ServeMode, run_cmd: Option<String>, diagnostics: DiagnosticCounts, manifest_rev: String }
+    ManifestSummary { id: ProjectId, serve: ServeMode, run_cmd: Option<String>, #[serde(default)] open_path: Option<String>, #[serde(default)] description: Option<String>, diagnostics: DiagnosticCounts, manifest_rev: String }
 }
 wire_enum! { /// Risk attached to an endpoint or routing policy.
     Risk { Low, Medium, High, Critical, Unknown }

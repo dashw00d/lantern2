@@ -3,6 +3,8 @@
 # Lanes: do NOT run this whole script; run targeted `cargo test -p <crate> <filter>` instead.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# The GUI's headless view tests render with tiny-skia (no GPU).
+export ICED_TEST_BACKEND="${ICED_TEST_BACKEND:-tiny-skia}"
 fail=0
 run() { echo "== $*"; "$@" || { echo "!! FAILED: $*"; fail=1; }; }
 run cargo fmt --all --check

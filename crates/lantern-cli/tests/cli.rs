@@ -50,6 +50,8 @@ fn fixture() -> (ProjectSummary, InstanceView) {
             id: project.clone(),
             serve: ServeMode::Proxy,
             run_cmd: Some("serve".into()),
+            open_path: None,
+            description: None,
             diagnostics: DiagnosticCounts {
                 errors: 0,
                 warnings: 0,

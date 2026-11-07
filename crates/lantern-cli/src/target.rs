@@ -183,6 +183,8 @@ mod tests {
                 id: project,
                 serve: ServeMode::Proxy,
                 run_cmd: None,
+                open_path: None,
+                description: None,
                 diagnostics: DiagnosticCounts {
                     errors: 0,
                     warnings: 0,

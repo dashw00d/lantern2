@@ -672,6 +672,14 @@
         "null"
       ]
     },
+    "open_path": {
+      "default": null,
+      "description": "Path the Open button goes to, such as `/app/`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "repo_url": {
       "default": null,
       "type": [
