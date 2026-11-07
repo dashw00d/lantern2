@@ -241,6 +241,12 @@ impl RuntimeStore for RegistryAdapter {
 }
 
 impl InstanceStore for RegistryAdapter {
+    fn set_setup_stale(&self, id: &InstanceId, stale: bool) -> Result<(), String> {
+        RegistryAdapter::set_setup_stale(self, id, stale)
+    }
+    fn flush(&self) -> crate::instances::InstanceStoreFlushFuture<'_> {
+        Box::pin(self.flush_registry())
+    }
     fn project(&self, id: &ProjectId) -> Result<Option<ProjectConfig>, String> {
         Ok(self.project_config(id))
     }
