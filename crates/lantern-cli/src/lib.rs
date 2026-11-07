@@ -68,6 +68,7 @@ pub fn run() -> CliAction {
             return CliAction::Exit(code);
         }
     };
+    init_tracing(cli.verbose);
     let tty = std::io::stdout().is_terminal();
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
@@ -83,4 +84,22 @@ pub fn run() -> CliAction {
         &mut std::io::stderr(),
         tty,
     ))
+}
+
+fn init_tracing(verbosity: u8) {
+    let setting = std::env::var("RUST_LOG").ok().or_else(|| match verbosity {
+        0 => None,
+        1 => Some("debug".into()),
+        _ => Some("trace".into()),
+    });
+    if let Some(setting) = setting {
+        let filter = tracing_subscriber::EnvFilter::try_new(setting)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .try_init();
+        tracing::debug!("Lantern CLI initialized");
+    }
 }
