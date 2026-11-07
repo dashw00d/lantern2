@@ -931,7 +931,18 @@ impl InstanceService {
             .map(str::to_owned)
             .or_else(|| branch.as_deref().map(branch_slug));
         let domain = instance_domain(&p.primary_domain, id.slug());
-        let port = self.store.port(id).map_err(InstanceError::Adapter)?.unwrap_or(0);
+        let leased_port = self.store.port(id).map_err(InstanceError::Adapter)?;
+        let needs_port = manifest
+            .setup
+            .as_ref()
+            .is_some_and(|commands| commands.iter().any(|s| s.mentions("PORT")))
+            || manifest.run.env.values().any(|s| s.mentions("PORT"))
+            || (record.checkout.kind != CheckoutKind::Primary
+                && manifest.worktree.env.values().any(|s| s.mentions("PORT")));
+        if leased_port.is_none() && needs_port {
+            return Err(InstanceError::Refused("port_unavailable before setup".into()));
+        }
+        let port = leased_port.unwrap_or(0);
         let ctx = VarContext {
             port,
             host: "127.0.0.1".parse().expect("loopback"),
@@ -962,7 +973,6 @@ impl InstanceService {
             .collect();
         env.extend(worktree_env.clone());
         for (k, v) in [
-            ("PORT", port.to_string()),
             ("HOST", ctx.host.to_string()),
             ("DOMAIN", domain.clone()),
             ("URL", ctx.url.clone()),
@@ -976,7 +986,10 @@ impl InstanceService {
         ] {
             env.insert(format!("LANTERN_{k}"), v);
         }
-        env.insert("PORT".into(), port.to_string());
+        if let Some(port) = leased_port {
+            env.insert("LANTERN_PORT".into(), port.to_string());
+            env.insert("PORT".into(), port.to_string());
+        }
         env.insert("DOMAIN".into(), domain);
         env.insert("PROJECT_NAME".into(), p.project.id.to_string());
         env.insert("LANTERN_PHASE".into(), "setup".into());

@@ -105,6 +105,7 @@ struct FakeStore {
     records: Mutex<BTreeMap<InstanceId, InstanceRecord>>,
     manifest: Mutex<Option<Arc<ResolvedManifest>>>,
     statuses: Mutex<BTreeMap<InstanceId, InstanceStatus>>,
+    port: Mutex<Option<u16>>,
 }
 impl InstanceStore for FakeStore {
     fn project(&self, id: &ProjectId) -> Result<Option<ProjectConfig>, String> {
@@ -155,7 +156,7 @@ impl InstanceStore for FakeStore {
             .unwrap_or(&InstanceStatus::Stopped))
     }
     fn port(&self, _: &InstanceId) -> Result<Option<u16>, String> {
-        Ok(Some(29876))
+        Ok(*self.port.lock().unwrap())
     }
 }
 #[derive(Default)]
@@ -234,6 +235,7 @@ async fn fixture(
     let (root, remote) = make_repo(temp);
     let store = Arc::new(FakeStore::default());
     *store.manifest.lock().unwrap() = Some(resolved(yaml));
+    *store.port.lock().unwrap() = Some(29876);
     register(&store, &root, "myapp", "apps/web");
     let runner = Arc::new(FakeRunner::default());
     let service = InstanceService::new(
@@ -1064,4 +1066,20 @@ async fn instances_runtime_preparer_token_stops_the_setup_unit() {
             .setup
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn instances_setup_rejects_missing_required_port_lease() {
+    let t = Temp::new();
+    let (root, _, store, runner, service) =
+        fixture(&t, "id: myapp\nrun: {cmd: 'echo ok'}\nsetup: ['echo ${PORT}']\n").await;
+    *store.port.lock().unwrap() = None;
+    git_cmd(&root, &["branch", "port-needed"]);
+    let op = operation();
+    let result = service
+        .run_branch(req(BranchTarget::Branch("port-needed".into())), &op)
+        .await;
+    assert!(result.unwrap_err().to_string().contains("port_unavailable"));
+    assert!(runner.calls.lock().unwrap().is_empty());
+    op.finish(OpOutcome::Cancelled);
 }
