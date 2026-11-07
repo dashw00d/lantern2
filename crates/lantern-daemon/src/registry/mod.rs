@@ -52,6 +52,8 @@ pub enum Error {
     WrongProject,
     #[error("primary instance cannot be removed independently")]
     Primary,
+    #[error("invalid profile name: {0}")]
+    InvalidProfile(String),
 }
 
 /// A discovery notification after appearance and disappearance delays have elapsed.
@@ -188,6 +190,24 @@ impl RegistryHandle {
     /// Return one persisted instance.
     pub fn instance_record(&self, id: &InstanceId) -> Option<InstanceRecord> {
         self.lock().file.instances.get(id).cloned()
+    }
+    /// Return the currently active profile name, if any.
+    pub fn active_profile(&self) -> Option<String> {
+        self.lock().file.active_profile.clone()
+    }
+    /// Persist the active profile name; profile existence and activation effects belong to the caller.
+    pub fn set_active_profile(&self, name: Option<String>) -> Result<(), Error> {
+        if let Some(name) = &name
+            && !lantern_core::profiles::valid_name(name)
+        {
+            return Err(Error::InvalidProfile(name.clone()));
+        }
+        let mut s = self.lock();
+        if s.file.active_profile != name {
+            s.file.active_profile = name;
+            s.dirty();
+        }
+        Ok(())
     }
     /// Return all persisted checkouts belonging to a repository.
     pub fn checkouts(&self, repo: &Path) -> Vec<(InstanceId, InstanceRecord)> {
