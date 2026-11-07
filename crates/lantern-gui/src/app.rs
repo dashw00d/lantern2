@@ -66,6 +66,17 @@ enum CommandKind {
     Stop,
     Restart,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusFilter {
+    All,
+    Running,
+    Attention,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectTab {
+    Overview,
+    Logs,
+}
 #[derive(Debug, Clone)]
 struct Command {
     id: InstanceId,
@@ -102,6 +113,8 @@ struct App {
     why: Option<String>,
     stream_generation: u64,
     log_target: Option<InstanceId>,
+    project_tab: ProjectTab,
+    status_filter: StatusFilter,
     logs: LogBuffer,
     log_loading: bool,
     log_epoch: u64,
@@ -130,6 +143,9 @@ enum Message {
     DaemonDone(Result<String, String>, bool),
     CopyCommand,
     OpenLogs(InstanceId),
+    OpenProject(InstanceId),
+    ProjectTab(ProjectTab),
+    StatusFilter(StatusFilter),
     Dashboard,
     LogBacklog(InstanceId, u64, Result<LogPage, String>),
     LogScrolled(scrollable::Viewport),
@@ -160,6 +176,8 @@ impl App {
             why: None,
             stream_generation: 0,
             log_target: None,
+            project_tab: ProjectTab::Logs,
+            status_filter: StatusFilter::All,
             logs: LogBuffer::default(),
             log_loading: false,
             log_epoch: 0,
@@ -222,6 +240,7 @@ impl App {
                     match InstanceId::parse(&target) {
                         Ok(id) => {
                             self.log_target = Some(id);
+                            self.project_tab = ProjectTab::Overview;
                             self.logs = LogBuffer::default();
                             self.stream_generation = self.stream_generation.wrapping_add(1);
                         }
@@ -434,10 +453,24 @@ impl App {
             Message::CopyCommand => iced::clipboard::write("systemctl --user start lantern".to_string()),
             Message::OpenLogs(id) => {
                 self.log_target = Some(id);
+                self.project_tab = ProjectTab::Logs;
                 self.logs = LogBuffer::default();
                 self.log_live.clear();
                 self.log_epoch = self.log_epoch.wrapping_add(1);
                 self.stream_generation = self.stream_generation.wrapping_add(1);
+                Task::none()
+            }
+            Message::OpenProject(id) => {
+                let task = self.update(Message::OpenLogs(id));
+                self.project_tab = ProjectTab::Overview;
+                task
+            }
+            Message::ProjectTab(tab) => {
+                self.project_tab = tab;
+                Task::none()
+            }
+            Message::StatusFilter(filter) => {
+                self.status_filter = filter;
                 Task::none()
             }
             Message::Dashboard => {
@@ -558,39 +591,67 @@ impl App {
             body = body.push(
                 row![
                     button("‹ Dashboard").on_press(Message::Dashboard),
-                    text(format!("{target}  ›  Logs")).size(22),
-                    button("Jump to latest").on_press(Message::LogFollow)
+                    text(format!("{target}")).size(22),
+                    button("Overview").on_press(Message::ProjectTab(ProjectTab::Overview)),
+                    button("Logs").on_press(Message::ProjectTab(ProjectTab::Logs))
                 ]
                 .spacing(12),
             );
-            body = body.push(text(format!(
-                "{} lines buffered · {}",
-                self.logs.len(),
-                if self.logs.follow { "Following" } else { "Paused" }
-            )));
-            let range = self.logs.range();
-            let mut rows = column![space::vertical().height(range.start as f32 * ROW_HEIGHT)].spacing(0);
-            for index in range.clone() {
-                if let Some(line) = self.logs.get(index) {
-                    let value = format!("{}  {}", line.ts, line.line);
-                    rows = rows.push(
-                        container(
-                            text(value)
-                                .font(Font::with_name(self.fonts.mono))
-                                .size(13)
-                                .wrapping(text::Wrapping::None),
-                        )
-                        .height(ROW_HEIGHT),
-                    );
+            if self.project_tab == ProjectTab::Overview {
+                if let Some(instance) = self.mirror.live.instances.get(target) {
+                    body = body.push(text(format!(
+                        "Status: {:?}   {}",
+                        instance.runtime.status, instance.url
+                    )));
+                    body = body.push(text(format!("Checkout: {}", instance.checkout.path.display())));
+                    body = body.push(text(format!(
+                        "Branch: {}",
+                        instance.checkout.branch.as_deref().unwrap_or("detached")
+                    )));
+                    if let Some(message) = &instance.runtime.message {
+                        body = body.push(text(format!("Why: {message}")));
+                    }
+                    if let Some(issue) = &instance.runtime.issue {
+                        body = body.push(text(format!(
+                            "{} {}",
+                            issue.detail,
+                            issue.hint.as_deref().unwrap_or_default()
+                        )));
+                    }
+                } else {
+                    body = body.push(text("Waiting for instance state…"));
                 }
+            } else {
+                body = body.push(button("Jump to latest").on_press(Message::LogFollow));
+                body = body.push(text(format!(
+                    "{} lines buffered · {}",
+                    self.logs.len(),
+                    if self.logs.follow { "Following" } else { "Paused" }
+                )));
+                let range = self.logs.range();
+                let mut rows = column![space::vertical().height(range.start as f32 * ROW_HEIGHT)].spacing(0);
+                for index in range.clone() {
+                    if let Some(line) = self.logs.get(index) {
+                        let value = format!("{}  {}", line.ts, line.line);
+                        rows = rows.push(
+                            container(
+                                text(value)
+                                    .font(Font::with_name(self.fonts.mono))
+                                    .size(13)
+                                    .wrapping(text::Wrapping::None),
+                            )
+                            .height(ROW_HEIGHT),
+                        );
+                    }
+                }
+                rows = rows.push(space::vertical().height((self.logs.len() - range.end) as f32 * ROW_HEIGHT));
+                body = body.push(
+                    scrollable(rows)
+                        .id("lantern-logs")
+                        .on_scroll(Message::LogScrolled)
+                        .height(Length::Fill),
+                );
             }
-            rows = rows.push(space::vertical().height((self.logs.len() - range.end) as f32 * ROW_HEIGHT));
-            body = body.push(
-                scrollable(rows)
-                    .id("lantern-logs")
-                    .on_scroll(Message::LogScrolled)
-                    .height(Length::Fill),
-            );
         } else if self.mirror.ever_live {
             let instances = self
                 .mirror
@@ -617,11 +678,25 @@ impl App {
                     )
                 })
                 .count();
+            let unmanaged = self
+                .mirror
+                .live
+                .listeners
+                .iter()
+                .filter(|listener| !listener.managed)
+                .count();
             body = body
-                .push(text(format!(
-                    "{running} running  ·  {attention} needs attention  ·  {} listeners",
-                    self.mirror.live.listeners.len()
-                )))
+                .push(
+                    row![
+                        button("All").on_press(Message::StatusFilter(StatusFilter::All)),
+                        button(text(format!("{running} running")))
+                            .on_press(Message::StatusFilter(StatusFilter::Running)),
+                        button(text(format!("{attention} needs attention")))
+                            .on_press(Message::StatusFilter(StatusFilter::Attention)),
+                        text(format!("{unmanaged} unmanaged"))
+                    ]
+                    .spacing(8),
+                )
                 .push(text_input("Filter projects or instances", &self.filter).on_input(Message::Filter));
             let filter = self.filter.to_lowercase();
             let mut list = column![].spacing(8);
@@ -631,6 +706,19 @@ impl App {
                     .copied()
                     .filter(|i| {
                         i.project == project.project.id
+                            && match self.status_filter {
+                                StatusFilter::All => true,
+                                StatusFilter::Running => matches!(
+                                    i.runtime.status,
+                                    InstanceStatus::Running | InstanceStatus::Starting
+                                ),
+                                StatusFilter::Attention => matches!(
+                                    i.runtime.status,
+                                    InstanceStatus::Crashed
+                                        | InstanceStatus::Unhealthy
+                                        | InstanceStatus::NeedsConfig
+                                ),
+                            }
                             && (filter.is_empty()
                                 || project.project.name.to_lowercase().contains(&filter)
                                 || i.id.as_str().contains(&filter))
@@ -678,9 +766,18 @@ impl App {
                         .runtime
                         .port
                         .map_or_else(|| "-".to_owned(), |p| format!(":{p}"));
+                    let color = match status {
+                        InstanceStatus::Running => iced::color!(0x3FB950),
+                        InstanceStatus::Crashed | InstanceStatus::NeedsConfig => iced::color!(0xF85149),
+                        InstanceStatus::Unhealthy
+                        | InstanceStatus::Starting
+                        | InstanceStatus::Preparing
+                        | InstanceStatus::Stopping => iced::color!(0xD29922),
+                        _ => iced::color!(0x999999),
+                    };
                     let mut line = row![
-                        text(format!("{glyph}  {name}   {branch}   {port}   {}", instance.url))
-                            .width(Length::Fill)
+                        text(glyph).color(color),
+                        text(format!("{name}   {branch}   {port}   {}", instance.url)).width(Length::Fill)
                     ]
                     .spacing(8);
                     if let Some(pending) = self.pending.get(&instance.id) {
@@ -714,6 +811,7 @@ impl App {
                             restart
                         });
                     }
+                    line = line.push(button("Overview").on_press(Message::OpenProject(instance.id.clone())));
                     line = line.push(button("Logs").on_press(Message::OpenLogs(instance.id.clone())));
                     list = list.push(line);
                     if matches!(
@@ -731,6 +829,26 @@ impl App {
             }
             if self.mirror.live.projects.is_empty() {
                 list = list.push(text("No projects yet. Add a project or run lantern scan."));
+            }
+            if unmanaged > 0 && self.status_filter == StatusFilter::All {
+                list = list.push(text(format!("Other listeners ({unmanaged})")).size(20));
+                for listener in self
+                    .mirror
+                    .live
+                    .listeners
+                    .iter()
+                    .filter(|listener| !listener.managed)
+                {
+                    list = list.push(text(format!(
+                        "◇ :{}   {}   {}",
+                        listener.port,
+                        listener.label,
+                        listener
+                            .cwd
+                            .as_ref()
+                            .map_or_else(String::new, |p| p.display().to_string())
+                    )));
+                }
             }
             body = body.push(scrollable(list).height(Length::Fill));
         }
@@ -931,5 +1049,26 @@ mod tests {
         let mut ui = iced_test::simulator(app.view(window::Id::unique()));
         assert!(ui.find("Start daemon").is_ok());
         assert!(ui.find("Retry now").is_ok());
+    }
+    #[test]
+    fn project_tabs_and_status_filters_are_headless() {
+        let mut app = app();
+        complete(&mut app);
+        drop(app.update(Message::StatusFilter(StatusFilter::Running)));
+        let mut ui = iced_test::simulator(app.view(window::Id::unique()));
+        assert!(ui.find("Start").is_err());
+        drop(ui);
+        drop(app.update(Message::StatusFilter(StatusFilter::All)));
+        let mut ui = iced_test::simulator(app.view(window::Id::unique()));
+        ui.click("Overview").unwrap();
+        let messages: Vec<_> = ui.into_messages().collect();
+        drop(app.update(messages.into_iter().next().unwrap()));
+        let mut ui = iced_test::simulator(app.view(window::Id::unique()));
+        assert!(ui.find("Branch: main").is_ok());
+        ui.click("Logs").unwrap();
+        let messages: Vec<_> = ui.into_messages().collect();
+        drop(app.update(messages.into_iter().next().unwrap()));
+        let mut ui = iced_test::simulator(app.view(window::Id::unique()));
+        assert!(ui.find("Jump to latest").is_ok());
     }
 }

@@ -166,7 +166,13 @@ impl ksni::Tray for GuiTray {
                 .into(),
             );
         }
-        for id in self.snapshot.running.iter().take(12) {
+        for id in self
+            .snapshot
+            .running
+            .iter()
+            .filter(|_| self.snapshot.online)
+            .take(12)
+        {
             let id = id.clone();
             let label = id.to_string();
             menu.push(
@@ -182,6 +188,18 @@ impl ksni::Tray for GuiTray {
                         }
                         .into(),
                     ],
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        if self.snapshot.online && self.snapshot.running.len() > 12 {
+            menu.push(
+                StandardItem {
+                    label: format!("{} more…", self.snapshot.running.len() - 12),
+                    activate: Box::new(|tray: &mut Self| {
+                        let _ = tray.sender.send(UiEvent::ShowWindow(None));
+                    }),
                     ..Default::default()
                 }
                 .into(),

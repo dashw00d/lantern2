@@ -338,4 +338,107 @@ pub(crate) mod tests {
         assert!(m.live.projects.is_empty());
         assert_eq!(m.boot_id.as_deref(), Some("two"));
     }
+
+    #[test]
+    fn client_reconnects_and_replays_after_resync() {
+        use futures_util::StreamExt;
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+            time::Instant,
+        };
+        let listener = (39340..39360)
+            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            .expect("no free GUI test port");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let frame = |event: WireEvent| {
+            format!(
+                "event: {}\ndata: {}\n\n",
+                event.event_name(),
+                serde_json::to_string(&event).unwrap()
+            )
+        };
+        let first = [
+            hello("one"),
+            WireEvent::ProjectUpdated { project: project() },
+            WireEvent::InstanceUpdated {
+                instance: instance(InstanceStatus::Stopped),
+            },
+            WireEvent::SnapshotComplete,
+            WireEvent::InstanceUpdated {
+                instance: instance(InstanceStatus::Running),
+            },
+            WireEvent::Resync {
+                reason: "lagged".into(),
+                skipped: Some(1),
+            },
+        ]
+        .into_iter()
+        .map(frame)
+        .collect::<String>();
+        let second = [
+            hello("two"),
+            WireEvent::ProjectUpdated { project: project() },
+            WireEvent::SnapshotComplete,
+        ]
+        .into_iter()
+        .map(frame)
+        .collect::<String>();
+        let server = thread::spawn(move || {
+            for body in [first, second] {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut socket, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("test server accept: {error}"),
+                    }
+                };
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).unwrap() > 0);
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = lantern_client::Client::new(lantern_client::ClientConfig {
+                base_url: Some(format!("http://127.0.0.1:{port}")),
+            })
+            .unwrap();
+            let mut events = client.events(lantern_client::EventsOptions::default());
+            let mut mirror = Mirror::default();
+            let mut snapshots = 0;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = events.next().await {
+                    if matches!(&event, StreamEvent::Event(WireEvent::SnapshotComplete)) {
+                        snapshots += 1;
+                    }
+                    mirror.stream(event);
+                    if snapshots == 2 {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("SSE replay timed out");
+            assert_eq!(snapshots, 2);
+            assert_eq!(mirror.boot_id.as_deref(), Some("two"));
+            assert_eq!(mirror.connection, Connection::Live);
+            assert_eq!(mirror.live.projects.len(), 1);
+            assert!(mirror.live.instances.is_empty());
+        });
+        server.join().unwrap();
+    }
 }
