@@ -32,7 +32,6 @@ serde_urlencoded = "0.7"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 # Network subsystem
-lantern-system = { workspace = true }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
