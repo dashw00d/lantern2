@@ -22,3 +22,14 @@ toml_edit = "0.23"
 globset = "0.4"
 walkdir = "2"
 sha2 = "0.11"
+async-trait = "0.1"
+axum = "0.8"
+async-stream = "0.3"
+futures-util = "0.3"
+percent-encoding = "2"
+serde_urlencoded = "0.7"
+
+[dev-dependencies]
+lantern-client = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["test-util"] }
