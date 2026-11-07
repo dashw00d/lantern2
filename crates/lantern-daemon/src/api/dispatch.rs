@@ -104,13 +104,11 @@ fn operation_failure(op: &Operation) -> HttpError {
     HttpError::operation(error, &op.id.0)
 }
 async fn operation(state: &ApiState, ticket: OperationTicket, w: WaitParams) -> Result<Response, HttpError> {
+    let deadline = Instant::now() + Duration::from_secs(u64::from(w.timeout.unwrap_or(60)));
     let op = if w.wait {
         state
             .operations
-            .wait(
-                &ticket.id,
-                Duration::from_secs(u64::from(w.timeout.unwrap_or(60))),
-            )
+            .wait(&ticket.id, deadline.saturating_duration_since(Instant::now()))
             .await
     } else {
         state.operations.get(&ticket.id)
@@ -123,7 +121,15 @@ async fn operation(state: &ApiState, ticket: OperationTicket, w: WaitParams) -> 
     if w.wait
         && op.status == OperationStatus::Succeeded
         && let Some(id) = &op.instance
-        && let Ok(fresh) = within(state, "registry", state.facade.instance(id.clone())).await
+        && let Ok(fresh) = within_deadline(
+            "registry",
+            state
+                .config
+                .module_timeout
+                .min(deadline.saturating_duration_since(Instant::now())),
+            state.facade.instance(id.clone()),
+        )
+        .await
     {
         view = Some(fresh);
     }

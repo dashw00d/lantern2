@@ -1318,3 +1318,53 @@ async fn api_group_wait_uses_one_deadline_and_returns_failures() {
         }
     }
 }
+
+#[derive(Debug)]
+struct SlowViewFacade {
+    ops: OperationTracker,
+}
+#[async_trait]
+impl DaemonFacade for SlowViewFacade {
+    async fn start(&self, id: InstanceId) -> FacadeResult<OperationTicket> {
+        let handle = self.ops.begin(OperationKind::Start, Some(id));
+        let id = handle.id().clone();
+        handle.finish(OpOutcome::Succeeded(None));
+        Ok(OperationTicket {
+            id,
+            instance: Some(inst()),
+            created: None,
+            forgotten: None,
+        })
+    }
+    async fn instance(&self, _: InstanceId) -> FacadeResult<InstanceView> {
+        std::future::pending().await
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn api_wait_deadline_also_bounds_the_final_view_lookup() {
+    let bus = EventBus::new();
+    let ops = OperationTracker::new(bus.clone());
+    let router = api::router(ApiState::new(
+        Arc::new(SlowViewFacade { ops: ops.clone() }),
+        bus,
+        ops,
+        ApiConfig::new(39400, "glow", "test"),
+    ));
+    let before = tokio::time::Instant::now();
+    let response = router
+        .oneshot(request(
+            "POST",
+            "/api/instances/myapp@feature-x/start?wait=true&timeout=1",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(before),
+        Duration::from_secs(1)
+    );
+    let body = json_body(response).await;
+    assert_eq!(body["operation"]["status"], "succeeded");
+    assert_eq!(body["instance"]["id"], "myapp@feature-x");
+}
