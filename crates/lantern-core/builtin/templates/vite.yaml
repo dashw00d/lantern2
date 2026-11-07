@@ -1,0 +1,6 @@
+name: vite
+type: proxy
+run:
+  cmd: "npx vite --host ${HOST} --port ${PORT}"
+routing:
+  websocket: true

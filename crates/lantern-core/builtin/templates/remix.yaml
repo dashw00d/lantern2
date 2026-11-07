@@ -1,0 +1,4 @@
+name: remix
+type: proxy
+run:
+  cmd: "npx remix vite:dev --host ${HOST} --port ${PORT}"

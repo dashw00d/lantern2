@@ -798,6 +798,10 @@ pub trait DetectionInfo {
     fn framework_name(&self) -> &str;
     fn template_name(&self) -> Option<&str>;
     fn rewrite_builtin(&self, cmd: &str) -> String;
+    /// Detected docroot for PHP projects.
+    fn php_root(&self) -> Option<&str> {
+        None
+    }
 }
 /// An effective manifest for one checkout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -981,6 +985,11 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
             def.manifest.repo_url = None;
             def.manifest.enabled = None;
             if def.builtin {
+                if name == "php" && input.detection.framework_name() == "php" {
+                    if let Some(root) = input.detection.php_root() {
+                        def.manifest.root = Some(root.to_string());
+                    }
+                }
                 if let Some(run) = &mut def.manifest.run {
                     if let Some(cmd) = &mut run.cmd {
                         *cmd = input.detection.rewrite_builtin(cmd);

@@ -1,0 +1,3 @@
+name: symfony
+type: php
+root: "public"
