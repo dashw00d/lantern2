@@ -64,13 +64,20 @@ pub struct LeaseOutcome<H> {
 
 /// Failure to allocate from a configured range.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PortError<H> {
+pub enum PortError<H, E = std::convert::Infallible> {
     /// A zero or inverted range was supplied.
     InvalidRange,
     /// No unleased, unreserved port passed the injected conflict check.
     Exhausted {
         /// Previous unusable sticky lease and holder, when applicable.
         previous: Option<PreviousLease<H>>,
+    },
+    /// The injected discovery or bind probe failed; the lease table is unchanged.
+    Probe {
+        /// Port whose probe failed.
+        port: u16,
+        /// Original probe error.
+        source: E,
     },
 }
 
@@ -108,6 +115,21 @@ impl PortLeases {
         reserved: &[u16],
         mut check: impl FnMut(u16) -> PortAvailability<H>,
     ) -> Result<LeaseOutcome<H>, PortError<H>> {
+        self.try_allocate(id, range, reserved, |port| {
+            Ok::<_, std::convert::Infallible>(check(port))
+        })
+    }
+
+    /// Allocate while propagating errors from the injected conflict probe.
+    ///
+    /// A probe error never changes the lease table and is not treated as a free port.
+    pub fn try_allocate<H, E>(
+        &mut self,
+        id: &InstanceId,
+        range: PortRange,
+        reserved: &[u16],
+        mut check: impl FnMut(u16) -> Result<PortAvailability<H>, E>,
+    ) -> Result<LeaseOutcome<H>, PortError<H, E>> {
         if range.start == 0 || range.start > range.end {
             return Err(PortError::InvalidRange);
         }
@@ -125,7 +147,7 @@ impl PortLeases {
             } else if other_leases.contains(&port) {
                 PreviousLeaseReason::Duplicate
             } else {
-                match check(port) {
+                match check(port).map_err(|source| PortError::Probe { port, source })? {
                     PortAvailability::Free => return Ok(LeaseOutcome { port, previous: None }),
                     PortAvailability::Busy(holder) => PreviousLeaseReason::Busy(holder),
                 }
@@ -141,7 +163,10 @@ impl PortLeases {
             {
                 continue;
             }
-            if matches!(check(port), PortAvailability::Free) {
+            if matches!(
+                check(port).map_err(|source| PortError::Probe { port, source })?,
+                PortAvailability::Free
+            ) {
                 self.leases.insert(id.clone(), port);
                 return Ok(LeaseOutcome { port, previous });
             }
@@ -289,5 +314,34 @@ mod tests {
         let b = reserved.allocate(&id("app"), range, &[39100], free).unwrap();
         assert_eq!(b.port, 39101);
         assert_eq!(b.previous.unwrap().reason, PreviousLeaseReason::Reserved);
+    }
+
+    #[test]
+    fn probe_failure_is_reported_and_does_not_mutate_leases() {
+        let mut leases = PortLeases::from_table(BTreeMap::from([(id("app"), 39100)]));
+        let old = leases.clone();
+        let result: Result<LeaseOutcome<()>, PortError<(), &str>> = leases.try_allocate(
+            &id("app"),
+            PortRange {
+                start: 39100,
+                end: 39101,
+            },
+            &[],
+            |port| {
+                if port == 39100 {
+                    Ok(PortAvailability::Busy(None))
+                } else {
+                    Err("scan unavailable")
+                }
+            },
+        );
+        assert_eq!(
+            result,
+            Err(PortError::Probe {
+                port: 39101,
+                source: "scan unavailable"
+            })
+        );
+        assert_eq!(leases, old);
     }
 }

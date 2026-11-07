@@ -415,6 +415,14 @@ async fn run(program: &str, args: &[String], timeout: Duration) -> Result<String
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+impl SystemctlBackend {
+    async fn absent(&self, unit: &str) -> bool {
+        self.poll(&[unit.to_owned()])
+            .await
+            .is_ok_and(|rows| rows.is_empty() || rows.iter().all(|row| row.load == Load::NotFound))
+    }
+}
+
 impl UserSystemd for SystemctlBackend {
     fn start<'a>(&'a self, spec: &'a UnitStart) -> SystemdFuture<'a, ()> {
         Box::pin(async move {
@@ -430,13 +438,17 @@ impl UserSystemd for SystemctlBackend {
             if !valid_unit(unit, ".service") {
                 return Err(UnitError::Invalid("invalid unit".into()));
             }
-            run(
+            let result = run(
                 "systemctl",
                 &["--user".into(), "stop".into(), "--".into(), unit.into()],
                 stop_timeout.saturating_add(Duration::from_secs(15)),
             )
-            .await?;
-            Ok(())
+            .await;
+            match result {
+                Ok(_) => Ok(()),
+                Err(_) if self.absent(unit).await => Ok(()),
+                Err(error) => Err(error),
+            }
         })
     }
     fn reset_failed<'a>(&'a self, unit: &'a str) -> SystemdFuture<'a, ()> {
@@ -444,13 +456,17 @@ impl UserSystemd for SystemctlBackend {
             if !valid_unit(unit, ".service") {
                 return Err(UnitError::Invalid("invalid unit".into()));
             }
-            run(
+            let result = run(
                 "systemctl",
                 &["--user".into(), "reset-failed".into(), "--".into(), unit.into()],
                 Duration::from_secs(15),
             )
-            .await?;
-            Ok(())
+            .await;
+            match result {
+                Ok(_) => Ok(()),
+                Err(_) if self.absent(unit).await => Ok(()),
+                Err(error) => Err(error),
+            }
         })
     }
     fn poll<'a>(&'a self, units: &'a [String]) -> SystemdFuture<'a, Vec<UnitSnapshot>> {
@@ -747,7 +763,7 @@ mod tests {
         let spec = UnitStart {
             unit: unit.clone(),
             instance: id,
-            slice: names.slice,
+            slice: names.slice.clone(),
             cwd: dir.clone(),
             script: script.clone(),
             post_stop: None,
@@ -766,6 +782,40 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "unit did not fail in time: {rows:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = Command::new("journalctl")
+                .args([
+                    "--user",
+                    "--output=json",
+                    "--all",
+                    "--no-pager",
+                    "-n",
+                    "100",
+                    &format!("_SYSTEMD_USER_UNIT={unit}"),
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8_lossy(&output.stdout);
+            let found = text
+                .lines()
+                .filter_map(|line| super::super::journal::parse_line(line, &names).ok().flatten())
+                .any(|row| row.line.instance == spec.instance && row.line.line == "lantern-runtime-c5-first");
+            if found {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "crashed test unit's journal line was not found: {text}"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -788,5 +838,100 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "real system: runs and cancels its own one-shot unit in app-lantern-test.slice"]
+    async fn real_oneshot_exit_and_cancellation() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let id = InstanceId::parse(&format!("os-{unique}")).unwrap();
+        let names = UnitNames {
+            instance_prefix: "lantern-test-runtime-inst-".into(),
+            operation_prefix: "lantern-test-runtime-op-".into(),
+            slice: "app-lantern-test.slice".into(),
+        };
+        let unit = names.operation(&id, "setup", 1);
+        let dir = std::env::temp_dir().join(format!("lantern-test-runtime-oneshot-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let _cleanup = Cleanup {
+            unit: unit.clone(),
+            dir: dir.clone(),
+        };
+        let script = dir.join("script.sh");
+        fs::write(&script, "#!/bin/bash\necho lantern-runtime-oneshot\nexit 3\n").unwrap();
+        let spec = OneShotSpec {
+            unit: UnitStart {
+                unit,
+                instance: id,
+                slice: names.slice.clone(),
+                cwd: dir,
+                script: script.clone(),
+                post_stop: None,
+                stop_timeout: Duration::from_secs(1),
+            },
+            timeout: Duration::from_secs(10),
+            poll_interval: Duration::from_millis(50),
+        };
+        let backend = SystemctlBackend;
+        let result = run_oneshot(&backend, &spec, std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(3));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = Command::new("journalctl")
+                .args([
+                    "--user",
+                    "--output=json",
+                    "--all",
+                    "--no-pager",
+                    "-n",
+                    "100",
+                    &format!("_SYSTEMD_USER_UNIT={}", spec.unit.unit),
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8_lossy(&output.stdout);
+            let found = text
+                .lines()
+                .filter_map(|line| super::super::journal::parse_line(line, &names).ok().flatten())
+                .any(|row| {
+                    row.line.instance == spec.unit.instance
+                        && row.line.stream == lantern_core::model::Stream::Setup
+                        && row.line.line == "lantern-runtime-oneshot"
+                });
+            if found {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "setup test unit's journal line was not found: {text}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        fs::write(script, "#!/bin/bash\nexec sleep 30\n").unwrap();
+        let result = run_oneshot(&backend, &spec, tokio::time::sleep(Duration::from_millis(250))).await;
+        assert!(matches!(result, Err(OneShotError::Cancelled)), "{result:?}");
+        let snapshots = backend.poll(std::slice::from_ref(&spec.unit.unit)).await.unwrap();
+        assert!(snapshots.iter().all(|row| row.active != Active::Active));
+        let immediate = run_oneshot(&backend, &spec, async {}).await;
+        assert!(matches!(immediate, Err(OneShotError::Cancelled)), "{immediate:?}");
+        let mut timeout_spec = spec;
+        timeout_spec.timeout = Duration::from_millis(250);
+        let timed_out = run_oneshot(&backend, &timeout_spec, std::future::pending()).await;
+        assert!(matches!(timed_out, Err(OneShotError::Timeout)), "{timed_out:?}");
     }
 }

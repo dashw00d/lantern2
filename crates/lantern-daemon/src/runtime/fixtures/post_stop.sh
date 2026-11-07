@@ -4,7 +4,7 @@ cd '/work/feature x' || lantern_fail 'working directory missing'
 . '/cache/shell-env.sh' || lantern_fail 'cannot source shell environment'
 while IFS= read -r lantern_name; do unset "$lantern_name"; done < <(compgen -A variable LANTERN_)
 unset lantern_name
-case :"$PATH": in *:'/home/u/.cargo/bin':*) ;; *) export PATH="$PATH":'/home/u/.cargo/bin' ;; esac
+if [ -d '/home/u/.cargo/bin' ]; then case :"$PATH": in *:'/home/u/.cargo/bin':*) ;; *) export PATH="$PATH":'/home/u/.cargo/bin' ;; esac; fi
 export NVM_DIR='/home/u/.nvm'
 . "$NVM_DIR/nvm.sh" --no-use && nvm use --silent || lantern_fail 'nvm: .nvmrc version not installed (run: nvm install)'
 export VIRTUAL_ENV='/work/feature x/.venv'

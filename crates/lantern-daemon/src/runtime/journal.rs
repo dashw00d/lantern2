@@ -49,10 +49,11 @@ pub fn unit_stream(unit: &str, names: &UnitNames) -> Option<(InstanceId, Stream)
     }
     let rest = unit.strip_prefix(&names.operation_prefix)?;
     for (verb, stream) in [("-setup-", Stream::Setup), ("-deploy-", Stream::System)] {
-        if let Some((safe, seq)) = rest.rsplit_once(verb) {
-            if !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()) {
-                return Some((instance(safe)?, stream));
-            }
+        if let Some((safe, seq)) = rest.rsplit_once(verb)
+            && !seq.is_empty()
+            && seq.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Some((instance(safe)?, stream));
         }
     }
     None

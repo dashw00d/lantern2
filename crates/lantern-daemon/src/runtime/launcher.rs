@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use lantern_core::ids::InstanceId;
+use thiserror::Error;
 
 /// A shell-mutating version manager selected for the checkout.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -32,8 +33,8 @@ pub struct DetectedToolchain {
 /// All data needed to render a launch and optional post-stop script.
 ///
 /// `command`, `pre_start`, and `post_stop` must already be shell-rendered by the
-/// caller; map values and paths are data. All strings must be NUL-free and map
-/// keys must be valid shell identifiers. Violations cause `render` to panic.
+/// caller; map values and paths are data. Use `try_render` with untrusted input;
+/// `render` panics when its NUL-free, UTF-8 and identifier preconditions fail.
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
     /// Owning instance, also used for the two instance exports.
@@ -42,7 +43,7 @@ pub struct LaunchSpec {
     pub cwd: PathBuf,
     /// Optional captured shell environment file.
     pub shell_env: Option<PathBuf>,
-    /// Existing safety-net directories to append to PATH.
+    /// Safety-net directories to append to PATH when they exist.
     pub safety_path: Vec<PathBuf>,
     /// Detected toolchain, including an optional virtual environment.
     pub toolchain: DetectedToolchain,
@@ -60,6 +61,60 @@ pub struct LaunchSpec {
     pub post_stop: Option<String>,
     /// Already shell-rendered command.
     pub command: String,
+}
+
+/// An invalid value that cannot safely be represented in a launcher script.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum LaunchError {
+    /// A value or command contained a NUL byte.
+    #[error("launcher value contains NUL")]
+    Nul,
+    /// An environment or template variable name is not a valid shell identifier.
+    #[error("invalid launcher environment key: {0}")]
+    InvalidKey(String),
+    /// A path cannot be represented as NUL-free UTF-8 shell text.
+    #[error("launcher path is not NUL-free UTF-8")]
+    InvalidPath,
+}
+
+impl LaunchSpec {
+    /// Validate untrusted values before script generation.
+    pub fn validate(&self) -> Result<(), LaunchError> {
+        let path_ok = |path: &Path| path.to_str().is_some_and(|s| !s.contains('\0'));
+        if !path_ok(&self.cwd)
+            || self.shell_env.as_deref().is_some_and(|p| !path_ok(p))
+            || self.safety_path.iter().any(|p| !path_ok(p))
+            || matches!(&self.toolchain.manager, Toolchain::Nvm(p) if !path_ok(p))
+            || self.toolchain.virtual_env.as_deref().is_some_and(|p| !path_ok(p))
+        {
+            return Err(LaunchError::InvalidPath);
+        }
+        for vars in [&self.runtime_env, &self.env_file, &self.run_env, &self.variables] {
+            for (key, value) in vars {
+                if !identifier(key) {
+                    return Err(LaunchError::InvalidKey(key.clone()));
+                }
+                if value.contains('\0') {
+                    return Err(LaunchError::Nul);
+                }
+            }
+        }
+        for key in self.variables.keys() {
+            if !key
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
+                return Err(LaunchError::InvalidKey(key.clone()));
+            }
+        }
+        if self.command.contains('\0')
+            || self.pre_start.as_deref().is_some_and(|s| s.contains('\0'))
+            || self.post_stop.as_deref().is_some_and(|s| s.contains('\0'))
+        {
+            return Err(LaunchError::Nul);
+        }
+        Ok(())
+    }
 }
 
 /// Quote one NUL-free literal for Bash, including embedded single quotes.
@@ -102,7 +157,8 @@ fn preamble(spec: &LaunchSpec) -> String {
     out.push_str("while IFS= read -r lantern_name; do unset \"$lantern_name\"; done < <(compgen -A variable LANTERN_)\nunset lantern_name\n");
     for dir in &spec.safety_path {
         out.push_str(&format!(
-            "case :\"$PATH\": in *:{}:*) ;; *) export PATH=\"$PATH\":{} ;; esac\n",
+            "if [ -d {} ]; then case :\"$PATH\": in *:{}:*) ;; *) export PATH=\"$PATH\":{} ;; esac; fi\n",
+            path_quote(dir),
             path_quote(dir),
             path_quote(dir)
         ));
@@ -145,6 +201,7 @@ fn preamble(spec: &LaunchSpec) -> String {
 
 /// Render the main script, with literal values quoted and stdin kept open.
 pub fn render(spec: &LaunchSpec) -> String {
+    spec.validate().expect("invalid launcher spec");
     let mut out = preamble(spec);
     if let Some(command) = &spec.pre_start {
         assert!(!command.contains('\0'), "command cannot contain NUL");
@@ -162,13 +219,31 @@ pub fn render(spec: &LaunchSpec) -> String {
     out
 }
 
+/// Validate untrusted data and render the main script without panicking on invalid input.
+pub fn try_render(spec: &LaunchSpec) -> Result<String, LaunchError> {
+    spec.validate()?;
+    Ok(render(spec))
+}
+
 /// Render the optional ExecStopPost script with the same environment as the launch.
 pub fn render_post_stop(spec: &LaunchSpec) -> Option<String> {
+    spec.validate().expect("invalid launcher spec");
     spec.post_stop.as_ref().map(|command| {
         let mut out = preamble(spec);
-        out.push_str(&format!("exec bash -c {}\n", sh_quote(command)));
+        let prefix = if spec.toolchain.manager == Toolchain::Mise {
+            "exec mise exec -- bash -c "
+        } else {
+            "exec bash -c "
+        };
+        out.push_str(&format!("{prefix}{}\n", sh_quote(command)));
         out
     })
+}
+
+/// Validate untrusted data and render the optional post-stop script.
+pub fn try_render_post_stop(spec: &LaunchSpec) -> Result<Option<String>, LaunchError> {
+    spec.validate()?;
+    Ok(render_post_stop(spec))
 }
 
 fn executable_on_path(name: &str, path: &str) -> bool {
@@ -285,14 +360,69 @@ mod tests {
         let mut s = spec();
         s.toolchain.manager = Toolchain::Mise;
         assert!(render(&s).contains("exec mise exec -- bash -c 'pnpm"));
+        assert!(
+            render_post_stop(&s)
+                .unwrap()
+                .contains("exec mise exec -- bash -c 'echo stop")
+        );
         s.toolchain.manager = Toolchain::Fnm;
         assert!(render(&s).contains("fnm use --version-file-strategy=recursive"));
+    }
+
+    #[test]
+    fn exported_values_are_data_and_inherited_lantern_variables_are_removed() {
+        use std::fs;
+        use std::process::Command;
+        let root = std::env::temp_dir().join(format!("lantern-runtime-envtest-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let env_file = root.join("env.sh");
+        fs::write(
+            &env_file,
+            "export LANTERN_DAEMON_URL=unsafe LANTERN_STALE=unsafe\n",
+        )
+        .unwrap();
+        let mut s = spec();
+        s.cwd = root.clone();
+        s.shell_env = Some(env_file);
+        s.safety_path.clear();
+        s.toolchain = DetectedToolchain::default();
+        let script = format!(
+            "{}printf '%s\\n' \"$LANTERN_BRANCH\" \"${{LANTERN_DAEMON_URL-unset}}\" \"${{LANTERN_DAEMON_PORT-unset}}\" \"${{LANTERN_STALE-unset}}\" \"$LANTERN_INSTANCE_ID\" \"$PORT\"\n",
+            preamble(&s)
+        );
+        let output = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(script)
+            .env("LANTERN_DAEMON_PORT", "unsafe")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "x$(id)\nunset\nunset\nunset\napp@feature\n29100\n"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     #[should_panic(expected = "NUL")]
     fn nul_is_rejected() {
         sh_quote("bad\0value");
+    }
+
+    #[test]
+    fn untrusted_launcher_inputs_return_validation_errors() {
+        let mut s = spec();
+        s.run_env.insert("BAD-KEY".into(), "value".into());
+        assert_eq!(try_render(&s), Err(LaunchError::InvalidKey("BAD-KEY".into())));
+        s.run_env.clear();
+        s.variables.insert("BRANCH".into(), "bad\0value".into());
+        assert_eq!(try_render(&s), Err(LaunchError::Nul));
+        assert_eq!(try_render_post_stop(&s), Err(LaunchError::Nul));
     }
 
     #[test]

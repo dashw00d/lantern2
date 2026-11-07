@@ -189,12 +189,11 @@ pub fn merge_path(shell: &str, manager: &str, safety_dirs: &[PathBuf]) -> String
         }
     }
     for dir in safety_dirs {
-        if dir.is_dir() {
-            if let Some(part) = dir.to_str() {
-                if seen.insert(part.to_owned()) {
-                    out.push(part.to_owned());
-                }
-            }
+        if dir.is_dir()
+            && let Some(part) = dir.to_str()
+            && seen.insert(part.to_owned())
+        {
+            out.push(part.to_owned());
         }
     }
     out.join(":")
