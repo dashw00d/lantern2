@@ -42,6 +42,12 @@ fn strategy(mode: PortMode) -> PortStrategy {
         PortMode::Setcap => PortStrategy::Setcap,
     }
 }
+fn validate_setcap_selection(mode: PortMode, configured: &str) -> Result<(), String> {
+    if mode == PortMode::Setcap && configured != "/usr/lib/lantern/caddy" {
+        return Err("--ports=setcap requires [caddy].binary = \"/usr/lib/lantern/caddy\" so the daemon selects the capability-bearing executable".into());
+    }
+    Ok(())
+}
 fn step_report(step: &init::StepReport) -> Value {
     let (state, detail) = match &step.state {
         StepState::Done(detail) => ("Done", detail),
@@ -135,6 +141,7 @@ impl SystemActions for System {
                 let user = init::ResolvedUser::from_uid(uid)?;
                 (user.paths, user.settings)
             };
+            validate_setcap_selection(*ports, &settings.caddy.binary)?;
             let runner = ProcessRunner {
                 fake_root: paths.fake_root.is_some(),
             };
@@ -223,6 +230,7 @@ impl SystemActions for System {
                 Ok(json!({"ok":ok, "checked_at":lantern_core::Timestamp::now(), "checks":checks}))
             }
             SystemCommand::Init { ports, .. } => {
+                validate_setcap_selection(*ports, &settings.caddy.binary)?;
                 if *ports == PortMode::Setcap && caddy != paths.bundled_caddy {
                     return Err(format!(
                         "--ports=setcap requires the selected Caddy to be {}; set [caddy].binary to this root-owned executable",
@@ -256,13 +264,16 @@ impl SystemActions for System {
                     .iter()
                     .map(|o| json!({"id":o.id, "state":format!("{:?}",o.state), "detail":o.detail}))
                     .collect();
-                let root = match init::complete_init(&system, &plan) {
-                    Ok(steps) => steps.iter().map(step_report).collect::<Vec<_>>(),
-                    Err(error) => vec![
-                        json!({"id":"system_steps", "state":"Failed", "detail":error, "needs_root":true}),
-                    ],
+                let (root, pending) = match init::complete_init(&system, &plan) {
+                    Ok(steps) => (steps.iter().map(step_report).collect::<Vec<_>>(), false),
+                    Err(error) => (
+                        vec![
+                            json!({"id":"system_steps", "state":"Failed", "detail":error, "needs_root":true}),
+                        ],
+                        true,
+                    ),
                 };
-                let pkexec = plan.pkexec.map(|command| json!({"program":command.program, "args":command.args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>() }));
+                let pkexec = plan.pkexec.filter(|_| pending).map(|command| json!({"program":command.program, "args":command.args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>() }));
                 Ok(json!({"user_steps":outcomes,"system_steps":root,"pkexec":pkexec}))
             }
             SystemCommand::InitSystem { .. } => unreachable!("handled before loading caller environment"),
@@ -273,8 +284,17 @@ impl SystemActions for System {
 
 #[cfg(test)]
 mod tests {
-    use super::caddy_selection;
+    use super::{caddy_selection, validate_setcap_selection};
+    use lantern_cli::args::PortMode;
     use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn setcap_requires_explicit_packaged_caddy_selection() {
+        assert!(validate_setcap_selection(PortMode::Sysctl, "").is_ok());
+        assert!(validate_setcap_selection(PortMode::Setcap, "").is_err());
+        assert!(validate_setcap_selection(PortMode::Setcap, "/home/user/caddy").is_err());
+        assert!(validate_setcap_selection(PortMode::Setcap, "/usr/lib/lantern/caddy").is_ok());
+    }
 
     #[test]
     fn wire_caddy_selection_reports_missing_and_finds_bundled_binary() {

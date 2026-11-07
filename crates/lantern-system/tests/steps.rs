@@ -1493,6 +1493,47 @@ fn init_elevation_uses_selected_strategy_and_rechecks_fake_root() {
             && err.contains("sudo lantern init --system-steps --uid 1000 --ports=setcap"),
         "{err}"
     );
+    struct JsonFailure;
+    impl CommandRunner for JsonFailure {
+        fn run(&self, _: &CommandSpec) -> io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                success: false,
+                stdout: br#"{"system_steps":[{"id":"ports","state":"Failed","detail":"sysctl failed"}]}"#
+                    .to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+    let err = complete_init(
+        &SystemInitCtx {
+            runner: &JsonFailure,
+            ..system
+        },
+        &plan,
+    )
+    .unwrap_err();
+    assert!(err.contains("ports: sysctl failed"));
+    assert!(!err.contains('{'));
+    struct JsonError;
+    impl CommandRunner for JsonError {
+        fn run(&self, _: &CommandSpec) -> io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                success: false,
+                stdout: Vec::new(),
+                stderr: br#"{"error":{"message":"permission denied"},"exit_code":2}"#.to_vec(),
+            })
+        }
+    }
+    let err = complete_init(
+        &SystemInitCtx {
+            runner: &JsonError,
+            ..system
+        },
+        &plan,
+    )
+    .unwrap_err();
+    assert!(err.contains("permission denied"));
+    assert!(!err.contains('{'));
 }
 
 #[test]

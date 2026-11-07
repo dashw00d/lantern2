@@ -887,3 +887,25 @@ async fn init_port_strategy_and_root_fallback_cli_are_forwarded() {
         assert!(err.is_empty());
     }
 }
+
+#[tokio::test]
+async fn doctor_warning_only_keeps_success_exit() {
+    struct FakeSystem;
+    impl lantern_cli::SystemActions for FakeSystem {
+        fn execute(&self, _: &lantern_cli::SystemCommand) -> Result<Value, String> {
+            Ok(
+                json!({"checks":[{"id":"session.systemd","title":"User systemd","status":"warn","detail":"degraded","fix":{"description":"inspect units","command":"systemctl --user --failed","needs_root":false}}]}),
+            )
+        }
+    }
+    for args in [&["lantern", "doctor"][..], &["lantern", "doctor", "--json"][..]] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert!(matches!(
+            dispatch(cli, &FakeSystem, &mut out, &mut err, false).await,
+            CliAction::Exit(0)
+        ));
+        assert!(err.is_empty());
+    }
+}

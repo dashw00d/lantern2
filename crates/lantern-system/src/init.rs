@@ -450,6 +450,44 @@ pub fn run_init(user: &InitCtx<'_>, system: &SystemInitCtx<'_>) -> Result<InitPl
     })
 }
 
+fn root_failure_detail(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Some(text.into());
+    };
+    if let Some(message) = value
+        .get("error")
+        .and_then(|v| v.get("message"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(message.into());
+    }
+    let details = value
+        .get("system_steps")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|step| step.get("state").and_then(serde_json::Value::as_str) == Some("Failed"))
+        .map(|step| {
+            format!(
+                "{}: {}",
+                step.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("step"),
+                step.get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("failed")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if details.is_empty() { None } else { Some(details) }
+}
+
 /// Execute a pending root plan through the injected runner and recheck its results.
 pub fn complete_init(system: &SystemInitCtx<'_>, plan: &InitPlan) -> Result<Vec<StepReport>, String> {
     let Some(mut command) = plan.pkexec.clone() else {
@@ -481,13 +519,9 @@ pub fn complete_init(system: &SystemInitCtx<'_>, plan: &InitPlan) -> Result<Vec<
         .run(&command)
         .map_err(|e| format!("could not run pkexec: {e}; run {fallback}"))?;
     if !result.success {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        let stdout = String::from_utf8_lossy(&result.stdout);
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim()
-        } else {
-            stdout.trim()
-        };
+        let detail = root_failure_detail(&result.stderr)
+            .or_else(|| root_failure_detail(&result.stdout))
+            .unwrap_or_default();
         return Err(format!(
             "root setup failed{}; run {fallback}",
             if detail.is_empty() {
