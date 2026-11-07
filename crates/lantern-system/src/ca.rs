@@ -174,24 +174,7 @@ fn existing(paths: &LanternPaths, tld: &str, minimum_days: i64) -> Result<CaInfo
 pub fn inspect_root(paths: &LanternPaths, tld: &str, minimum_days: i64) -> Result<CaInfo, CaError> {
     existing(paths, tld, minimum_days)
 }
-/// Create a new root, or retain an existing valid root; unsafe rotation is refused.
-pub fn ensure_root(paths: &LanternPaths, tld: &str) -> Result<CaState, CaError> {
-    if !valid_tld(tld) {
-        return Err(CaError::Invalid("invalid TLD".into()));
-    }
-    let cert_exists = fs::symlink_metadata(&paths.root_cert).is_ok();
-    let key_exists = fs::symlink_metadata(&paths.root_key).is_ok();
-    if cert_exists || key_exists {
-        return existing(paths, tld, 90)
-            .map(CaState::Existing)
-            .map_err(|e| CaError::RotationRequired(e.to_string()));
-    }
-    fs::create_dir_all(&paths.ca_dir)?;
-    let dir = fs::symlink_metadata(&paths.ca_dir)?;
-    if !dir.file_type().is_dir() {
-        return Err(CaError::Invalid("CA directory must be a real directory".into()));
-    }
-    fs::set_permissions(&paths.ca_dir, fs::Permissions::from_mode(0o700))?;
+fn generate_material(tld: &str) -> Result<(Vec<u8>, Vec<u8>, CaInfo), CaError> {
     let now = OffsetDateTime::now_utc();
     let mut params = CertificateParams::default();
     params.distinguished_name = DistinguishedName::new();
@@ -214,20 +197,218 @@ pub fn ensure_root(paths: &LanternPaths, tld: &str) -> Result<CaState, CaError> 
         .self_signed(&key)
         .map_err(|e| CaError::Invalid(e.to_string()))?;
     let info = inspect_der(cert.der().as_ref(), tld)?;
-    atomic_write(&paths.root_key, key.serialize_pem().as_bytes(), 0o600)?;
-    if let Err(e) = atomic_write(&paths.root_cert, cert.pem().as_bytes(), 0o644) {
+    Ok((key.serialize_pem().into_bytes(), cert.pem().into_bytes(), info))
+}
+/// Create a new root, or retain an existing valid root; unsafe rotation is refused.
+pub fn ensure_root(paths: &LanternPaths, tld: &str) -> Result<CaState, CaError> {
+    if !valid_tld(tld) {
+        return Err(CaError::Invalid("invalid TLD".into()));
+    }
+    let cert_exists = fs::symlink_metadata(&paths.root_cert).is_ok();
+    let key_exists = fs::symlink_metadata(&paths.root_key).is_ok();
+    let old_caddy_state = [
+        &paths.intermediate_cert,
+        &paths.intermediate_key,
+        &paths.certificates,
+    ]
+    .into_iter()
+    .any(|path| fs::symlink_metadata(path).is_ok());
+    if !cert_exists && !key_exists && old_caddy_state {
+        return Err(CaError::RotationRequired(
+            "orphaned Caddy certificates must be archived before creating a new root".into(),
+        ));
+    }
+    if cert_exists || key_exists {
+        return existing(paths, tld, 90)
+            .map(CaState::Existing)
+            .map_err(|e| CaError::RotationRequired(e.to_string()));
+    }
+    fs::create_dir_all(&paths.ca_dir)?;
+    let dir = fs::symlink_metadata(&paths.ca_dir)?;
+    if !dir.file_type().is_dir() {
+        return Err(CaError::Invalid("CA directory must be a real directory".into()));
+    }
+    fs::set_permissions(&paths.ca_dir, fs::Permissions::from_mode(0o700))?;
+    let (key_pem, cert_pem, info) = generate_material(tld)?;
+    atomic_write(&paths.root_key, &key_pem, 0o600)?;
+    if let Err(e) = atomic_write(&paths.root_cert, &cert_pem, 0o644) {
         let _ = fs::remove_file(&paths.root_key);
         return Err(e.into());
     }
     Ok(CaState::Created(info))
 }
-/// User step that creates the local root and refuses uncoordinated rotation.
-#[derive(Debug)]
+/// Rotate a stale or invalid root while coordinating Caddy and preserving old files.
+pub fn rotate_root(
+    paths: &LanternPaths,
+    tld: &str,
+    runner: &dyn crate::command::CommandRunner,
+) -> Result<CaInfo, CaError> {
+    use crate::{command::CommandSpec, steps::run_checked};
+    use std::{ffi::OsString, path::PathBuf};
+    if !valid_tld(tld) {
+        return Err(CaError::Invalid("invalid TLD".into()));
+    }
+    let runtime =
+        paths.runtime.as_ref().and_then(|p| p.parent()).ok_or_else(|| {
+            CaError::RotationRequired("no user systemd session for Caddy coordination".into())
+        })?;
+    let command = |args: &[&str], mutating: bool| {
+        let mut spec = CommandSpec::new("/usr/bin/systemctl", args.iter().copied(), mutating);
+        spec.env
+            .insert(OsString::from("XDG_RUNTIME_DIR"), runtime.as_os_str().to_owned());
+        spec.env.insert(
+            OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+            OsString::from(format!("unix:path={}/bus", runtime.display())),
+        );
+        spec
+    };
+    if fs::symlink_metadata(&paths.ca_dir).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+        fs::create_dir_all(&paths.ca_dir)?;
+        fs::set_permissions(&paths.ca_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    if !fs::symlink_metadata(&paths.ca_dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return Err(CaError::Invalid("CA directory must be a real directory".into()));
+    }
+    let candidates = [
+        (&paths.root_key, "root.key"),
+        (&paths.root_cert, "root.crt"),
+        (&paths.intermediate_key, "intermediate.key"),
+        (&paths.intermediate_cert, "intermediate.crt"),
+        (&paths.certificates, "certificates"),
+    ];
+    for (path, name) in candidates {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(CaError::Invalid(format!("refusing symlinked {name}")));
+            }
+            Ok(meta)
+                if (name == "certificates" && !meta.is_dir())
+                    || (name != "certificates" && !meta.is_file()) =>
+            {
+                return Err(CaError::Invalid(format!("unexpected file type for {name}")));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let (key, cert, info) = generate_material(tld)?;
+    let status = runner
+        .run(&command(&["--user", "is-active", "lantern-caddy.service"], false))
+        .map_err(CaError::Io)?;
+    let was_active = if status.success {
+        true
+    } else if matches!(
+        String::from_utf8_lossy(&status.stdout).trim(),
+        "inactive" | "failed" | "unknown"
+    ) {
+        false
+    } else {
+        return Err(CaError::RotationRequired(
+            "could not determine Caddy state".into(),
+        ));
+    };
+    if was_active {
+        run_checked(
+            runner,
+            &command(&["--user", "stop", "lantern-caddy.service"], true),
+            paths.fake_root.is_some(),
+        )
+        .map_err(CaError::RotationRequired)?;
+    }
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut written_key = false;
+    let mut written_cert = false;
+    let mut archive: Option<PathBuf> = None;
+    let attempt = (|| -> Result<(), CaError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        for suffix in 0..1000 {
+            let dir = paths.ca_dir.join(format!(".old-{now}-{suffix}"));
+            match fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {
+                    archive = Some(dir);
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let dir = archive
+            .as_ref()
+            .ok_or_else(|| CaError::Invalid("could not create unique CA archive".into()))?;
+        for (source, name) in candidates {
+            if fs::symlink_metadata(source).is_ok() {
+                let destination = dir.join(name);
+                fs::rename(source, &destination)?;
+                moved.push((source.to_path_buf(), destination));
+            }
+        }
+        atomic_write(&paths.root_key, &key, 0o600)?;
+        written_key = true;
+        atomic_write(&paths.root_cert, &cert, 0o644)?;
+        written_cert = true;
+        if was_active {
+            run_checked(
+                runner,
+                &command(&["--user", "start", "lantern-caddy.service"], true),
+                paths.fake_root.is_some(),
+            )
+            .map_err(CaError::RotationRequired)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = attempt {
+        let mut recovery_errors = Vec::new();
+        if written_cert && let Err(e) = fs::remove_file(&paths.root_cert) {
+            recovery_errors.push(e.to_string());
+        }
+        if written_key && let Err(e) = fs::remove_file(&paths.root_key) {
+            recovery_errors.push(e.to_string());
+        }
+        for (source, destination) in moved.iter().rev() {
+            if let Err(e) = fs::rename(destination, source) {
+                recovery_errors.push(e.to_string());
+            }
+        }
+        if let Some(dir) = archive {
+            let _ = fs::remove_dir(dir);
+        }
+        if was_active
+            && let Err(e) = run_checked(
+                runner,
+                &command(&["--user", "start", "lantern-caddy.service"], true),
+                paths.fake_root.is_some(),
+            )
+        {
+            recovery_errors.push(format!("Caddy restart: {e}"));
+        }
+        return if recovery_errors.is_empty() {
+            Err(error)
+        } else {
+            Err(CaError::RotationRequired(format!(
+                "{error}; recovery incomplete: {}",
+                recovery_errors.join("; ")
+            )))
+        };
+    }
+    Ok(info)
+}
+/// User step that creates the local root and coordinates necessary rotations.
 pub struct CaStep<'a> {
     /// User paths.
     pub paths: &'a LanternPaths,
     /// Configured TLD.
     pub tld: &'a str,
+    /// Command boundary used to stop and restart Caddy during rotation.
+    pub runner: Option<&'a dyn crate::command::CommandRunner>,
+}
+impl std::fmt::Debug for CaStep<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaStep")
+            .field("tld", &self.tld)
+            .finish_non_exhaustive()
+    }
 }
 impl Step for CaStep<'_> {
     fn id(&self) -> &'static str {
@@ -253,7 +434,7 @@ impl Step for CaStep<'_> {
         }
         match existing(self.paths, self.tld, 90) {
             Ok(info) => StepState::Done(format!("CA {} is valid", info.fingerprint_sha256)),
-            Err(e) => StepState::Failed(format!("CA rotation requires coordinated Caddy stop: {e}")),
+            Err(e) => StepState::Pending(format!("CA needs coordinated rotation: {e}")),
         }
     }
     fn apply(&self) -> StepOutcome {
@@ -266,6 +447,16 @@ impl Step for CaStep<'_> {
                 OutcomeState::Changed,
                 "created name-constrained local CA",
             ),
+            Err(CaError::RotationRequired(_)) if self.runner.is_some() => {
+                match rotate_root(self.paths, self.tld, self.runner.expect("checked")) {
+                    Ok(_) => StepOutcome::new(
+                        self.id(),
+                        OutcomeState::Changed,
+                        "rotated CA; browser and system trust must be refreshed",
+                    ),
+                    Err(e) => StepOutcome::new(self.id(), OutcomeState::Failed, e.to_string()),
+                }
+            }
             Err(e) => StepOutcome::new(self.id(), OutcomeState::Failed, e.to_string()),
         }
     }

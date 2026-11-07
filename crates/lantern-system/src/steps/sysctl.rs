@@ -90,9 +90,6 @@ impl Step for PortsStep<'_> {
             return StepState::Failed(e);
         }
         let min = self.http_port.min(self.https_port);
-        if min >= 1024 {
-            return StepState::Done("both ports are unprivileged".into());
-        }
         if fs::read_to_string(&self.paths.sysctl_live)
             .ok()
             .and_then(|s| s.trim().parse::<u16>().ok())

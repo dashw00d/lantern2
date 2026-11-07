@@ -787,3 +787,148 @@ fn init_defaults_to_real_ca_and_fake_system_trust() {
     );
     assert!(again.pkexec.is_none());
 }
+
+#[test]
+fn ca_rotation_stops_caddy_archives_old_roots_and_restarts() {
+    use lantern_system::ca::{CaStep, ensure_root, inspect_root};
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    ensure_root(&f.paths, "glow").unwrap();
+    let old = fs::read(&f.paths.root_cert).unwrap();
+    f.write(&f.paths.intermediate_cert, b"old-intermediate");
+    f.write(&f.paths.certificates.join("host/leaf.crt"), b"old-leaf");
+    let step = CaStep {
+        paths: &f.paths,
+        tld: "glow2",
+        runner: Some(&runner),
+    };
+    assert!(matches!(step.check(), StepState::Pending(_)));
+    assert_eq!(step.apply().state, OutcomeState::Changed);
+    assert_eq!(step.apply().state, OutcomeState::AlreadyDone);
+    assert_eq!(
+        inspect_root(&f.paths, "glow2", 90).unwrap().permitted_subtree,
+        ".glow2"
+    );
+    let archive = fs::read_dir(&f.paths.ca_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(".old-"))
+        .unwrap();
+    assert_eq!(fs::read(archive.join("root.crt")).unwrap(), old);
+    assert_eq!(
+        fs::read(archive.join("intermediate.crt")).unwrap(),
+        b"old-intermediate"
+    );
+    assert_eq!(
+        fs::read(archive.join("certificates/host/leaf.crt")).unwrap(),
+        b"old-leaf"
+    );
+    assert!(!f.paths.intermediate_cert.exists() && !f.paths.certificates.exists());
+    let calls = &runner.state.borrow().commands;
+    let ops: Vec<_> = calls
+        .iter()
+        .filter(|c| c.mutating)
+        .map(|c| {
+            c.args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(ops.len(), 2);
+    assert_eq!(ops[0][1], "stop");
+    assert_eq!(ops[1][1], "start");
+    assert!(calls.iter().filter(|c| c.mutating).all(|c| c.fake_root));
+}
+#[test]
+fn ca_rotation_rolls_back_if_caddy_cannot_restart() {
+    use lantern_system::ca::{CaStep, ensure_root, inspect_root};
+    struct FailFirstStart<'a> {
+        base: &'a RecordingRunner,
+        failed: std::cell::Cell<bool>,
+    }
+    impl CommandRunner for FailFirstStart<'_> {
+        fn run(&self, spec: &CommandSpec) -> io::Result<CommandOutput> {
+            if spec.args.iter().any(|a| a == "start") && !self.failed.replace(true) {
+                self.base.state.borrow_mut().commands.push(spec.clone());
+                return Ok(CommandOutput {
+                    success: false,
+                    stdout: vec![],
+                    stderr: b"simulated start failure".to_vec(),
+                });
+            }
+            self.base.run(spec)
+        }
+    }
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    ensure_root(&f.paths, "glow").unwrap();
+    let old = fs::read(&f.paths.root_cert).unwrap();
+    f.write(&f.paths.intermediate_cert, b"old-intermediate");
+    let failure = FailFirstStart {
+        base: &runner,
+        failed: std::cell::Cell::new(false),
+    };
+    let step = CaStep {
+        paths: &f.paths,
+        tld: "glow2",
+        runner: Some(&failure),
+    };
+    assert_eq!(step.apply().state, OutcomeState::Failed);
+    assert_eq!(fs::read(&f.paths.root_cert).unwrap(), old);
+    assert_eq!(fs::read(&f.paths.intermediate_cert).unwrap(), b"old-intermediate");
+    assert!(inspect_root(&f.paths, "glow", 90).is_ok());
+    assert_eq!(
+        runner
+            .state
+            .borrow()
+            .commands
+            .iter()
+            .filter(|c| c.args.iter().any(|a| a == "start"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn orphaned_caddy_leaves_are_archived_before_new_root() {
+    use lantern_system::ca::{CaStep, inspect_root};
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(&f.paths.certificates.join("host/old.crt"), b"old-leaf");
+    let step = CaStep {
+        paths: &f.paths,
+        tld: "glow",
+        runner: Some(&runner),
+    };
+    assert_eq!(step.apply().state, OutcomeState::Changed);
+    assert!(!f.paths.certificates.exists());
+    assert!(inspect_root(&f.paths, "glow", 90).is_ok());
+    let archive = fs::read_dir(&f.paths.ca_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(".old-"))
+        .unwrap();
+    assert_eq!(
+        fs::read(archive.join("certificates/host/old.crt")).unwrap(),
+        b"old-leaf"
+    );
+}
+#[test]
+fn high_ports_still_check_the_actual_kernel_threshold() {
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(&f.paths.sysctl_live, b"65535");
+    let step = PortsStep {
+        paths: &f.paths,
+        runner: &runner,
+        http_port: 8080,
+        https_port: 8443,
+        caddy: &f.paths.bundled_caddy,
+        strategy: PortStrategy::Sysctl,
+        from_package: false,
+    };
+    assert!(matches!(step.check(), StepState::Pending(_)));
+    assert_eq!(step.apply().state, OutcomeState::Changed);
+    assert!(matches!(step.check(), StepState::Done(_)));
+}

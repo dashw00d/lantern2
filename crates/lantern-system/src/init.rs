@@ -194,6 +194,7 @@ pub fn run_user_steps(ctx: &InitCtx<'_>) -> Vec<StepOutcome> {
         None => crate::ca::CaStep {
             paths: ctx.paths,
             tld: ctx.tld,
+            runner: Some(ctx.runner),
         }
         .apply(),
     });
