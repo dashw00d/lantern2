@@ -1,9 +1,33 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProfileScalar": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "format": "double",
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    }
+  },
   "description": "Profile services, start targets and environment overlay.",
   "properties": {
     "auto_start": {
       "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "auto_start_projects": {
+      "default": [],
+      "deprecated": true,
       "items": {
         "type": "string"
       },
@@ -18,7 +42,7 @@
     },
     "env": {
       "additionalProperties": {
-        "type": "string"
+        "$ref": "#/definitions/ProfileScalar"
       },
       "default": {},
       "type": "object"

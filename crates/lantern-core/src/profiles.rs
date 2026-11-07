@@ -21,9 +21,18 @@ pub struct Profile {
     pub services: Vec<String>,
     #[serde(alias = "auto_start_projects")]
     pub auto_start: Vec<String>,
+    #[schemars(with = "BTreeMap<String, ProfileScalar>")]
     pub env: BTreeMap<String, String>,
     pub port_range: Option<[u16; 2]>,
     pub stop_others: bool,
+}
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(untagged)]
+enum ProfileScalar {
+    Text(String),
+    Number(f64),
+    Boolean(bool),
 }
 /// A parsed profile and diagnostics.
 #[derive(Debug, Clone, PartialEq)]

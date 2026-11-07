@@ -49,7 +49,16 @@ pub fn manifest_json_schema() -> Value {
 }
 /// Generate the profile schema in draft-07 form.
 pub fn profile_json_schema() -> Value {
-    generate::<Profile>()
+    let mut schema = generate::<Profile>();
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut)
+        && let Some(mut alias) = properties.get("auto_start").cloned()
+    {
+        if let Some(object) = alias.as_object_mut() {
+            object.insert("deprecated".into(), json!(true));
+        }
+        properties.insert("auto_start_projects".into(), alias);
+    }
+    schema
 }
 /// Generate the settings schema in draft-07 form.
 pub fn config_json_schema() -> Value {
