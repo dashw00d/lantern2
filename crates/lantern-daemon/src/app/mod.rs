@@ -15,6 +15,9 @@ pub mod gateway;
 /// Intel refresh worker.
 pub mod intel_worker;
 
+/// Read-only shared-service detection.
+pub mod services;
+
 /// Network construction and diagnostics.
 pub mod network;
 
@@ -36,7 +39,7 @@ use crate::{
     registry::{RegistryHandle, state_io::Recovery},
     runtime::{
         Runtime, RuntimeAdapters, RuntimeConfig,
-        seams::{ScannerProbe, UnavailableServices},
+        seams::ScannerProbe,
         systemd::{SystemctlBackend, UnitNames},
     },
 };
@@ -270,6 +273,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             dns_health.set_dns_error(error);
         }
     });
+    let services = Arc::new(services::ServiceObserver::new(settings.clone(), !isolated_units));
     let runtime = Arc::new(Runtime::with_scoped_journal(
         RuntimeConfig {
             settings: settings.clone(),
@@ -288,7 +292,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         RuntimeAdapters {
             preparer: Arc::new(CheckoutPreparer(service.clone())),
             router: router.clone(),
-            services: Arc::new(UnavailableServices),
+            services: services.clone(),
         },
         args.restrict_journal_to_units,
     ));
@@ -347,6 +351,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             home,
             boot_id.clone(),
         )
+        .with_services(services.clone())
         .with_intel(intel.clone())
         .with_network_health(net_health, isolated_units)
         .with_environment(env.clone())
@@ -383,6 +388,29 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             }
             let delay = InstanceService::refresh_interval(!git_registry.listeners().1.is_empty());
             tokio::select! { ()=git_shutdown.cancelled()=>break, ()=tokio::time::sleep(delay)=>{} }
+        }
+    });
+    let services_shutdown = shutdown.clone();
+    let services_router = router.clone();
+    let services_bus = bus.clone();
+    let service_enabled = settings.services.mailpit.enabled;
+    let services_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut previous = BTreeMap::new();
+        loop {
+            tokio::select! {
+                () = services_shutdown.cancelled() => break,
+                _ = interval.tick() => for name in ["mailpit", "redis", "postgres"] {
+                    if let Some(status) = services.status(name).await && previous.get(name) != Some(&status) {
+                        if name == "mailpit" {
+                            let upstream = (status.state == lantern_core::api::ServiceState::Running).then(|| ([127,0,0,1], status.ports["ui"]).into());
+                            services_router.set_mailpit(service_enabled, upstream);
+                        }
+                        services_bus.publish(lantern_core::api::Event::ServiceUpdated { service: status.clone() });
+                        previous.insert(name, status);
+                    }
+                }
+            }
         }
     });
     let mut errors = registry.subscribe_write_errors();
@@ -456,6 +484,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     let _ = network_task.await;
     let _ = dns_task.await;
     let _ = intel_task.await;
+    let _ = services_task.await;
     discovery.join().await;
     loop {
         let running: Vec<_> = tracker

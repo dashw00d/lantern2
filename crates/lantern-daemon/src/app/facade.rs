@@ -120,6 +120,7 @@ pub struct AppFacade {
     /// Daemon start timestamp.
     pub started_at: Timestamp,
     pub(super) intel_service: Option<Arc<crate::intel::Intel>>,
+    services_observer: Option<Arc<super::services::ServiceObserver>>,
     network_health: Option<Arc<super::network::NetworkHealth>>,
     isolated_health: bool,
     active: Arc<Mutex<HashMap<InstanceId, Active>>>,
@@ -155,10 +156,16 @@ impl AppFacade {
             boot_id,
             started_at: Timestamp::now(),
             intel_service: None,
+            services_observer: None,
             network_health: None,
             isolated_health: false,
             active: Arc::default(),
         }
+    }
+    /// Attach read-only shared-service status detection.
+    pub fn with_services(mut self, services: Arc<super::services::ServiceObserver>) -> Self {
+        self.services_observer = Some(services);
+        self
     }
     /// Attach the shared per-instance intelligence service.
     pub fn with_intel(mut self, intel: Arc<crate::intel::Intel>) -> Self {
@@ -783,13 +790,26 @@ impl DaemonFacade for AppFacade {
         Ok(self.discovery.scan().await.map_err(internal)?.listeners)
     }
     async fn services(&self) -> FacadeResult<Vec<ServiceStatus>> {
-        Err(error("unavailable", "shared services are not assembled"))
+        let mut result = Vec::new();
+        for name in ["mailpit", "redis", "postgres"] {
+            result.push(self.service(name.into()).await?);
+        }
+        Ok(result)
     }
-    async fn service(&self, _: String) -> FacadeResult<ServiceStatus> {
-        Err(error("unavailable", "shared services are not assembled"))
+    async fn service(&self, name: String) -> FacadeResult<ServiceStatus> {
+        self.services_observer
+            .as_ref()
+            .ok_or_else(|| error("unavailable", "shared services are not assembled"))?
+            .status(&name)
+            .await
+            .ok_or_else(|| error("service_not_found", format!("unknown service {name}")))
     }
-    async fn service_action(&self, _: String, _: ServiceAction) -> FacadeResult<ServiceStatus> {
-        Err(error("unavailable", "shared services are not assembled"))
+    async fn service_action(&self, name: String, _: ServiceAction) -> FacadeResult<ServiceStatus> {
+        let service = self.service(name.clone()).await?;
+        Err(error(
+            "not_controllable",
+            format!("{name} is read-only: {}", service.detail.unwrap_or_default()),
+        ))
     }
     async fn templates(&self) -> FacadeResult<Vec<Value>> {
         Err(error("unavailable", "template management is not assembled"))
