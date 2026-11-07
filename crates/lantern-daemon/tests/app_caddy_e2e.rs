@@ -692,17 +692,20 @@ async fn app_caddy_real_system_https_reload_recovery_and_removal() {
     let base = format!("http://127.0.0.1:{api_port}");
     let ca = temp.path().join("data/caddy/pki/authorities/local/root.crt");
     let admin_socket = temp.path().join("run/caddy-admin.sock");
-    let outcome = AssertUnwindSafe(scenario(Scenario {
-        client: &client,
-        base: &base,
-        root: &root,
-        ca: &ca,
-        admin_socket: &admin_socket,
-        unit: &caddy_unit,
-        http_port,
-        https_port,
-    }))
-    .catch_unwind()
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(120),
+        AssertUnwindSafe(scenario(Scenario {
+            client: &client,
+            base: &base,
+            root: &root,
+            ca: &ca,
+            admin_socket: &admin_socket,
+            unit: &caddy_unit,
+            http_port,
+            https_port,
+        }))
+        .catch_unwind(),
+    )
     .await;
     shutdown.cancel();
     let daemon = tokio::time::timeout(Duration::from_secs(20), &mut task).await;
@@ -710,7 +713,7 @@ async fn app_caddy_real_system_https_reload_recovery_and_removal() {
         task.abort();
         let _ = task.await;
     }
-    if outcome.is_err() {
+    if !matches!(outcome, Ok(Ok(()))) {
         eprintln!("daemon result: {daemon:?}");
         for unit in &guard.units {
             let log = Command::new("journalctl")
@@ -722,8 +725,10 @@ async fn app_caddy_real_system_https_reload_recovery_and_removal() {
     }
     guard.cleanup();
     guard.assert_gone();
-    if let Err(panic) = outcome {
-        std::panic::resume_unwind(panic);
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => panic!("Caddy scenario timed out"),
     }
     daemon.expect("daemon shutdown timed out").unwrap().unwrap();
     println!("all test units stopped and reset-failed");
