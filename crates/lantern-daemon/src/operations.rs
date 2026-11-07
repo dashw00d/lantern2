@@ -23,6 +23,8 @@ use crate::events::EventBus;
 
 /// Finished operations kept for `GET /api/operations/{id}`.
 pub const RETAIN_FINISHED: usize = 200;
+/// How long finished operations stay queryable (15 §3.4: 1 hour).
+pub const RETAIN_FOR: Duration = Duration::from_secs(3600);
 
 #[derive(Debug)]
 struct Entry {
@@ -43,6 +45,7 @@ struct Inner {
 pub struct OperationTracker {
     inner: Arc<Mutex<Inner>>,
     bus: EventBus,
+    retain_for: Duration,
 }
 
 /// Owned by the worker performing the operation. Dropping it without [`OpHandle::finish`] marks the
@@ -71,9 +74,38 @@ pub enum OpOutcome {
 impl OperationTracker {
     /// A tracker publishing `OperationProgress` events on `bus`.
     pub fn new(bus: EventBus) -> Self {
+        Self::with_retention(bus, RETAIN_FOR)
+    }
+
+    /// A tracker with a custom retention period for finished operations (tests).
+    pub fn with_retention(bus: EventBus, retain_for: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
             bus,
+            retain_for,
+        }
+    }
+
+    /// Drop finished operations older than the retention period. `finished` is in finish order.
+    fn prune(&self, inner: &mut Inner) {
+        let Ok(span) = jiff::SignedDuration::try_from(self.retain_for) else {
+            return;
+        };
+        let Ok(cutoff) = Timestamp::now().checked_sub(span) else {
+            return;
+        };
+        while let Some(front) = inner.finished.front() {
+            let expired = inner
+                .ops
+                .get(front)
+                .and_then(|e| e.op.finished_at)
+                .is_none_or(|at| at < cutoff);
+            if !expired {
+                break;
+            }
+            if let Some(old) = inner.finished.pop_front() {
+                inner.ops.remove(&old);
+            }
         }
     }
 
@@ -81,6 +113,7 @@ impl OperationTracker {
     pub fn begin(&self, kind: OperationKind, instance: Option<InstanceId>) -> OpHandle {
         let cancel = CancellationToken::new();
         let mut inner = self.inner.lock().expect("operations lock");
+        self.prune(&mut inner);
         inner.seq += 1;
         let id = OperationId(format!("op-{}-{}", Timestamp::now().as_second(), inner.seq));
         let op = Operation {
@@ -115,17 +148,15 @@ impl OperationTracker {
 
     /// Current snapshot of an operation.
     pub fn get(&self, id: &OperationId) -> Option<Operation> {
-        self.inner
-            .lock()
-            .expect("operations lock")
-            .ops
-            .get(id)
-            .map(|e| e.op.clone())
+        let mut inner = self.inner.lock().expect("operations lock");
+        self.prune(&mut inner);
+        inner.ops.get(id).map(|e| e.op.clone())
     }
 
     /// All retained operations, newest first.
     pub fn list(&self) -> Vec<Operation> {
-        let inner = self.inner.lock().expect("operations lock");
+        let mut inner = self.inner.lock().expect("operations lock");
+        self.prune(&mut inner);
         let mut v: Vec<Operation> = inner.ops.values().map(|e| e.op.clone()).collect();
         v.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         v
@@ -336,6 +367,20 @@ mod tests {
         let op = t.wait(h.id(), Duration::from_millis(20)).await.unwrap();
         assert_eq!(op.status, OperationStatus::Running);
         h.finish(OpOutcome::Noop);
+    }
+
+    #[tokio::test]
+    async fn finished_operations_expire_after_retention() {
+        let t = OperationTracker::with_retention(EventBus::new(), Duration::from_millis(30));
+        let h = t.begin(OperationKind::Start, Some(inst()));
+        let id = h.id().clone();
+        h.finish(OpOutcome::Succeeded(None));
+        assert!(t.get(&id).is_some(), "kept right after finishing");
+        let running = t.begin(OperationKind::Prepare, Some(inst()));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(t.get(&id).is_none(), "expired after retention");
+        assert!(t.get(running.id()).is_some(), "running operations never expire");
+        running.finish(OpOutcome::Noop);
     }
 
     #[tokio::test]
