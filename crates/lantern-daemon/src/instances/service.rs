@@ -902,6 +902,15 @@ impl InstanceService {
     ) -> Result<Prepared, InstanceError> {
         self.prepare_inner(id, false, cancel, None).await
     }
+    /// Runtime hook with the supervisor cancellation token and operation progress.
+    pub async fn ensure_ready_with_progress(
+        &self,
+        id: &InstanceId,
+        cancel: tokio_util::sync::CancellationToken,
+        op: &OpHandle,
+    ) -> Result<Prepared, InstanceError> {
+        self.prepare_inner(id, false, cancel, Some(op)).await
+    }
     async fn prepare_inner(
         &self,
         id: &InstanceId,
