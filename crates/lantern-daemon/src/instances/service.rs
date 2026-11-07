@@ -1250,7 +1250,7 @@ impl InstanceService {
         if record.checkout.kind != CheckoutKind::Primary {
             let primary_root = pr.map(|r| r.git_root.as_path()).unwrap_or(&p.project.root);
             progress(op, "Copying files");
-            let (copied, copy_result) = files::materialize(
+            let (copied, copy_result, warnings) = files::materialize_detailed(
                 primary_root,
                 &p.project.root,
                 &root,
@@ -1259,6 +1259,9 @@ impl InstanceService {
                 false,
                 &cancel,
             );
+            for warning in warnings {
+                progress(op, &warning);
+            }
             record.checkout.materialized.extend(copied);
             record.checkout.materialized.sort();
             record.checkout.materialized.dedup();
@@ -1267,7 +1270,7 @@ impl InstanceService {
                 .map_err(InstanceError::Adapter)?;
             copy_result?;
             progress(op, "Linking files");
-            let (linked, link_result) = files::materialize(
+            let (linked, link_result, warnings) = files::materialize_detailed(
                 primary_root,
                 &p.project.root,
                 &root,
@@ -1276,6 +1279,9 @@ impl InstanceService {
                 true,
                 &cancel,
             );
+            for warning in warnings {
+                progress(op, &warning);
+            }
             record.checkout.materialized.extend(linked);
             record.checkout.materialized.sort();
             record.checkout.materialized.dedup();

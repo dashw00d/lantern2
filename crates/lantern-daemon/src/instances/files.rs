@@ -22,7 +22,28 @@ pub fn materialize(
     link: bool,
     cancel: &CancellationToken,
 ) -> (Vec<PathBuf>, Result<(), InstanceError>) {
+    let (made, result, _) = materialize_detailed(
+        primary_root,
+        primary_project,
+        dest_root,
+        dest_project,
+        patterns,
+        link,
+        cancel,
+    );
+    (made, result)
+}
+pub(super) fn materialize_detailed(
+    primary_root: &Path,
+    primary_project: &Path,
+    dest_root: &Path,
+    dest_project: &Path,
+    patterns: &[String],
+    link: bool,
+    cancel: &CancellationToken,
+) -> (Vec<PathBuf>, Result<(), InstanceError>, Vec<String>) {
     let mut made = Vec::new();
+    let mut warnings = Vec::new();
     let result = (|| {
         let primary_root = fs::canonicalize(primary_root)?;
         let dest_root = fs::canonicalize(dest_root)?;
@@ -75,6 +96,12 @@ pub fn materialize(
                 }
             }
             matches.sort();
+            if matches.is_empty() {
+                let kind = if link { "link" } else { "copy" };
+                let warning = format!("Warning: worktree.{kind} pattern {pattern:?} matched no files");
+                tracing::warn!(%warning);
+                warnings.push(warning);
+            }
             for src in matches {
                 if cancel.is_cancelled() {
                     return Err(InstanceError::Cancelled);
@@ -108,7 +135,7 @@ pub fn materialize(
         }
         Ok(())
     })();
-    (made, result)
+    (made, result, warnings)
 }
 fn allow(e: &walkdir::DirEntry, base: &Path, literal: &str) -> bool {
     if e.depth() == 0 {

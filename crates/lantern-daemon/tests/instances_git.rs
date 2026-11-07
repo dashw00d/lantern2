@@ -664,6 +664,39 @@ async fn instances_tick_publishes_stale_without_git_metadata_change() {
 }
 
 #[tokio::test]
+async fn instances_missing_copy_and_link_patterns_warn_in_progress() {
+    let t = Temp::new();
+    let (root, _, _, _, service) = fixture(&t, "id: myapp\nrun: {cmd: 'echo ok'}\nsetup: []\nworktree: {copy: [missing.env], link: [missing-cache]}\n").await;
+    git_cmd(&root, &["branch", "missing-patterns"]);
+    let tracker = OperationTracker::new(EventBus::new());
+    let op = tracker.begin(OperationKind::Prepare, None);
+    let id = op.id().clone();
+    service
+        .run_branch(req(BranchTarget::Branch("missing-patterns".into())), &op)
+        .await
+        .unwrap();
+    let snapshot = tracker.get(&id).unwrap();
+    let steps = snapshot
+        .steps
+        .iter()
+        .map(|step| step.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.contains("copy") && step.contains("missing.env")),
+        "{steps:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.contains("link") && step.contains("missing-cache")),
+        "{steps:?}"
+    );
+    op.finish(OpOutcome::Succeeded(None));
+}
+
+#[tokio::test]
 async fn instances_recover_interrupted_creation_without_claiming_user_data() {
     use lantern_core::{model::CheckoutKind, state::CheckoutPhase};
     let t = Temp::new();
