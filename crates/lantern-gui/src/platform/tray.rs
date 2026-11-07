@@ -79,6 +79,23 @@ impl IconState {
         }
     }
 }
+fn pixmap(state: IconState) -> ksni::Icon {
+    let color = state.color();
+    let mut data = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16 {
+        for x in 0..16 {
+            let inside = ((4..=11).contains(&x) && (4..=12).contains(&y))
+                || ((6..=9).contains(&x) && (2..=3).contains(&y))
+                || ((3..=12).contains(&x) && y == 13);
+            data.extend_from_slice(if inside { &color } else { &[0, 0, 0, 0] });
+        }
+    }
+    ksni::Icon {
+        width: 16,
+        height: 16,
+        data,
+    }
+}
 #[derive(Debug)]
 struct GuiTray {
     snapshot: TraySnapshot,
@@ -108,21 +125,10 @@ impl ksni::Tray for GuiTray {
         std::env::var("LANTERN_ICON_DIR").unwrap_or_default()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        let color = self.snapshot.state().color();
-        let mut data = Vec::with_capacity(16 * 16 * 4);
-        for y in 0..16 {
-            for x in 0..16 {
-                let inside = ((4..=11).contains(&x) && (4..=12).contains(&y))
-                    || ((6..=9).contains(&x) && (2..=3).contains(&y))
-                    || ((3..=12).contains(&x) && y == 13);
-                data.extend_from_slice(if inside { &color } else { &[0, 0, 0, 0] });
-            }
-        }
-        vec![ksni::Icon {
-            width: 16,
-            height: 16,
-            data,
-        }]
+        vec![pixmap(self.snapshot.state())]
+    }
+    fn attention_icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![pixmap(IconState::Attention)]
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
