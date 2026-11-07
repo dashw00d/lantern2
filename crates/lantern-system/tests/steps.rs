@@ -302,3 +302,61 @@ fn real_runner_blocks_mutation_in_fake_mode() {
         io::ErrorKind::PermissionDenied
     );
 }
+
+#[derive(Debug)]
+struct OfflineNetwork;
+impl lantern_system::doctor::NetworkProbe for OfflineNetwork {
+    fn check(&self, _: lantern_system::doctor::Probe) -> Result<String, String> {
+        Err("offline fake".into())
+    }
+}
+#[test]
+fn doctor_is_read_only_and_reports_expected_checks() {
+    use lantern_system::doctor::{DoctorCtx, run};
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    let settings = lantern_core::settings::Settings::default();
+    let ctx = DoctorCtx {
+        paths: &f.paths,
+        settings: &settings,
+        runner: &runner,
+        network: &OfflineNetwork,
+        caddy: &f.paths.bundled_caddy,
+        certutil: Some(Path::new("/usr/bin/certutil")),
+        search_path: vec![],
+    };
+    let checks = run(&ctx);
+    for id in [
+        "daemon.running",
+        "session.systemd",
+        "caddy.binary",
+        "caddy.running",
+        "ports.bind",
+        "ports.free",
+        "dns.resolved",
+        "dns.delegate",
+        "dns.responder",
+        "dns.system",
+        "tls.ca",
+        "tls.system",
+        "tls.certutil",
+        "tls.nss.chrome",
+        "tls.serving",
+        "e2e.https",
+        "browser.doh",
+        "conflict.v1",
+        "conflict.caddy",
+        "path.shadow",
+        "services.mailpit",
+        "services.redis",
+        "services.postgres",
+        "php.fpm",
+        "linger",
+    ] {
+        assert!(checks.iter().any(|c| c.id == id), "missing {id}");
+    }
+    assert!(checks.iter().all(|c| c.fix.is_some()));
+    assert!(runner.state.borrow().commands.iter().all(|c| !c.mutating));
+    assert!(!f.paths.user_unit.exists());
+    assert!(!f.paths.dns_delegate.exists());
+}

@@ -62,16 +62,16 @@ impl std::fmt::Debug for UserUnitsStep<'_> {
 impl UserUnitsStep<'_> {
     fn cmd(&self, args: &[&str], mutating: bool) -> CommandSpec {
         let mut command = CommandSpec::new("/usr/bin/systemctl", args.iter().copied(), mutating);
-        if let Some(runtime) = &self.paths.runtime {
-            if let Some(root) = runtime.parent() {
-                command
-                    .env
-                    .insert(OsString::from("XDG_RUNTIME_DIR"), root.as_os_str().to_owned());
-                command.env.insert(
-                    OsString::from("DBUS_SESSION_BUS_ADDRESS"),
-                    OsString::from(format!("unix:path={}/bus", root.display())),
-                );
-            }
+        if let Some(runtime) = &self.paths.runtime
+            && let Some(root) = runtime.parent()
+        {
+            command
+                .env
+                .insert(OsString::from("XDG_RUNTIME_DIR"), root.as_os_str().to_owned());
+            command.env.insert(
+                OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                OsString::from(format!("unix:path={}/bus", root.display())),
+            );
         }
         command
     }
