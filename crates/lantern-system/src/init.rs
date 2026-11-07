@@ -20,13 +20,15 @@ pub struct InitCtx<'a> {
     pub paths: &'a LanternPaths,
     /// Command execution boundary.
     pub runner: &'a dyn CommandRunner,
+    /// Configured local TLD.
+    pub tld: &'a str,
     /// Lantern executable.
     pub executable: &'a Path,
     /// Absolute certutil path, when installed.
     pub certutil: Option<&'a Path>,
     /// Opt in to tray autostart.
     pub tray_autostart: bool,
-    /// CA generation step; required to complete initialization.
+    /// Optional CA step override, primarily for tests; defaults to the built-in CA.
     pub ca_step: Option<&'a dyn Step>,
 }
 impl std::fmt::Debug for InitCtx<'_> {
@@ -54,7 +56,7 @@ pub struct SystemInitCtx<'a> {
     pub migrate_v1: bool,
     /// Allow guarded v1 cleanup inside a fake root only.
     pub allow_fake_cleanup: bool,
-    /// System trust step; required except during package setup.
+    /// Optional system-trust step override; defaults to the built-in trust step.
     pub system_trust_step: Option<&'a dyn Step>,
 }
 impl std::fmt::Debug for SystemInitCtx<'_> {
@@ -65,14 +67,43 @@ impl std::fmt::Debug for SystemInitCtx<'_> {
             .finish_non_exhaustive()
     }
 }
-fn effective_uid() -> Result<u32, String> {
-    let status = fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|s| s.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(|| "cannot determine effective uid".into())
+fn effective_uid() -> u32 {
+    nix::unistd::Uid::effective().as_raw()
+}
+
+/// User identity, paths and settings resolved independently of root's environment.
+#[derive(Debug, Clone)]
+pub struct ResolvedUser {
+    /// The passwd-resolved numeric user.
+    pub uid: u32,
+    /// Default user paths derived from the passwd home.
+    pub paths: LanternPaths,
+    /// Settings loaded from the user's config without environment overrides.
+    pub settings: Settings,
+}
+impl ResolvedUser {
+    /// Resolve a non-root user through the system account database and load their config.
+    pub fn from_uid(uid: u32) -> Result<Self, String> {
+        if uid == 0 {
+            return Err("target uid must not be root".into());
+        }
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .map_err(|e| e.to_string())?
+            .ok_or("target uid not found in account database")?;
+        let home = user.dir;
+        let dirs = lantern_core::dirs::Dirs {
+            config: home.join(".config/lantern"),
+            state: home.join(".local/state/lantern"),
+            data: home.join(".local/share/lantern"),
+        };
+        let env = std::collections::BTreeMap::<String, String>::new();
+        let settings = lantern_core::settings::load(&dirs.config.join("config.toml"), &env, &home, None)
+            .map_err(|e| e.to_string())?
+            .settings;
+        let cache = home.join(".cache/lantern");
+        let paths = LanternPaths::new(dirs, home, None, cache, None)?;
+        Ok(Self { uid, paths, settings })
+    }
 }
 fn validate_settings(ctx: &SystemInitCtx<'_>) -> Result<SocketAddr, String> {
     if ctx.uid == 0 {
@@ -98,44 +129,37 @@ fn validate_settings(ctx: &SystemInitCtx<'_>) -> Result<SocketAddr, String> {
 fn validate_system(ctx: &SystemInitCtx<'_>) -> Result<SocketAddr, String> {
     let listen = validate_settings(ctx)?;
     if ctx.paths.fake_root.is_none() {
-        if effective_uid()? != 0 {
+        if effective_uid() != 0 {
             return Err("system steps require root".into());
         }
-        let passwd = fs::read_to_string("/etc/passwd").map_err(|e| e.to_string())?;
-        let home = passwd
-            .lines()
-            .filter_map(|line| {
-                let fields: Vec<_> = line.split(':').collect();
-                (fields.len() >= 7 && fields[2].parse::<u32>().ok() == Some(ctx.uid))
-                    .then(|| Path::new(fields[5]).to_path_buf())
-            })
-            .next()
-            .ok_or("target uid not found in /etc/passwd")?;
-        if !home.is_absolute()
-            || home != ctx.paths.home
-            || ctx.paths.dirs.config != home.join(".config/lantern")
-            || ctx.paths.dirs.data != home.join(".local/share/lantern")
+        let resolved = ResolvedUser::from_uid(ctx.uid)?;
+        if resolved.paths.home != ctx.paths.home
+            || resolved.paths.dirs.config != ctx.paths.dirs.config
+            || resolved.paths.dirs.data != ctx.paths.dirs.data
         {
-            return Err("root steps require paths resolved from the target user's passwd entry, not the caller environment".into());
+            return Err("root steps require paths resolved from the target user's account, not the caller environment".into());
+        }
+        if resolved.settings.domains.tld != ctx.settings.domains.tld
+            || resolved.settings.dns.listen != ctx.settings.dns.listen
+            || resolved.settings.proxy.http_port != ctx.settings.proxy.http_port
+            || resolved.settings.proxy.https_port != ctx.settings.proxy.https_port
+        {
+            return Err("root steps require settings loaded from the target user's config".into());
         }
     }
+
     Ok(listen)
 }
 /// Run user steps, returning a separate result for each action.
 pub fn run_user_steps(ctx: &InitCtx<'_>) -> Vec<StepOutcome> {
-    if ctx.paths.fake_root.is_none() {
-        match effective_uid() {
-            Ok(0) => {
-                return vec![StepOutcome::new(
-                    "user_steps",
-                    OutcomeState::Failed,
-                    "run user steps as your user, not root",
-                )];
-            }
-            Err(e) => return vec![StepOutcome::new("user_steps", OutcomeState::Failed, e)],
-            Ok(_) => {}
-        }
+    if ctx.paths.fake_root.is_none() && effective_uid() == 0 {
+        return vec![StepOutcome::new(
+            "user_steps",
+            OutcomeState::Failed,
+            "run user steps as your user, not root",
+        )];
     }
+
     let mut outcomes = Vec::new();
     let dirs = [
         &ctx.paths.dirs.config,
@@ -167,7 +191,11 @@ pub fn run_user_steps(ctx: &InitCtx<'_>) -> Vec<StepOutcome> {
     outcomes.push(match ctx.ca_step {
         Some(step) if !step.needs_root() => step.apply(),
         Some(_) => StepOutcome::new("ca", OutcomeState::Failed, "CA step must not require root"),
-        None => StepOutcome::new("ca", OutcomeState::Failed, "CA generation is not available"),
+        None => crate::ca::CaStep {
+            paths: ctx.paths,
+            tld: ctx.tld,
+        }
+        .apply(),
     });
     outcomes.push(
         NssTrustStep {
@@ -231,11 +259,12 @@ pub fn run_system_steps(ctx: &SystemInitCtx<'_>) -> Vec<StepOutcome> {
                 OutcomeState::Failed,
                 "system trust step must require root",
             ),
-            None => StepOutcome::new(
-                "system_trust",
-                OutcomeState::Failed,
-                "system CA trust is not available",
-            ),
+            None => crate::steps::system_trust::SystemTrustStep {
+                paths: ctx.paths,
+                runner: ctx.runner,
+                tld: &ctx.settings.domains.tld,
+            }
+            .apply(),
         }
     });
     if ctx.migrate_v1 {
@@ -331,11 +360,11 @@ pub fn plan_system_steps(ctx: &SystemInitCtx<'_>) -> Result<Vec<StepReport>, Str
                 state: StepState::Failed("system trust step must require root".into()),
                 needs_root: true,
             },
-            None => StepReport {
-                id: "system_trust",
-                state: StepState::Failed("system CA trust is not available".into()),
-                needs_root: true,
-            },
+            None => report(&crate::steps::system_trust::SystemTrustStep {
+                paths: ctx.paths,
+                runner: ctx.runner,
+                tld: &ctx.settings.domains.tld,
+            }),
         });
     }
     if ctx.migrate_v1 {
@@ -349,6 +378,9 @@ pub fn plan_system_steps(ctx: &SystemInitCtx<'_>) -> Result<Vec<StepReport>, Str
 }
 /// Run user steps and construct, but do not execute, an elevation plan when needed.
 pub fn run_init(user: &InitCtx<'_>, system: &SystemInitCtx<'_>) -> Result<InitPlan, String> {
+    if user.tld != system.settings.domains.tld {
+        return Err("user and system steps must use the same TLD".into());
+    }
     if user.paths.home != system.paths.home
         || user.paths.root_cert != system.paths.root_cert
         || user.paths.fake_root != system.paths.fake_root

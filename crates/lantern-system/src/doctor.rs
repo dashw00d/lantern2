@@ -548,23 +548,21 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
             true,
         ));
     }
-    // Full CA validation is added by the CA module; absence is never reported as success.
-    checks.push(item(
-        "tls.ca",
-        "Local CA",
-        CheckStatus::Skipped,
-        "CA inspection is unavailable",
-        "lantern init",
-        false,
-    ));
-    checks.push(item(
-        "tls.system",
-        "System trust",
-        CheckStatus::Skipped,
-        "CA inspection is unavailable",
-        "sudo lantern init --system-steps",
-        true,
-    ));
+    let ca = crate::ca::inspect_root(ctx.paths, tld, 30)
+        .map(|info| {
+            format!(
+                "CA {} expires at Unix time {}",
+                info.fingerprint_sha256, info.expires_at
+            )
+        })
+        .map_err(|e| e.to_string());
+    checks.push(from_result("tls.ca", "Local CA", ca, "lantern init", false));
+    let trust = crate::steps::system_trust::SystemTrustStep {
+        paths: ctx.paths,
+        runner: ctx.runner,
+        tld,
+    };
+    checks.push(from_step("tls.system", "System trust", &trust));
     let certutil = ctx.certutil.filter(|p| p.is_absolute());
     checks.push(item(
         "tls.certutil",

@@ -59,12 +59,16 @@ struct State {
 struct RecordingRunner {
     state: RefCell<State>,
     live: PathBuf,
+    system_cert: PathBuf,
+    system_cert_link: PathBuf,
 }
 impl RecordingRunner {
     fn new(f: &Fixture) -> Self {
         Self {
             state: RefCell::new(State::default()),
             live: f.paths.sysctl_live.clone(),
+            system_cert: f.paths.system_cert.clone(),
+            system_cert_link: f.paths.system_cert_link.clone(),
         }
     }
 }
@@ -88,6 +92,13 @@ impl CommandRunner for RecordingRunner {
                 if state.cap {
                     out.stdout = b"caddy cap_net_bind_service=ep\n".to_vec();
                 }
+            }
+            "/usr/sbin/update-ca-certificates" => {
+                fs::create_dir_all(self.system_cert_link.parent().unwrap())?;
+                if fs::symlink_metadata(&self.system_cert_link).is_ok() {
+                    fs::remove_file(&self.system_cert_link)?;
+                }
+                std::os::unix::fs::symlink(&self.system_cert, &self.system_cert_link)?;
             }
             "/usr/sbin/setcap" => state.cap = true,
             "/usr/sbin/sysctl" => {
@@ -435,6 +446,7 @@ fn init_composes_steps_with_uid_and_settings_validation() {
     let user = InitCtx {
         paths: &f.paths,
         runner: &runner,
+        tld: "glow",
         executable: &exe,
         certutil: Some(Path::new("/usr/bin/certutil")),
         tray_autostart: true,
@@ -653,4 +665,125 @@ fn generated_ca_has_critical_constrained_der_and_private_key() {
     let original = fs::read(&f.paths.root_cert).unwrap();
     assert!(ensure_root(&f.paths, "other").is_err());
     assert_eq!(fs::read(&f.paths.root_cert).unwrap(), original);
+}
+
+#[test]
+fn system_trust_verifies_input_reencodes_and_is_idempotent() {
+    use lantern_system::{ca::ensure_root, steps::system_trust::SystemTrustStep};
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    ensure_root(&f.paths, "glow").unwrap();
+    let trust = SystemTrustStep {
+        paths: &f.paths,
+        runner: &runner,
+        tld: "glow",
+    };
+    assert!(matches!(trust.check(), StepState::Pending(_)));
+    assert_eq!(trust.apply().state, OutcomeState::Changed);
+    assert_eq!(trust.apply().state, OutcomeState::AlreadyDone);
+    assert_eq!(
+        fs::metadata(&f.paths.system_cert).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert!(f.paths.system_cert_link.exists());
+    let actions = runner.state.borrow();
+    assert_eq!(
+        actions
+            .commands
+            .iter()
+            .filter(|c| c.program == Path::new("/usr/sbin/update-ca-certificates"))
+            .count(),
+        1
+    );
+    assert!(
+        actions
+            .commands
+            .iter()
+            .filter(|c| c.mutating)
+            .all(|c| c.fake_root)
+    );
+    drop(actions);
+    let wrong = SystemTrustStep {
+        tld: "other",
+        ..trust
+    };
+    assert!(matches!(wrong.check(), StepState::Failed(_)));
+    assert_eq!(wrong.apply().state, OutcomeState::Failed);
+}
+#[test]
+fn system_trust_rejects_symlink_or_oversized_root_without_commands() {
+    use lantern_system::steps::system_trust::SystemTrustStep;
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    let external = f.paths.home.join("cert");
+    f.write(&external, b"untrusted");
+    fs::create_dir_all(&f.paths.ca_dir).unwrap();
+    std::os::unix::fs::symlink(&external, &f.paths.root_cert).unwrap();
+    let trust = SystemTrustStep {
+        paths: &f.paths,
+        runner: &runner,
+        tld: "glow",
+    };
+    assert_eq!(trust.apply().state, OutcomeState::Failed);
+    fs::remove_file(&f.paths.root_cert).unwrap();
+    f.write(&f.paths.root_cert, &vec![b'x'; 16385]);
+    assert_eq!(trust.apply().state, OutcomeState::Failed);
+    assert!(runner.state.borrow().commands.is_empty());
+}
+#[test]
+fn init_defaults_to_real_ca_and_fake_system_trust() {
+    use lantern_system::init::{InitCtx, SystemInitCtx, run_init, run_system_steps};
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(&f.paths.sysctl_live, b"1024");
+    let exe = f.paths.home.join("build/lantern");
+    f.write(&exe, b"binary");
+    let settings = lantern_core::settings::Settings::default();
+    let user = InitCtx {
+        paths: &f.paths,
+        runner: &runner,
+        tld: "glow",
+        executable: &exe,
+        certutil: Some(Path::new("/usr/bin/certutil")),
+        tray_autostart: true,
+        ca_step: None,
+    };
+    let system = SystemInitCtx {
+        paths: &f.paths,
+        settings: &settings,
+        runner: &runner,
+        uid: 1000,
+        port_strategy: PortStrategy::Sysctl,
+        from_package: false,
+        migrate_v1: false,
+        allow_fake_cleanup: false,
+        system_trust_step: None,
+    };
+    let plan = run_init(&user, &system).unwrap();
+    assert!(
+        plan.user_outcomes
+            .iter()
+            .all(|o| o.state == OutcomeState::Changed)
+    );
+    assert!(plan.pkexec.is_some());
+    assert!(
+        run_system_steps(&system)
+            .iter()
+            .all(|o| o.state == OutcomeState::Changed)
+    );
+    let again = run_init(&user, &system).unwrap();
+    assert!(
+        again
+            .user_outcomes
+            .iter()
+            .all(|o| o.state == OutcomeState::AlreadyDone)
+    );
+    assert!(
+        again
+            .system_steps
+            .iter()
+            .all(|s| matches!(s.state, StepState::Done(_)))
+    );
+    assert!(again.pkexec.is_none());
 }
