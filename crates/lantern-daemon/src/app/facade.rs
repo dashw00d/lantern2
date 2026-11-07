@@ -3,6 +3,7 @@
 use crate::{
     api::facade::{
         DaemonFacade, FacadeResult, InstanceFilter, ListenerFilter, OperationTicket, ProjectFilter,
+        ServiceAction,
     },
     app::discovery::Discovery,
     git::Git,
@@ -716,6 +717,59 @@ impl DaemonFacade for AppFacade {
     async fn scan_listeners(&self) -> FacadeResult<Vec<Listener>> {
         Ok(self.discovery.scan().await.map_err(internal)?.listeners)
     }
+    async fn services(&self) -> FacadeResult<Vec<ServiceStatus>> {
+        Err(error("unavailable", "shared services are not assembled"))
+    }
+    async fn service(&self, _: String) -> FacadeResult<ServiceStatus> {
+        Err(error("unavailable", "shared services are not assembled"))
+    }
+    async fn service_action(&self, _: String, _: ServiceAction) -> FacadeResult<ServiceStatus> {
+        Err(error("unavailable", "shared services are not assembled"))
+    }
+    async fn templates(&self) -> FacadeResult<Vec<Value>> {
+        Err(error("unavailable", "template management is not assembled"))
+    }
+    async fn template(&self, _: String) -> FacadeResult<Value> {
+        Err(error("unavailable", "template management is not assembled"))
+    }
+    async fn create_template(&self, _: Value) -> FacadeResult<Value> {
+        Err(error("unavailable", "template management is not assembled"))
+    }
+    async fn put_template(&self, _: String, _: Value) -> FacadeResult<(Value, bool)> {
+        Err(error("unavailable", "template management is not assembled"))
+    }
+    async fn delete_template(&self, _: String) -> FacadeResult<()> {
+        Err(error("unavailable", "template management is not assembled"))
+    }
+    async fn intel(&self, _: InstanceId, _: Option<u32>) -> FacadeResult<IntelSnapshot> {
+        Err(error("unavailable", "project intelligence is not assembled"))
+    }
+    async fn refresh_intel(&self, _: InstanceId) -> FacadeResult<IntelSnapshot> {
+        Err(error("unavailable", "project intelligence is not assembled"))
+    }
+    async fn refresh_all_intel(&self) -> FacadeResult<IntelRefreshReport> {
+        Err(error("unavailable", "project intelligence is not assembled"))
+    }
+    async fn docs(&self, _: InstanceId) -> FacadeResult<Vec<DocEntry>> {
+        Err(error("unavailable", "document discovery is not assembled"))
+    }
+    async fn doc(
+        &self,
+        _: InstanceId,
+        _: String,
+        _: Option<u64>,
+        _: Option<u64>,
+    ) -> FacadeResult<DocContent> {
+        Err(error("unavailable", "document discovery is not assembled"))
+    }
+    async fn endpoints(
+        &self,
+        _: InstanceId,
+        _: Option<String>,
+        _: Option<u32>,
+    ) -> FacadeResult<Vec<EndpointEntry>> {
+        Err(error("unavailable", "endpoint discovery is not assembled"))
+    }
     async fn profiles(&self) -> FacadeResult<Vec<Value>> {
         let profiles = lantern_core::profiles::Profiles::load_dir(&self.dirs.config.join("profiles"))
             .map_err(internal)?
@@ -1225,20 +1279,28 @@ impl DaemonFacade for AppFacade {
         id: InstanceId,
         request: RenameInstanceRequest,
     ) -> FacadeResult<InstanceView> {
-        let view = self.view(&id)?;
-        if !matches!(
-            view.runtime.status,
-            InstanceStatus::Stopped | InstanceStatus::NeedsConfig
-        ) {
-            return Err(error(
-                "operation_in_progress",
-                "stop the instance before renaming",
-            ));
-        }
-        let new = self
-            .instances_service
-            .rename_instance(&id, &request.slug)
-            .map_err(internal)?;
+        let new = {
+            let active = self
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if active.contains_key(&id) {
+                return Err(error("operation_in_progress", "instance has an active operation"));
+            }
+            let view = self.view(&id)?;
+            if !matches!(
+                view.runtime.status,
+                InstanceStatus::Stopped | InstanceStatus::NeedsConfig
+            ) {
+                return Err(error(
+                    "operation_in_progress",
+                    "stop the instance before renaming",
+                ));
+            }
+            self.instances_service
+                .rename_instance(&id, &request.slug)
+                .map_err(internal)?
+        };
         self.runtime
             .on_instance_removed(&id)
             .await

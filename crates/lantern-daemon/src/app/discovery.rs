@@ -182,6 +182,15 @@ async fn run(
                         }
                     }
                     settle(&snapshot.listeners, &registry, &runtime, &mut candidates);
+                    for listener in snapshot
+                        .listeners
+                        .iter()
+                        .filter(|l| l.matched.is_none() && !l.managed)
+                    {
+                        if let Some(path) = &listener.cwd {
+                            let _ = registry.offer_suggestion(path);
+                        }
+                    }
                     if latest
                         .as_ref()
                         .is_none_or(|old| old.listeners != snapshot.listeners)
