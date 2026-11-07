@@ -127,6 +127,24 @@ async fn net_gateway_guard_and_escaped_nonce_pages() {
         StatusCode::ACCEPTED
     );
     assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
+    let default_port = router(GatewayState {
+        backend: backend.clone(),
+        daemon_port: 39720,
+        https_port: 443,
+        root_cert: PathBuf::from("/missing/test.crt"),
+    });
+    let bad_port = Request::builder()
+        .method("POST")
+        .uri("/__lantern/start")
+        .header("host", "127.0.0.1:39720")
+        .header("x-forwarded-host", "app.glow:99999")
+        .header("origin", "https://app.glow:99999")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        default_port.oneshot(bad_port).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
     let unknown = Request::builder()
         .uri("/__lantern/page")
         .header("host", "localhost:39720")

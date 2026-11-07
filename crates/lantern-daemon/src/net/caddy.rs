@@ -350,13 +350,13 @@ impl Caddy {
                 .ok_or_else(|| NetError::Invalid("missing XDG runtime directory".into()))?;
             std::fs::create_dir_all(runtime)?;
             std::fs::set_permissions(runtime, std::fs::Permissions::from_mode(0o700))?;
-            if let Some(snapshot) = state.iter().find(|s| s.unit == self.cfg.unit) {
-                if snapshot.active == Active::Failed {
-                    self.sd
-                        .reset_failed(&self.cfg.unit)
-                        .await
-                        .map_err(|e| NetError::Unavailable(e.to_string()))?;
-                }
+            if let Some(snapshot) = state.iter().find(|s| s.unit == self.cfg.unit)
+                && snapshot.active == Active::Failed
+            {
+                self.sd
+                    .reset_failed(&self.cfg.unit)
+                    .await
+                    .map_err(|e| NetError::Unavailable(e.to_string()))?;
             }
             let unit = CaddyUnit {
                 unit: self.cfg.unit.clone(),
