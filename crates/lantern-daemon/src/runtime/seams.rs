@@ -115,3 +115,44 @@ impl InstancePreparer for NoopPreparer {
         Box::pin(async { Ok(()) })
     }
 }
+
+/// A route target supplied to the eventual networking adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteTarget {
+    /// Reverse proxy to a ready managed listener.
+    Socket(SocketAddr),
+    /// Reverse proxy to a configured upstream URL.
+    Url(String),
+    /// Serve a PHP root through php-fpm.
+    Php(std::path::PathBuf),
+    /// Serve a static directory.
+    Static(std::path::PathBuf),
+}
+
+/// An asynchronous router operation.
+pub type RouteFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// Routing and php-fpm boundary, implemented by the networking integration.
+pub trait RuntimeRouter: Send + Sync {
+    /// Publish the selected route for an instance.
+    fn publish<'a>(&'a self, instance: &'a Instance, target: RouteTarget) -> RouteFuture<'a>;
+    /// Remove an instance's route, without stopping its upstream.
+    fn unpublish<'a>(&'a self, id: &'a InstanceId) -> RouteFuture<'a>;
+    /// Verify that the configured php-fpm socket is reachable.
+    fn php_ready<'a>(&'a self) -> RouteFuture<'a>;
+}
+
+/// Placeholder until the network subsystem provides a real adapter.
+#[derive(Debug, Default)]
+pub struct UnavailableRouter;
+impl RuntimeRouter for UnavailableRouter {
+    fn publish<'a>(&'a self, _: &'a Instance, _: RouteTarget) -> RouteFuture<'a> {
+        Box::pin(async { Err("router adapter unavailable".into()) })
+    }
+    fn unpublish<'a>(&'a self, _: &'a InstanceId) -> RouteFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+    fn php_ready<'a>(&'a self) -> RouteFuture<'a> {
+        Box::pin(async { Err("php-fpm adapter unavailable".into()) })
+    }
+}

@@ -362,7 +362,7 @@ pub fn transition(state: &SupervisorState, event: Event) -> (SupervisorState, Ve
             next.desired_up = false;
             finish(&mut next, &mut effects);
         }
-        Event::PlanInvalid(issue) if matches!(next.status, S::Preparing | S::Stopped) => {
+        Event::PlanInvalid(issue) if matches!(next.status, S::Preparing | S::Starting | S::Stopped) => {
             next.status = S::NeedsConfig;
             next.issue = Some(issue);
             next.desired_up = false;

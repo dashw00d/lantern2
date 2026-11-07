@@ -25,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 use super::journal::{self, LogHub};
 use super::launcher::{self, LaunchSpec};
 use super::ports::{PortAvailability, PortLeases, PortRange};
-use super::seams::{InstancePreparer, NoopPreparer, PortProbe, RuntimeStore};
+use super::seams::{
+    InstancePreparer, NoopPreparer, PortProbe, RouteTarget, RuntimeRouter, RuntimeStore, UnavailableRouter,
+};
 use super::shell_env;
 use super::state_machine::{
     self as sm, Event, Operation, RequestPolicy, StartKind, StartValidation, SupervisorState,
@@ -202,6 +204,7 @@ struct Inner {
     store: Arc<dyn RuntimeStore>,
     probe: Arc<dyn PortProbe>,
     preparer: Arc<dyn InstancePreparer>,
+    router: Arc<dyn RuntimeRouter>,
     backend: Arc<dyn UserSystemd>,
     tracker: OperationTracker,
     logs: Arc<LogHub>,
@@ -247,6 +250,26 @@ impl Runtime {
         tracker: OperationTracker,
         preparer: Arc<dyn InstancePreparer>,
     ) -> Self {
+        Self::with_adapters(
+            config,
+            store,
+            probe,
+            backend,
+            tracker,
+            preparer,
+            Arc::new(UnavailableRouter),
+        )
+    }
+    /// Construct the runtime with checkout preparation and routing adapters.
+    pub fn with_adapters(
+        config: RuntimeConfig,
+        store: Arc<dyn RuntimeStore>,
+        probe: Arc<dyn PortProbe>,
+        backend: Arc<dyn UserSystemd>,
+        tracker: OperationTracker,
+        preparer: Arc<dyn InstancePreparer>,
+        router: Arc<dyn RuntimeRouter>,
+    ) -> Self {
         let logs = Arc::new(LogHub::new(
             config.settings.logs.ring_lines,
             config.settings.logs.ring_bytes,
@@ -257,6 +280,7 @@ impl Runtime {
             store,
             probe,
             preparer,
+            router,
             backend,
             tracker,
             logs,
@@ -501,6 +525,13 @@ impl Runtime {
         if token.is_cancelled() {
             return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
         }
+        if !noop {
+            self.inner
+                .router
+                .unpublish(id)
+                .await
+                .map_err(|e| Fault::new("route_failed", IssueCode::RouteFailed, e))?;
+        }
         let unit = self.inner.config.names.instance(id);
         if !noop || state.unit.is_some() {
             self.inner
@@ -702,18 +733,25 @@ impl Runtime {
         self.update(id, actor, generation, move |r| r.port = port);
         if command.is_none() {
             self.event(id, actor, generation, Event::Prepared(StartKind::Site));
-            if let Some(url) = upstream {
-                self.wait_upstream(&url, token).await?;
-                self.event(id, actor, generation, Event::Ready);
-                let _ = self.inner.store.set_activated(id, true);
-                let _ = self.inner.store.record_started(id);
-                return Ok(false);
+            if let Some(url) = &upstream {
+                self.wait_upstream(url, token).await?;
             }
-            return Err(Fault::new(
-                "route_unavailable",
-                IssueCode::RouteFailed,
-                "site activation needs a router and, for PHP, a php-fpm adapter",
-            ));
+            let _guard = actor.io_lock.lock().await;
+            if token.is_cancelled() {
+                return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
+            }
+            if let Err(error) = self.publish_route(&instance, None).await {
+                self.event(id, actor, generation, Event::PlanInvalid(IssueCode::RouteFailed));
+                return Err(error);
+            }
+            if token.is_cancelled() {
+                return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
+            }
+            self.event(id, actor, generation, Event::Ready);
+            self.inner.store.set_activated(id, true).map_err(store_fault)?;
+            self.inner.store.record_started(id).map_err(store_fault)?;
+            self.start_health(id.clone(), actor.clone(), generation);
+            return Ok(false);
         }
         let command = command.expect("checked above");
         let is_deploy = m.deploy.start.is_some();
@@ -806,9 +844,80 @@ impl Runtime {
                 s.ready_at = Some(Instant::now());
             }
         }
+        {
+            let _guard = actor.io_lock.lock().await;
+            if token.is_cancelled() {
+                return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
+            }
+            let upstream_addr = self
+                .state(id)
+                .and_then(|s| s.upstream)
+                .or_else(|| port.map(|p| SocketAddr::from((Ipv4Addr::LOCALHOST, p))));
+            if let Err(error) = self.publish_route(&instance, upstream_addr).await {
+                self.event(id, actor, generation, Event::RouteFailed);
+                self.update(id, actor, generation, move |r| {
+                    r.message = Some(error.message.clone());
+                    r.issue = Some(RuntimeIssue {
+                        code: IssueCode::RouteFailed,
+                        detail: error.message,
+                        hint: None,
+                    });
+                });
+            }
+        }
         let _ = self.inner.store.record_started(id);
         self.start_health(id.clone(), actor.clone(), generation);
         Ok(false)
+    }
+    async fn publish_route(&self, instance: &Instance, upstream: Option<SocketAddr>) -> Result<(), Fault> {
+        let manifest = &instance.manifest;
+        let root = manifest.root.as_deref().unwrap_or(".");
+        let root = instance.checkout.path.join(root);
+        let target = match manifest.serve {
+            ServeMode::Php => {
+                if !root.is_dir() {
+                    return Err(Fault::new(
+                        "needs_config",
+                        IssueCode::RouteFailed,
+                        format!("site root missing: {}", root.display()),
+                    ));
+                }
+                self.inner
+                    .router
+                    .php_ready()
+                    .await
+                    .map_err(|e| Fault::new("php_unavailable", IssueCode::RouteFailed, e))?;
+                RouteTarget::Php(root)
+            }
+            ServeMode::Static => {
+                if !root.is_dir() {
+                    return Err(Fault::new(
+                        "needs_config",
+                        IssueCode::RouteFailed,
+                        format!("site root missing: {}", root.display()),
+                    ));
+                }
+                RouteTarget::Static(root)
+            }
+            _ => {
+                if let Some(url) = &manifest.upstream_url {
+                    RouteTarget::Url(url.clone())
+                } else if let Some(addr) = upstream {
+                    RouteTarget::Socket(addr)
+                } else {
+                    return Err(Fault::new(
+                        "route_failed",
+                        IssueCode::RouteFailed,
+                        "no upstream address",
+                    ));
+                }
+            }
+        };
+        self.inner
+            .router
+            .publish(instance, target)
+            .await
+            .map_err(|e| Fault::new("route_failed", IssueCode::RouteFailed, e))
     }
     fn dependencies(&self, root: &InstanceId) -> Result<Vec<InstanceId>, Fault> {
         fn visit(
