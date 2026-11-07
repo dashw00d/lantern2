@@ -1,0 +1,396 @@
+//! Bounded, manifest-first workspace scans and registry reconciliation.
+
+use super::{Error, RegistryHandle, expand_home};
+use lantern_core::{
+    Timestamp,
+    api::{Confidence as ApiConfidence, Event, ScanSkip, Suggestion},
+    detect::{self, Confidence, Framework},
+    ids::{PROJECT_ID_MAX, ProjectId},
+    manifest::{self, DetectionInfo},
+    model::ProjectSource,
+    settings::WorkspaceSettings,
+    state::{ProjectRecord, ProjectRepoRecord, RepoRecord},
+};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+const IGNORE: &[&str] = &[
+    "node_modules",
+    "vendor",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "_build",
+    "deps",
+    ".cache",
+    ".git",
+];
+const LIMIT: usize = 5_000;
+const BUDGET: Duration = Duration::from_secs(2);
+
+/// A discovered manifest and its proposed project identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManifestHit {
+    /// Canonical project directory.
+    pub path: PathBuf,
+    /// Parsed manifest, including diagnostics.
+    pub manifest: manifest::ParsedManifest,
+}
+/// Results of bounded filesystem traversal before registry reconciliation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceScan {
+    /// Discovered manifests.
+    pub manifests: Vec<ManifestHit>,
+    /// Detected but unregistered candidates.
+    pub suggestions: Vec<Suggestion>,
+    /// Files or directories skipped during traversal.
+    pub skipped: Vec<ScanSkip>,
+    /// At least one root reached its budget.
+    pub truncated: bool,
+}
+/// Results of applying a scan to the registry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanReport {
+    /// Newly registered project identifiers.
+    pub registered: Vec<ProjectId>,
+    /// Manifest roots already present.
+    pub already_known: u32,
+    /// Current visible suggestions.
+    pub suggestions: Vec<Suggestion>,
+    /// Skipped paths and reasons, including invalid or conflicting projects.
+    pub skipped: Vec<ScanSkip>,
+    /// User-facing warnings, including suffixed duplicate ids.
+    pub warnings: Vec<String>,
+    /// At least one root reached its budget.
+    pub truncated: bool,
+}
+
+/// Scan configured roots without mutating the registry; all supplied paths are explicit.
+pub fn scan_roots(settings: &WorkspaceSettings, home: &Path, managed_worktrees: &Path) -> WorkspaceScan {
+    let mut report = WorkspaceScan {
+        manifests: vec![],
+        suggestions: vec![],
+        skipped: vec![],
+        truncated: false,
+    };
+    let managed = managed_worktrees
+        .canonicalize()
+        .unwrap_or_else(|_| managed_worktrees.to_owned());
+    let mut visited = BTreeSet::new();
+    for root in &settings.roots {
+        let root = expand_home(root, home);
+        let canonical = match root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                report.skipped.push(ScanSkip {
+                    path: root,
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
+        let mut queue = VecDeque::from([(canonical, 0_u8)]);
+        let start = Instant::now();
+        let mut count = 0;
+        while let Some((path, depth)) = queue.pop_front() {
+            if count >= LIMIT || start.elapsed() >= BUDGET {
+                report.truncated = true;
+                break;
+            }
+            let path = match path.canonicalize() {
+                Ok(path) => path,
+                Err(e) => {
+                    report.skipped.push(ScanSkip {
+                        path,
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if !visited.insert(path.clone()) {
+                continue;
+            }
+            if path == managed || path.starts_with(&managed) {
+                report.skipped.push(ScanSkip {
+                    path,
+                    reason: "managed_worktree".into(),
+                });
+                continue;
+            }
+            count += 1;
+            if path.join(".git").is_file() {
+                report.skipped.push(ScanSkip {
+                    path,
+                    reason: "linked_worktree".into(),
+                });
+                continue;
+            }
+            match manifest::load(&path) {
+                Ok(Some(manifest)) => {
+                    report.manifests.push(ManifestHit { path, manifest });
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    report.skipped.push(ScanSkip {
+                        path,
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            }
+            let git = path.join(".git").is_dir();
+            if depth > 0 && settings.suggest {
+                let detection = detect::detect_dir(&path);
+                if (git || detection.framework != Framework::Unknown)
+                    && (git || detection.confidence != Confidence::Low)
+                {
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    match ProjectId::from_name(name) {
+                        Ok(proposed_id) => report.suggestions.push(Suggestion {
+                            path: path.clone(),
+                            proposed_id,
+                            framework: detection.framework_name().into(),
+                            confidence: match detection.confidence {
+                                Confidence::High => ApiConfidence::High,
+                                Confidence::Medium => ApiConfidence::Medium,
+                                Confidence::Low => ApiConfidence::Low,
+                            },
+                        }),
+                        Err(e) => report.skipped.push(ScanSkip {
+                            path: path.clone(),
+                            reason: e.to_string(),
+                        }),
+                    }
+                }
+            }
+            if git || depth >= settings.depth {
+                continue;
+            }
+            let entries = match fs::read_dir(&path) {
+                Ok(e) => e,
+                Err(e) => {
+                    report.skipped.push(ScanSkip {
+                        path,
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let mut children = Vec::new();
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if IGNORE.contains(&name.as_ref())
+                    || settings.ignore.iter().any(|v| v == name.as_ref())
+                    || (name.starts_with('.') && !settings.include_hidden.iter().any(|v| v == name.as_ref()))
+                {
+                    continue;
+                }
+                let ty = match entry.file_type() {
+                    Ok(ty) => ty,
+                    Err(_) => continue,
+                };
+                if ty.is_dir() || (ty.is_symlink() && entry.path().is_dir()) {
+                    children.push(entry.path());
+                }
+            }
+            children.sort();
+            queue.extend(children.into_iter().map(|p| (p, depth + 1)));
+        }
+    }
+    report
+}
+
+fn unique_id(base: &ProjectId, projects: &std::collections::BTreeMap<ProjectId, ProjectRecord>) -> ProjectId {
+    if !projects.contains_key(base)
+        && !projects
+            .values()
+            .any(|p| p.aliases.iter().any(|a| a == base.as_str()))
+    {
+        return base.clone();
+    }
+    for n in 2_u32.. {
+        let suffix = format!("-{n}");
+        let take = PROJECT_ID_MAX
+            .saturating_sub(suffix.len())
+            .min(base.as_str().len());
+        let candidate = format!("{}{}", base.as_str()[..take].trim_end_matches('-'), suffix);
+        if let Ok(id) = ProjectId::parse(&candidate)
+            && !projects.contains_key(&id)
+            && !projects
+                .values()
+                .any(|p| p.aliases.iter().any(|a| a == id.as_str()))
+        {
+            return id;
+        }
+    }
+    unreachable!("u32 suffix space exhausted")
+}
+
+impl RegistryHandle {
+    /// Scan configured roots, register manifests, preserve manual records and replace suggestions.
+    pub fn scan_workspace(&self, dirs: &lantern_core::dirs::Dirs) -> Result<ScanReport, Error> {
+        let (settings, home) = {
+            let s = self.lock();
+            (s.settings.clone(), s.home.clone())
+        };
+        let managed = if settings.worktrees.dir.is_empty() {
+            dirs.data.join("worktrees")
+        } else {
+            expand_home(&settings.worktrees.dir, &home)
+        };
+        let scan = scan_roots(&settings.workspaces, &home, &managed);
+        let mut report = ScanReport {
+            registered: vec![],
+            already_known: 0,
+            suggestions: vec![],
+            skipped: scan.skipped,
+            warnings: vec![],
+            truncated: scan.truncated,
+        };
+        for hit in scan.manifests {
+            let state = self.state_snapshot();
+            if let Some(mut existing) = state.projects.values().find(|p| p.root == hit.path).cloned() {
+                report.already_known += 1;
+                existing.last_seen_at = Timestamp::now();
+                existing.missing = false;
+                if existing.source == ProjectSource::Detected {
+                    existing.source = ProjectSource::Manifest;
+                }
+                self.upsert_project(existing)?;
+                continue;
+            }
+            let proposed = hit
+                .manifest
+                .raw
+                .id
+                .as_deref()
+                .unwrap_or_else(|| hit.path.file_name().and_then(|v| v.to_str()).unwrap_or(""));
+            let base = match ProjectId::from_name(proposed) {
+                Ok(id) => id,
+                Err(e) => {
+                    report.skipped.push(ScanSkip {
+                        path: hit.path,
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if let Some(mut old) = state
+                .projects
+                .get(&base)
+                .filter(|p| !p.root.exists() && p.source != ProjectSource::Manual)
+                .cloned()
+            {
+                let previous = old.root.clone();
+                old.root = hit.path.clone();
+                old.last_seen_at = Timestamp::now();
+                old.missing = false;
+                old.source = ProjectSource::Manifest;
+                self.upsert_project(old)?;
+                report.warnings.push(format!(
+                    "relocated {base} from {} to {}",
+                    previous.display(),
+                    hit.path.display()
+                ));
+                continue;
+            }
+            let id = unique_id(&base, &state.projects);
+            if id != base {
+                report.warnings.push(format!(
+                    "duplicate_id: {} and {} both request {base}; registered as {id}",
+                    state
+                        .projects
+                        .get(&base)
+                        .map_or_else(|| "an existing alias".into(), |p| p.root.display().to_string()),
+                    hit.path.display()
+                ));
+            }
+            let now = Timestamp::now();
+            let git_dir = hit.path.join(".git");
+            let repo = if git_dir.is_dir() {
+                let common_dir = git_dir.canonicalize()?;
+                self.upsert_repo(common_dir.clone(), RepoRecord { slug: id.to_string() });
+                Some(ProjectRepoRecord {
+                    common_dir,
+                    subpath: PathBuf::new(),
+                })
+            } else {
+                None
+            };
+            self.upsert_project(ProjectRecord {
+                id: id.clone(),
+                aliases: vec![],
+                root: hit.path,
+                repo,
+                source: ProjectSource::Manifest,
+                registered_at: now,
+                last_seen_at: now,
+                missing: false,
+                overrides: Default::default(),
+            })?;
+            report.registered.push(id);
+        }
+        let mut s = self.lock();
+        let missing: Vec<_> = s
+            .file
+            .projects
+            .iter()
+            .filter(|(_, p)| !p.root.exists() && !p.missing)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in missing {
+            if let Some(p) = s.file.projects.get_mut(&id) {
+                p.missing = true;
+            }
+            s.publish_project(&id);
+        }
+        // Persist the missing flags even when no project was otherwise registered.
+        s.dirty();
+        let suggestions: Vec<_> = scan
+            .suggestions
+            .into_iter()
+            .filter(|v| {
+                !s.file.dismissed_suggestions.contains(&v.path)
+                    && !s.file.projects.values().any(|p| p.root == v.path)
+            })
+            .collect();
+        if suggestions != s.suggestions {
+            s.suggestions = suggestions.clone();
+            s.bus.publish(Event::SuggestionsChanged {
+                suggestions: suggestions.clone(),
+            });
+        }
+        report.suggestions = suggestions;
+        Ok(report)
+    }
+    /// Persistently dismiss one suggestion and immediately update subscribers.
+    pub fn dismiss_suggestion(&self, path: &Path) {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        let mut s = self.lock();
+        if s.file.dismissed_suggestions.insert(path.clone()) {
+            s.dirty();
+        }
+        let old = s.suggestions.len();
+        s.suggestions.retain(|v| v.path != path);
+        if old != s.suggestions.len() {
+            s.bus.publish(Event::SuggestionsChanged {
+                suggestions: s.suggestions.clone(),
+            });
+        }
+    }
+}

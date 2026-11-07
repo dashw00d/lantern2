@@ -1,5 +1,6 @@
 //! Single owner of persisted project records and ephemeral daemon snapshots.
 
+pub mod scan;
 pub mod state_io;
 
 use crate::{
