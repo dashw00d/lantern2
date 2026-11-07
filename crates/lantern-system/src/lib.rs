@@ -5,3 +5,5 @@ pub mod paths;
 pub mod step;
 
 mod file;
+/// Individual installation steps.
+pub mod steps;

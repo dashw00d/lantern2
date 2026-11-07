@@ -10,3 +10,4 @@ workspace = true
 
 [dependencies]
 lantern-core = { workspace = true }
+base64 = "0.23"
