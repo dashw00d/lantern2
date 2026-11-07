@@ -1,6 +1,7 @@
 //! Offline CLI adapter for system initialization and diagnostics.
 use lantern_cli::{SystemActions, SystemCommand};
 use lantern_core::{
+    api::{Check, CheckStatus, Fix},
     dirs::Dirs,
     settings::{self, ProcessEnv},
 };
@@ -12,7 +13,27 @@ use lantern_system::{
     steps::sysctl::PortStrategy,
 };
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn caddy_selection(configured: &str, data: &Path, search_path: &str) -> (PathBuf, Option<Check>) {
+    match lantern_daemon::app::network::resolve_caddy(configured, data, search_path) {
+        Some(path) => (path, None),
+        None => (
+            data.join("bin/caddy"),
+            Some(Check {
+                id: "caddy_missing".into(),
+                title: "Caddy proxy".into(),
+                status: CheckStatus::Warn,
+                detail: "Caddy executable not found; routes are retained until it is installed.".into(),
+                fix: Some(Fix {
+                    description: "Install Caddy 2.8 or newer, or provide Lantern's bundled binary.".into(),
+                    command: "lantern init".into(),
+                    needs_root: false,
+                }),
+            }),
+        ),
+    }
+}
 
 pub struct System;
 impl SystemActions for System {
@@ -57,27 +78,29 @@ impl SystemActions for System {
             settings: &settings,
             runner: &runner,
         };
-        let caddy = if settings.caddy.binary.is_empty() {
-            paths.bundled_caddy.clone()
-        } else {
-            PathBuf::from(&settings.caddy.binary)
-        };
+        let search_path = std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let (caddy, missing_caddy) = caddy_selection(&settings.caddy.binary, &paths.dirs.data, &search_path);
         let certutil = find_program(&["/usr/bin/certutil", "/usr/local/bin/certutil"]);
         match command {
             SystemCommand::Doctor { fix } => {
                 if *fix {
                     return Err("doctor --fix is not implemented; use the reported fix commands".into());
                 }
-                let checks = doctor::run(&DoctorCtx {
+                let mut checks = doctor::run(&DoctorCtx {
                     paths: &paths,
                     settings: &settings,
                     runner: &runner,
                     network: &network,
                     caddy: &caddy,
                     certutil: certutil.as_deref(),
-                    search_path: std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                        .collect(),
+                    search_path: std::env::split_paths(&search_path).collect(),
                 });
+                if let Some(check) = missing_caddy {
+                    checks.push(check);
+                }
                 let ok = checks.iter().all(|c| {
                     matches!(
                         c.status,
@@ -128,5 +151,26 @@ impl SystemActions for System {
             SystemCommand::InitSystem { .. } => unreachable!("handled before loading caller environment"),
             SystemCommand::Uninstall { .. } => Err("uninstall is not implemented by lantern-system".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::caddy_selection;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn wire_caddy_selection_reports_missing_and_finds_bundled_binary() {
+        let root = std::env::temp_dir().join(format!("lantern-test-wire-doctor-{}", std::process::id()));
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let (path, check) = caddy_selection("", &root, "");
+        assert_eq!(path, root.join("bin/caddy"));
+        let check = check.unwrap();
+        assert_eq!(check.id, "caddy_missing");
+        assert!(check.fix.unwrap().description.contains("Install Caddy"));
+        fs::write(&path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(caddy_selection("", &root, "").1.is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 }
