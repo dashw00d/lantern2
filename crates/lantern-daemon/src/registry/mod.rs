@@ -225,11 +225,13 @@ impl RegistryHandle {
             .map(|(id, i)| (id.clone(), i.clone()))
             .collect()
     }
-    /// Add or update a repository keyed by canonical common directory.
+    /// Register a repository keyed by common directory, retaining its original stable slug.
     pub fn upsert_repo(&self, common_dir: PathBuf, record: RepoRecord) {
         let mut s = self.lock();
-        s.file.repos.insert(common_dir, record);
-        s.dirty();
+        if let std::collections::btree_map::Entry::Vacant(entry) = s.file.repos.entry(common_dir) {
+            entry.insert(record);
+            s.dirty();
+        }
     }
     /// Remove a repository record once no project refers to it.
     pub fn remove_repo(&self, common_dir: &Path) -> Result<(), Error> {
@@ -269,10 +271,9 @@ impl RegistryHandle {
         let original_manifests = s.manifests.clone();
         if let Some(previous) = s.file.projects.get(&id)
             && previous.root != root
+            && let Some(primary_record) = s.file.instances.get_mut(&primary)
         {
-            if let Some(primary_record) = s.file.instances.get_mut(&primary) {
-                primary_record.checkout.path = root.clone();
-            }
+            primary_record.checkout.path = root.clone();
         }
         s.file.projects.insert(id.clone(), project);
         s.file
@@ -762,7 +763,12 @@ impl State {
                     head: old.and_then(|c| c.head.clone()),
                     dirty: old.and_then(|c| c.dirty),
                     locked: old.and_then(|c| c.locked.clone()),
-                    missing: record.checkout.missing_since.is_some(),
+                    missing: record.checkout.missing_since.is_some()
+                        || self
+                            .file
+                            .projects
+                            .get(&record.project)
+                            .is_some_and(|p| p.missing && id.is_primary()),
                 },
             );
         }
@@ -828,15 +834,19 @@ impl State {
         Ok(())
     }
     fn publish_index(&self) {
-        let refs = self.checkouts.iter().filter_map(|(id, c)| {
-            self.file.instances.get(id).map(|i| CheckoutRef {
-                instance: id.clone(),
-                project: i.project.clone(),
-                kind: c.kind,
-                branch: c.branch.clone(),
-                path: c.path.clone(),
-            })
-        });
+        let refs = self
+            .checkouts
+            .iter()
+            .filter(|(_, c)| !c.missing)
+            .filter_map(|(id, c)| {
+                self.file.instances.get(id).map(|i| CheckoutRef {
+                    instance: id.clone(),
+                    project: i.project.clone(),
+                    kind: c.kind,
+                    branch: c.branch.clone(),
+                    path: c.path.clone(),
+                })
+            });
         let mut index = CheckoutIndex::new(refs, self.home.clone());
         index.any_adopted = self.file.instances.values().any(|i| i.adopt);
         index.workspace_roots = self
@@ -852,6 +862,11 @@ impl State {
         let r = self.file.instances.get(id)?;
         let m = self.manifests.get(id)?;
         let checkout = self.checkouts.get(id)?.clone();
+        let mut runtime = self.runtime.get(id).cloned().unwrap_or_default();
+        if checkout.missing && runtime.status == InstanceStatus::Stopped {
+            runtime.status = InstanceStatus::NeedsConfig;
+            runtime.message = Some("checkout path not found".into());
+        }
         let domain = if id.is_primary() {
             m.value
                 .domain
@@ -874,7 +889,7 @@ impl State {
                     !matches!(r.status, InstanceStatus::Stopped | InstanceStatus::NeedsConfig)
                 }),
             setup_stale: self.setup_stale.get(id).copied().unwrap_or(false),
-            runtime: self.runtime.get(id).cloned().unwrap_or_default(),
+            runtime,
             manifest: m.value.summary(m.rev.clone()),
         })
     }

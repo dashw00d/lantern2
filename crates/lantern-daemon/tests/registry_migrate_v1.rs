@@ -53,6 +53,7 @@ async fn registry_migrate_v1_dry_run_apply_repeat_and_force() {
     let source = t.mkdir("v1");
     let manifest = t.mkdir("projects/app");
     let manual = t.mkdir("projects/manual");
+    fs::create_dir_all(manual.join(".git")).unwrap();
     fs::write(
         manifest.join("lantern.yaml"),
         "id: app\nname: Original\ntype: proxy\nrun: {cmd: 'npm run dev', env: {KEEP: manifest}}\n",
@@ -111,6 +112,15 @@ async fn registry_migrate_v1_dry_run_apply_repeat_and_force() {
     registry.flush().await.unwrap();
     let snapshot = registry.state_snapshot();
     assert_eq!(snapshot.projects.len(), 2);
+    assert_eq!(snapshot.repos.len(), 1);
+    assert_eq!(
+        snapshot.projects[&ProjectId::parse("my-manual").unwrap()]
+            .repo
+            .as_ref()
+            .unwrap()
+            .common_dir,
+        manual.join(".git")
+    );
     assert_eq!(snapshot.active_profile.as_deref(), Some("custom"));
     assert!(snapshot.port_leases.is_empty());
     assert_eq!(

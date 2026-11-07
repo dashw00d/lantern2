@@ -122,6 +122,26 @@ async fn registry_scan_manifest_first_suggestions_dismissal_and_manual() {
         .unwrap();
     assert!(record.missing);
     assert_eq!(record.source, ProjectSource::Manual);
+    let view = registry
+        .instances()
+        .into_iter()
+        .find(|i| i.project == record.id)
+        .unwrap();
+    assert!(view.checkout.missing);
+    assert_eq!(
+        view.runtime.status,
+        lantern_core::model::InstanceStatus::NeedsConfig
+    );
+    fs::create_dir_all(&manual).unwrap();
+    registry.scan_workspace(&t.dirs()).unwrap();
+    assert!(!registry.project_record(&record.id).unwrap().missing);
+    let view = registry
+        .instances()
+        .into_iter()
+        .find(|i| i.project == record.id)
+        .unwrap();
+    assert!(!view.checkout.missing);
+    assert_eq!(view.runtime.status, lantern_core::model::InstanceStatus::Stopped);
     drop(registry);
 }
 

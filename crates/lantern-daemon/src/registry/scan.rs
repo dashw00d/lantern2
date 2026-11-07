@@ -349,21 +349,28 @@ impl RegistryHandle {
             report.registered.push(id);
         }
         let mut s = self.lock();
-        let missing: Vec<_> = s
+        let changed: Vec<_> = s
             .file
             .projects
             .iter()
-            .filter(|(_, p)| !p.root.exists() && !p.missing)
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, project)| {
+                let missing = !project.root.exists();
+                (missing != project.missing).then_some((id.clone(), missing))
+            })
             .collect();
-        for id in missing {
-            if let Some(p) = s.file.projects.get_mut(&id) {
-                p.missing = true;
+        for (id, missing) in &changed {
+            if let Some(project) = s.file.projects.get_mut(id) {
+                project.missing = *missing;
             }
-            s.publish_project(&id);
+            let primary = lantern_core::ids::InstanceId::primary(id);
+            s.rebuild_checkout(&primary);
+            s.publish_instance(&primary);
+            s.publish_project(id);
         }
-        // Persist the missing flags even when no project was otherwise registered.
-        s.dirty();
+        if !changed.is_empty() {
+            s.dirty();
+            s.publish_index();
+        }
         let suggestions: Vec<_> = scan
             .suggestions
             .into_iter()

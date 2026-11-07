@@ -8,21 +8,23 @@ use lantern_core::{
     manifest::{self, raw::RawManifest},
     model::ProjectSource,
     profiles::{self, Profiles},
-    state::{ImportRecord, ProjectRecord},
+    state::{ImportRecord, ProjectRecord, ProjectRepoRecord, RepoRecord},
     yaml,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use toml_edit::{DocumentMut, Item};
 
 const INPUT_LIMIT: u64 = 16 * 1024 * 1024;
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Import operation failed before or during application.
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +67,7 @@ pub struct ImportPlan {
 struct Prepared {
     plan: ImportPlan,
     projects: Vec<ProjectRecord>,
+    repos: BTreeMap<PathBuf, RepoRecord>,
     files: Vec<(PathBuf, Vec<u8>, bool)>,
     profile: Option<String>,
     from: PathBuf,
@@ -86,6 +89,33 @@ fn read_limited(path: &Path) -> io::Result<Option<Vec<u8>>> {
         ));
     }
     Ok(Some(data))
+}
+fn project_repo(path: &Path) -> Option<ProjectRepoRecord> {
+    for root in path.ancestors() {
+        let dotgit = root.join(".git");
+        let git_dir = if dotgit.is_dir() {
+            dotgit.canonicalize().ok()?
+        } else if dotgit.is_file() {
+            let src = read_limited(&dotgit).ok()??;
+            let text = std::str::from_utf8(&src).ok()?;
+            let target = text.trim().strip_prefix("gitdir:")?.trim();
+            root.join(target).canonicalize().ok()?
+        } else {
+            continue;
+        };
+        let common = match read_limited(&git_dir.join("commondir")).ok()? {
+            Some(bytes) => git_dir
+                .join(std::str::from_utf8(&bytes).ok()?.trim())
+                .canonicalize()
+                .ok()?,
+            None => git_dir,
+        };
+        return Some(ProjectRepoRecord {
+            common_dir: common,
+            subpath: path.strip_prefix(root).ok()?.to_owned(),
+        });
+    }
+    None
 }
 fn read_json(path: &Path) -> Result<Option<Value>, Error> {
     read_limited(path)?
@@ -454,7 +484,10 @@ fn prepare(reg: &RegistryHandle, from: &Path, dirs: &Dirs, force: bool) -> Resul
         }
     });
     let tld = settings.get("tld").and_then(Value::as_str).unwrap_or("glow");
-    let mut known = reg.state_snapshot().projects;
+    let snapshot = reg.state_snapshot();
+    let mut known = snapshot.projects;
+    let mut known_repos = snapshot.repos;
+    let mut prepared_repos = BTreeMap::new();
     let mut prepared_projects = Vec::new();
     let mut added = 0;
     for (key, project) in projects {
@@ -580,12 +613,20 @@ fn prepare(reg: &RegistryHandle, from: &Path, dirs: &Dirs, force: bool) -> Resul
                 aliases.push(alias.to_string());
             }
         }
+        let repo = project_repo(&path);
+        if let Some(repo) = &repo
+            && !known_repos.contains_key(&repo.common_dir)
+        {
+            let record = RepoRecord { slug: id.to_string() };
+            known_repos.insert(repo.common_dir.clone(), record.clone());
+            prepared_repos.insert(repo.common_dir.clone(), record);
+        }
         let now = Timestamp::now();
         let record = ProjectRecord {
             id: id.clone(),
             aliases,
             root: path,
-            repo: None,
+            repo,
             source: if parsed.is_some() {
                 ProjectSource::Manifest
             } else {
@@ -604,6 +645,7 @@ fn prepare(reg: &RegistryHandle, from: &Path, dirs: &Dirs, force: bool) -> Resul
     Ok(Prepared {
         plan,
         projects: prepared_projects,
+        repos: prepared_repos,
         files,
         profile,
         from,
@@ -616,31 +658,31 @@ fn write_file(path: &Path, contents: &[u8], replace: bool) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::other("target has no parent"))?;
     fs::create_dir_all(dir)?;
-    if !replace {
-        let mut f = OpenOptions::new()
+    let temp = dir.join(format!(
+        ".lantern-import-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(path)?;
-        f.write_all(contents)?;
-        f.sync_all()?;
-        return fs::File::open(dir)?.sync_all();
+            .open(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        if replace {
+            fs::rename(&temp, path)?;
+        } else {
+            fs::hard_link(&temp, path)?;
+            fs::remove_file(&temp)?;
+        }
+        fs::File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
     }
-    let temp = path.with_extension("toml.import-tmp");
-    match fs::remove_file(&temp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)?;
-    f.write_all(contents)?;
-    f.sync_all()?;
-    fs::rename(temp, path)?;
-    fs::File::open(dir)?.sync_all()
+    result
 }
 
 impl RegistryHandle {
@@ -658,6 +700,9 @@ impl RegistryHandle {
         }
         for (path, contents, replace) in &prepared.files {
             write_file(path, contents, *replace)?;
+        }
+        for (common_dir, repo) in prepared.repos {
+            self.upsert_repo(common_dir, repo);
         }
         for project in prepared.projects {
             self.upsert_project(project)?;

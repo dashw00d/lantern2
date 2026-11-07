@@ -166,15 +166,29 @@ fn load(path: &Path) -> Result<(StateFile, Recovery, bool), Error> {
 
 fn write_copy(from: &Path, to: &Path) -> io::Result<()> {
     let data = fs::read(from)?;
+    let dir = to
+        .parent()
+        .ok_or_else(|| io::Error::other("backup has no parent"))?;
+    let name = to
+        .file_name()
+        .ok_or_else(|| io::Error::other("backup has no filename"))?;
+    let mut temporary_name = name.to_os_string();
+    temporary_name.push(".tmp");
+    let temporary = dir.join(temporary_name);
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        .open(to)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        .open(&temporary)?;
     file.write_all(&data)?;
-    file.sync_all()
+    file.sync_all()?;
+    fs::rename(&temporary, to)?;
+    File::open(dir)?.sync_all()
 }
 
 fn write_atomic(path: &Path, state: &StateFile) -> Result<(), String> {
@@ -227,6 +241,7 @@ async fn writer(
     let mut pending: Option<StateFile> = None;
     let mut first: Option<Instant> = None;
     let mut deadline: Option<Instant> = None;
+    let mut retrying = false;
     loop {
         let timer = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400 * 365));
         tokio::select! {
@@ -235,18 +250,18 @@ async fn writer(
                     let now = Instant::now();
                     let start = *first.get_or_insert(now);
                     pending = Some(state);
-                    deadline = Some((now + DEBOUNCE).min(start + MAX_WAIT));
+                    if !retrying { deadline = Some((now + DEBOUNCE).min(start + MAX_WAIT)); }
                 }
                 Some(Command::Flush(reply)) => {
                     let result = persist(&path, &mut pending, &errors);
-                    if result.is_ok() { first = None; deadline = None; } else { deadline = Some(Instant::now() + RETRY); }
+                    if result.is_ok() { first = None; deadline = None; retrying = false; } else { deadline = Some(Instant::now() + RETRY); retrying = true; }
                     let _ = reply.send(result);
                 }
                 None => { let _ = persist(&path, &mut pending, &errors); break; }
             },
             () = sleep_until(timer), if deadline.is_some() => {
-                if persist(&path, &mut pending, &errors).is_ok() { first = None; deadline = None; }
-                else { deadline = Some(Instant::now() + RETRY); }
+                if persist(&path, &mut pending, &errors).is_ok() { first = None; deadline = None; retrying = false; }
+                else { deadline = Some(Instant::now() + RETRY); retrying = true; }
             }
         }
     }
