@@ -76,3 +76,40 @@ pub trait OneShot: Send + Sync {
     /// Run to successful exit, propagating failure, timeout and cancellation.
     fn run(&self, spec: OneShotSpec) -> OneShotFuture<'_>;
 }
+
+/// Dependency detection and setup stamp helpers.
+pub mod deps;
+/// Safe file materialization helpers.
+pub mod files;
+
+/// Instance operation failure.
+#[derive(Debug, thiserror::Error)]
+pub enum InstanceError {
+    /// Git operation failed.
+    #[error(transparent)]
+    Git(#[from] crate::git::GitError),
+    /// Filesystem operation failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// Registry or runtime adapter failed.
+    #[error("adapter: {0}")]
+    Adapter(String),
+    /// Requested project or instance does not exist.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// Project has no git repository.
+    #[error("not a git repository")]
+    NotARepo,
+    /// Invalid or escaping file pattern or destination.
+    #[error("unsafe path: {0}")]
+    UnsafePath(String),
+    /// File limits were exceeded.
+    #[error("copy limit exceeded; consider link instead")]
+    CopyLimit,
+    /// Cancellation was requested.
+    #[error("operation cancelled")]
+    Cancelled,
+    /// State or safety policy refused an operation.
+    #[error("{0}")]
+    Refused(String),
+}
