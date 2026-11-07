@@ -419,6 +419,9 @@ pub enum McpCommand {
         force: bool,
         #[arg(long)]
         print: bool,
+        /// Override the client configuration file path.
+        #[arg(long)]
+        config_path: Option<PathBuf>,
     },
 }
 /// Supported MCP clients.

@@ -3,6 +3,8 @@
 pub mod args;
 mod error;
 mod execute;
+/// MCP client configuration editing.
+pub mod mcp_install;
 mod output;
 mod target;
 
