@@ -99,6 +99,48 @@ impl Scanner {
             })
             .collect()
     }
+    /// Perform a fresh blocking readiness check without trusting a cached snapshot.
+    pub fn port_binding(&mut self, port: u16, expected_unit: Option<&str>) -> io::Result<super::PortBinding> {
+        let (_, mut sockets) = self.sockets()?;
+        sockets.retain(|s| s.addr.port() == port);
+        if sockets.is_empty() {
+            return Ok(super::PortBinding::Free);
+        }
+        let observations = self.observe(sockets, Instant::now());
+        let (visible, hidden) = build(
+            observations,
+            &self.index,
+            &self.settings,
+            self.reader.root.uid(),
+            std::process::id(),
+        );
+        let rows: Vec<_> = visible.into_iter().chain(hidden).collect();
+        if let Some(expected) = expected_unit.map(super::procinfo::normalize_unit) {
+            let matches: Vec<_> = rows
+                .iter()
+                .filter(|l| {
+                    l.pid.is_some()
+                        && l.unit
+                            .as_deref()
+                            .is_some_and(|unit| super::procinfo::normalize_unit(unit) == expected)
+                })
+                .collect();
+            if let Some(first) = matches.first() {
+                let mut addrs: Vec<_> = matches
+                    .iter()
+                    .flat_map(|l| std::iter::once(l.addr).chain(l.other_addrs.iter().copied()))
+                    .collect();
+                addrs.sort_unstable();
+                addrs.dedup();
+                return Ok(super::PortBinding::BoundByUnit {
+                    pid: first.pid.expect("filtered pid"),
+                    addrs,
+                });
+            }
+        }
+        let first = rows.first().expect("nonempty sockets yield listeners");
+        Ok(super::PortBinding::HeldByOther(first.into()))
+    }
     /// Perform a fresh blocking scan and increment sequence only for visible changes.
     pub fn scan(&mut self) -> io::Result<Snapshot> {
         let start = Instant::now();
@@ -139,6 +181,87 @@ mod tests {
         fn listening_tcp(&mut self) -> io::Result<Vec<RawSocket>> {
             Ok(self.0.clone())
         }
+    }
+    #[test]
+    fn discovery_port_binding_and_conflicts() {
+        use crate::discovery::{
+            PortBinding,
+            hide::{HideRule, PortSpec},
+        };
+        let t = Tree::new();
+        t.process(
+            111,
+            1,
+            10,
+            "node",
+            "/dev/app",
+            &["node", "--token", "secret"],
+            "/lantern-inst-app.service",
+        );
+        t.socket(111, 3, 123);
+        let root = ProcRoot::new(&t.0);
+        let uid = root.uid();
+        let project = ProjectId::parse("app").unwrap();
+        let checkout = CheckoutRef {
+            instance: InstanceId::primary(&project),
+            project,
+            kind: CheckoutKind::Primary,
+            branch: None,
+            path: "/dev/app".into(),
+        };
+        let instance = checkout.instance.clone();
+        let index = CheckoutIndex::new([checkout], "/home/test");
+        let sockets = vec![
+            RawSocket {
+                addr: "127.0.0.1:39200".parse().unwrap(),
+                inode: 123,
+                uid,
+            },
+            RawSocket {
+                addr: "127.0.0.1:39201".parse().unwrap(),
+                inode: 222,
+                uid: uid + 1,
+            },
+        ];
+        let settings = HideSettings {
+            rules: vec![
+                HideRule {
+                    port: Some(PortSpec::Single(39200)),
+                    ..HideRule::default()
+                },
+                HideRule {
+                    port: Some(PortSpec::Single(39201)),
+                    ..HideRule::default()
+                },
+            ],
+            ..HideSettings::default()
+        };
+        let mut scanner = Scanner::with_source(
+            root,
+            index,
+            settings,
+            Box::new(Fixed(sockets)),
+            SocketSourceKind::ProcNetTcp,
+        );
+        assert_eq!(scanner.port_binding(39202, None).unwrap(), PortBinding::Free);
+        assert_eq!(
+            scanner
+                .port_binding(39200, Some("lantern-inst-app.service"))
+                .unwrap(),
+            PortBinding::BoundByUnit {
+                pid: 111,
+                addrs: vec!["127.0.0.1:39200".parse().unwrap()]
+            }
+        );
+        let PortBinding::HeldByOther(holder) = scanner.port_binding(39200, None).unwrap() else {
+            panic!("expected holder");
+        };
+        assert_eq!(holder.cmdline[2], "***");
+        let snapshot = scanner.scan().unwrap();
+        assert_eq!(snapshot.listeners.len(), 1); // managed rows survive all hide rules
+        assert_eq!(snapshot.hidden.len(), 1);
+        assert!(snapshot.conflicts(&[(instance.clone(), 39200)]).is_empty());
+        assert_eq!(snapshot.conflicts(&[(instance, 39201)])[0].holder.uid, uid + 1);
     }
     #[test]
     fn discovery_snapshot_stable_grouping_hidden_and_redaction() {

@@ -11,3 +11,5 @@ pub mod procinfo;
 mod redact;
 mod scanner;
 pub use scanner::{Scanner, Snapshot};
+mod port;
+pub use port::{PortBinding, PortConflict, PortHolder};

@@ -2,6 +2,7 @@
 
 use super::matcher::{CheckoutIndex, usable_ancestors};
 use super::procinfo::ProcInfo;
+use super::redact::redact;
 use lantern_core::model::ListenerClass;
 use std::path::Path;
 
@@ -118,12 +119,13 @@ fn fallback(p: Option<&ProcInfo>) -> String {
         .and_then(|s| s.to_str())
         .or_else(|| p.cmdline_raw.first().map(|s| basename(s)))
         .unwrap_or("process");
+    let safe_args = redact(&p.cmdline_raw);
     let script = if [
         "node", "bun", "deno", "tsx", "nodemon", "python", "python3", "ruby", "php",
     ]
     .contains(&exe)
     {
-        p.cmdline_raw
+        safe_args
             .iter()
             .skip(1)
             .find(|s| !s.starts_with('-'))
