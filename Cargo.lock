@@ -1176,6 +1176,7 @@ dependencies = [
  "lantern-client",
  "lantern-core",
  "percent-encoding",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",
