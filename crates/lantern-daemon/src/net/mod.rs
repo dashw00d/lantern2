@@ -2,4 +2,5 @@
 
 pub mod caddy;
 pub mod caddy_config;
+pub mod dns;
 pub mod routes;
