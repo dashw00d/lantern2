@@ -215,7 +215,10 @@ pub fn scan_roots(settings: &WorkspaceSettings, home: &Path, managed_worktrees: 
     report
 }
 
-fn unique_id(base: &ProjectId, projects: &std::collections::BTreeMap<ProjectId, ProjectRecord>) -> ProjectId {
+pub(super) fn unique_id(
+    base: &ProjectId,
+    projects: &std::collections::BTreeMap<ProjectId, ProjectRecord>,
+) -> ProjectId {
     if !projects.contains_key(base)
         && !projects
             .values()

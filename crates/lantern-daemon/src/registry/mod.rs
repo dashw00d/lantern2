@@ -1,5 +1,6 @@
 //! Single owner of persisted project records and ephemeral daemon snapshots.
 
+pub mod migrate_v1;
 pub mod scan;
 pub mod state_io;
 
