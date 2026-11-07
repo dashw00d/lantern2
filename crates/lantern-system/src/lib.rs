@@ -1,1 +1,7 @@
-//! lantern-system. See docs/README.md for the crate's role. Not yet implemented.
+//! Synchronous, daemon-independent Lantern installation and diagnostics.
+
+pub mod command;
+pub mod paths;
+pub mod step;
+
+mod file;
