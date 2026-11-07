@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 #[tokio::test]
 async fn app_services_observe_only_injected_test_port() {
     let mut listener = None;
-    for port in 39860..39890 {
+    for port in 39940..39960 {
         if let Ok(socket) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
             listener = Some((socket, port));
             break;
