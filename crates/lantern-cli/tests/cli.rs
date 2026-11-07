@@ -84,7 +84,7 @@ fn fixture() -> (ProjectSummary, InstanceView) {
 }
 
 fn bind() -> TcpListener {
-    (39500..=39598)
+    (39600..=39649)
         .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
         .expect("lane port available")
 }
@@ -296,13 +296,13 @@ async fn manifest_checks_are_offline_and_located() {
     let file = dir.path().join("lantern.yaml");
     std::fs::write(&file, "id: myapp\nrun:\n  cmd: [bad, type]\n").unwrap();
     let file = file.to_str().unwrap();
-    let (code, out, err) = run(&["manifest", "check", file], "http://127.0.0.1:39599", false).await;
+    let (code, out, err) = run(&["manifest", "check", file], "http://127.0.0.1:39699", false).await;
     assert_eq!(code, 8, "{out} {err}");
     assert!(out.contains("lantern.yaml:3:"), "{out}");
     assert!(err.is_empty());
     let (code, out, _) = run(
         &["manifest", "check", file, "--json"],
-        "http://127.0.0.1:39599",
+        "http://127.0.0.1:39699",
         false,
     )
     .await;
@@ -405,10 +405,10 @@ async fn routes_branch_and_preflight_removal_to_server() {
 #[tokio::test]
 async fn exit_codes_and_noninteractive_confirmation() {
     let _guard = NETWORK_TESTS.lock().await;
-    let (code, _, err) = run(&["off", "--all"], "http://127.0.0.1:39599", false).await;
+    let (code, _, err) = run(&["off", "--all"], "http://127.0.0.1:39699", false).await;
     assert_eq!(code, 2);
     assert!(err.contains("requires -y"));
-    let (code, _, err) = run(&["off", "--all", "--json"], "http://127.0.0.1:39599", true).await;
+    let (code, _, err) = run(&["off", "--all", "--json"], "http://127.0.0.1:39699", true).await;
     assert_eq!(code, 2);
     assert_eq!(serde_json::from_str::<Value>(&err).unwrap()["exit_code"], 2);
     let (host, server) = serve(1, |_, _, _| {
@@ -674,11 +674,15 @@ async fn process_actions_and_offline_commands_need_no_daemon() {
         dispatch(cli, &UnassembledSystem, &mut out, &mut err, false).await,
         CliAction::RunDaemon(_)
     ));
+    let cli = Cli::try_parse_from(["lantern", "daemon", "--dev"]).unwrap();
+    assert!(
+        matches!(dispatch(cli, &UnassembledSystem, &mut out, &mut err, false).await, CliAction::RunDaemon(args) if args.dev)
+    );
     let cli = Cli::try_parse_from(["lantern", "gui", "--tray", "myapp"]).unwrap();
     assert!(
         matches!(dispatch(cli, &UnassembledSystem, &mut out, &mut err, false).await, CliAction::RunGui(args) if args.tray && args.target.as_deref() == Some("myapp"))
     );
-    let (code, out, err) = run(&["schema", "manifest", "--json"], "http://127.0.0.1:39599", false).await;
+    let (code, out, err) = run(&["schema", "manifest", "--json"], "http://127.0.0.1:39699", false).await;
     assert_eq!(code, 0, "{err}");
     assert!(
         serde_json::from_str::<Value>(&out)
@@ -686,7 +690,7 @@ async fn process_actions_and_offline_commands_need_no_daemon() {
             .get("properties")
             .is_some()
     );
-    let (code, out, err) = run(&["completions", "bash"], "http://127.0.0.1:39599", false).await;
+    let (code, out, err) = run(&["completions", "bash"], "http://127.0.0.1:39699", false).await;
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("_lantern"));
 }
@@ -700,11 +704,11 @@ fn daemon_url_uses_d21_environment_and_explicit_host_wins() {
         );
     }
     assert_eq!(
-        Cli::try_parse_from(["lantern", "--host", "http://127.0.0.1:39598", "ls"])
+        Cli::try_parse_from(["lantern", "--host", "http://127.0.0.1:39698", "ls"])
             .unwrap()
             .host
             .as_deref(),
-        Some("http://127.0.0.1:39598")
+        Some("http://127.0.0.1:39698")
     );
 }
 

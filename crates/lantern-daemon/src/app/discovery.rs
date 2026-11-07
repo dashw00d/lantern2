@@ -15,7 +15,10 @@ use lantern_core::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +32,7 @@ const DISAPPEAR: Duration = Duration::from_secs(5);
 pub struct Discovery {
     requests: mpsc::Sender<oneshot::Sender<Result<Snapshot, String>>>,
     cache: Arc<RwLock<Option<Snapshot>>>,
+    interests: Arc<AtomicUsize>,
     task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 impl Discovery {
@@ -42,6 +46,7 @@ impl Discovery {
     ) -> Self {
         let (requests, rx) = mpsc::channel(32);
         let cache = Arc::new(RwLock::new(None));
+        let interests = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(run(
             scanner,
             registry,
@@ -49,12 +54,25 @@ impl Discovery {
             names,
             shutdown,
             rx,
-            cache.clone(),
+            (cache.clone(), interests.clone()),
         ));
         Self {
             requests,
             cache,
+            interests,
             task: Arc::new(tokio::sync::Mutex::new(Some(task))),
+        }
+    }
+    /// Update the number of active state-stream consumers.
+    pub fn interest(&self, active: bool) {
+        if active {
+            self.interests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let _ = self
+                .interests
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                });
         }
     }
     /// Wait for the cancelled worker to release its registry and runtime handles.
@@ -98,8 +116,9 @@ async fn run(
     names: UnitNames,
     shutdown: CancellationToken,
     mut requests: mpsc::Receiver<oneshot::Sender<Result<Snapshot, String>>>,
-    cache: Arc<RwLock<Option<Snapshot>>>,
+    shared: (Arc<RwLock<Option<Snapshot>>>, Arc<AtomicUsize>),
 ) {
+    let (cache, interests) = shared;
     let clock = MonotonicClock::default();
     let mut policy = ScanPolicy::new(clock);
     let epoch = Instant::now();
@@ -122,7 +141,11 @@ async fn run(
                     | InstanceStatus::Preparing
             )
         });
-        policy.set_interests(usize::from(live));
+        policy.set_interests(
+            interests
+                .load(Ordering::Relaxed)
+                .saturating_add(usize::from(live)),
+        );
         let now = epoch.elapsed();
         if policy.next_scan().is_some_and(|deadline| deadline <= now) {
             let scanner = scanner.clone();
@@ -145,6 +168,9 @@ async fn run(
             .map_err(|e| e.to_string())
             .and_then(|r| r);
             policy.scanned();
+            while let Ok(request) = requests.try_recv() {
+                pending.push(request);
+            }
             match result {
                 Ok(mut snapshot) => {
                     for row in snapshot.listeners.iter_mut().chain(snapshot.hidden.iter_mut()) {

@@ -86,6 +86,8 @@ fn unavailable() -> ApiError {
 /// Optional/default methods report unavailable until the controller wires that subsystem.
 #[async_trait]
 pub trait DaemonFacade: Send + Sync + 'static {
+    /// Track state-stream interest for discovery scheduling.
+    fn listener_interest(&self, _active: bool) {}
     /// Read or wait for a tracked operation, shared by REST and MCP.
     async fn operation(&self, _id: OperationId, _wait: std::time::Duration) -> FacadeResult<Operation> {
         Err(unavailable())

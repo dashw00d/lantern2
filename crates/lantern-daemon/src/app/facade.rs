@@ -426,6 +426,9 @@ async fn wait_finished(tracker: &OperationTracker, id: &OperationId) {
 
 #[async_trait]
 impl DaemonFacade for AppFacade {
+    fn listener_interest(&self, active: bool) {
+        self.discovery.interest(active);
+    }
     async fn operation(&self, id: OperationId, wait: Duration) -> FacadeResult<Operation> {
         self.tracker
             .wait(&id, wait)
@@ -470,6 +473,7 @@ impl DaemonFacade for AppFacade {
             return Err(error("bad_request", "project path must be a directory"));
         }
         let parsed = manifest::load(&root).map_err(internal)?;
+        let has_manifest = parsed.is_some() || request.write_manifest;
         if request.write_manifest && parsed.is_some() {
             return Err(error("already_exists", "manifest already exists"));
         }
@@ -484,37 +488,18 @@ impl DaemonFacade for AppFacade {
                     .into_owned()
             });
         let id = ProjectId::from_name(&name).map_err(|e| error(e.code(), e.to_string()))?;
-        if request.write_manifest {
-            if self
-                .registry
-                .state_snapshot()
-                .projects
-                .values()
-                .any(|p| p.id == id || p.root == root || p.aliases.iter().any(|a| a == id.as_str()))
-            {
-                return Err(error(
-                    "already_exists",
-                    "project identity or path is already registered",
-                ));
-            }
-            let detection = lantern_core::detect::detect_dir(&root);
-            let mut value = serde_json::Map::new();
-            value.insert("id".into(), json!(id.as_str()));
-            if let Some(template) = detection.template {
-                value.insert("template".into(), json!(template));
-            }
-            let text = lantern_core::yaml::to_string(&Value::Object(value)).map_err(internal)?;
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(root.join("lantern.yaml"))
-                .map_err(internal)?;
-            file.write_all(text.as_bytes())
-                .and_then(|()| file.sync_all())
-                .map_err(internal)?;
+        if self
+            .registry
+            .state_snapshot()
+            .projects
+            .values()
+            .any(|p| p.id == id || p.root == root || p.aliases.iter().any(|a| a == id.as_str()))
+        {
+            return Err(error(
+                "already_exists",
+                "project identity or path is already registered",
+            ));
         }
-
         let mut overrides = request
             .overrides
             .map(serde_json::from_value::<RawManifest>)
@@ -535,20 +520,55 @@ impl DaemonFacade for AppFacade {
                 subpath: p.subpath,
             }
         });
+        let created_manifest = if request.write_manifest {
+            let detection = lantern_core::detect::detect_dir(&root);
+            let mut value = serde_json::Map::new();
+            value.insert("id".into(), json!(id.as_str()));
+            if let Some(template) = detection.template {
+                value.insert("template".into(), json!(template));
+            }
+            let text = lantern_core::yaml::to_string(&Value::Object(value)).map_err(internal)?;
+            use std::io::Write;
+            let path = root.join("lantern.yaml");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(internal)?;
+            file.write_all(text.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(internal)?;
+            Some((path, text))
+        } else {
+            None
+        };
         let now = Timestamp::now();
-        self.registry
-            .upsert_project(ProjectRecord {
-                id: id.clone(),
-                aliases: vec![],
-                root,
-                repo,
-                source: ProjectSource::Manual,
-                registered_at: now,
-                last_seen_at: now,
-                missing: false,
-                overrides,
-            })
-            .map_err(internal)?;
+        let registered = self.registry.upsert_project(ProjectRecord {
+            id: id.clone(),
+            aliases: vec![],
+            root,
+            repo,
+            source: if has_manifest {
+                ProjectSource::Manifest
+            } else {
+                ProjectSource::Manual
+            },
+            registered_at: now,
+            last_seen_at: now,
+            missing: false,
+            overrides,
+        });
+        if let Err(error) = registered {
+            if let Some((path, source)) = created_manifest
+                && std::fs::read_to_string(&path).is_ok_and(|current| current == source)
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(match error {
+                crate::registry::Error::Conflict(_) => error_api_conflict(&error),
+                _ => internal(error),
+            });
+        }
         self.registry.flush().await.map_err(internal)?;
         self.summary(&id)
     }
@@ -1744,4 +1764,8 @@ fn remove_setting(source: &str, key: &str) -> Result<String, String> {
         table = next;
     }
     Ok(doc.to_string())
+}
+
+fn error_api_conflict(e: &crate::registry::Error) -> ApiError {
+    error("already_exists", e.to_string())
 }

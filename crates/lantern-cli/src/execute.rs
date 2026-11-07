@@ -158,8 +158,6 @@ fn needs_daemon(command: Option<&Command>) -> bool {
                 | Command::Init { .. }
                 | Command::Doctor { .. }
                 | Command::Uninstall { .. }
-                | Command::MigrateV1 { .. }
-                | Command::Env { .. }
         ) | Some(Command::Manifest {
             command: ManifestCommand::Check { .. }
         }) | Some(Command::Mcp { .. })
@@ -368,7 +366,28 @@ async fn execute(ctx: &mut Context<'_>, system: &dyn SystemActions) -> Result<Op
         Command::Mcp {
             command: McpCommand::Install { .. },
         } => Err(Failure::unsupported("mcp install is not assembled yet")),
-        Command::MigrateV1 { .. } => Err(Failure::unsupported("migrate-v1 is not assembled yet")),
+        Command::MigrateV1 {
+            from,
+            dry_run,
+            yes,
+            force,
+        } => {
+            if !dry_run && !yes {
+                return Err(Failure::usage(
+                    "migrate-v1 requires --yes to apply changes; use --dry-run to preview",
+                ));
+            }
+            let result = ctx
+                .client()?
+                .import_v1(api::ImportV1Request {
+                    from: from.clone(),
+                    dry_run: *dry_run,
+                    force: *force,
+                })
+                .await
+                .map_err(|e| ctx.failure(e))?;
+            Ok(Some(Reply::pretty(&result)?))
+        }
         Command::Env { command } => {
             let (method, path) = match command {
                 EnvCommand::Show => (reqwest::Method::GET, vec!["api", "system", "env"]),

@@ -35,14 +35,19 @@ use std::{
     fs, io,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
-struct Empty;
+struct Empty(Arc<AtomicUsize>);
 impl SocketSource for Empty {
     fn listening_tcp(&mut self) -> io::Result<Vec<RawSocket>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
         Ok(vec![])
     }
 }
@@ -140,11 +145,12 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         true,
     ));
     oneshot.bind(&runtime).unwrap();
+    let scan_count = Arc::new(AtomicUsize::new(0));
     let scanner = Scanner::with_source(
         ProcRoot::new(temp.0.join("proc")),
         CheckoutIndex::new([], &temp.0),
         HideSettings::default(),
-        Box::new(Empty),
+        Box::new(Empty(scan_count.clone())),
         SocketSourceKind::ProcNetTcp,
     );
     let shutdown = CancellationToken::new();
@@ -154,6 +160,27 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         runtime.clone(),
         names.clone(),
         shutdown.clone(),
+    );
+    for _ in 0..50 {
+        if discovery.cached().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(discovery.cached().is_some());
+    let before = scan_count.load(Ordering::SeqCst);
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let discovery = discovery.clone();
+        requests.spawn(async move { discovery.scan().await.unwrap() });
+    }
+    while let Some(result) = requests.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(
+        scan_count.load(Ordering::SeqCst) - before,
+        1,
+        "concurrent scan requests must share one scan"
     );
     let app = AppFacade::new(
         registry.clone(),
@@ -179,6 +206,34 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         .await
         .unwrap();
     let id: InstanceId = project.primary;
+    let collision = app
+        .register_project(RegisterProjectRequest {
+            path: temp.0.join("project"),
+            id: None,
+            name: None,
+            enabled: None,
+            overrides: None,
+            write_manifest: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(collision.code, "already_exists");
+    let invalid_root = temp.0.join("invalid");
+    fs::create_dir_all(&invalid_root).unwrap();
+    let invalid = app
+        .register_project(RegisterProjectRequest {
+            path: invalid_root.clone(),
+            id: None,
+            name: None,
+            enabled: None,
+            overrides: Some(serde_json::json!({"enabled":[]})),
+            write_manifest: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(invalid.code, "validation_failed");
+    assert!(!invalid_root.join("lantern.yaml").exists());
+
     let (profile, created) = app
         .put_profile(
             "testing".into(),
@@ -208,6 +263,34 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
     let off = app.stop(id.clone()).await.unwrap();
     let outcome = tracker.wait(&off.id, Duration::from_secs(8)).await.unwrap();
     assert_eq!(outcome.status, OperationStatus::Succeeded, "{:?}", outcome.error);
+    assert_eq!(
+        app.instance(id.clone()).await.unwrap().runtime.status,
+        InstanceStatus::Stopped
+    );
+    let again = app.start(id.clone()).await.unwrap();
+    assert_eq!(
+        tracker
+            .wait(&again.id, Duration::from_secs(8))
+            .await
+            .unwrap()
+            .status,
+        OperationStatus::Succeeded
+    );
+    let all = app
+        .stop_all(lantern_core::api::StopAllRequest {
+            include_services: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        tracker
+            .wait(&all[0].id, Duration::from_secs(8))
+            .await
+            .unwrap()
+            .status,
+        OperationStatus::Succeeded
+    );
     assert_eq!(
         app.instance(id.clone()).await.unwrap().runtime.status,
         InstanceStatus::Stopped
