@@ -135,6 +135,9 @@ pub struct RunSection {
     pub env: Option<BTreeMap<String, String>>,
     pub pre_start: Option<String>,
     pub post_stop: Option<String>,
+    /// Positive readiness timeout in seconds, overriding runtime settings.
+    #[schemars(range(min = 1))]
+    pub startup_timeout: Option<u32>,
 }
 /// Worktree copying, linking and environment overlay.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]

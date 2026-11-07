@@ -404,6 +404,116 @@ async fn runtime_port_mismatch_stops_the_unit() {
     assert!(fake.calls().iter().any(|s| s.starts_with("stop ")));
 }
 
+#[derive(Default)]
+struct CapturingSystemd {
+    fake: FakeSystemd,
+    started: Mutex<Vec<lantern_daemon::runtime::systemd::UnitStart>>,
+}
+impl UserSystemd for CapturingSystemd {
+    fn start<'a>(
+        &'a self,
+        spec: &'a lantern_daemon::runtime::systemd::UnitStart,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.started.lock().unwrap().push(spec.clone());
+        self.fake.start(spec)
+    }
+    fn stop<'a>(
+        &'a self,
+        unit: &'a str,
+        timeout: Duration,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.fake.stop(unit, timeout)
+    }
+    fn reset_failed<'a>(&'a self, unit: &'a str) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.fake.reset_failed(unit)
+    }
+    fn poll<'a>(
+        &'a self,
+        units: &'a [String],
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, Vec<UnitSnapshot>> {
+        self.fake.poll(units)
+    }
+    fn list_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, Vec<String>> {
+        self.fake.list_prefix(prefix)
+    }
+}
+
+#[tokio::test]
+async fn runtime_run_hooks_and_manifest_startup_timeout() {
+    use lantern_core::template::TemplateString;
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("hooks", &temp.0, "server ${PORT}", &[]);
+    {
+        let mut all = store.instances.lock().unwrap();
+        let run = &mut Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest).run;
+        run.pre_start = Some(TemplateString::parse("echo pre-${BRANCH}").0);
+        run.post_stop = Some(TemplateString::parse("echo post-${BRANCH}").0);
+        run.startup_timeout = Some(1);
+    }
+    let backend = Arc::new(CapturingSystemd::default());
+    backend.fake.set_auto_start(true);
+    let rt = Runtime::with_scoped_journal(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Waiting))),
+        backend.clone(),
+        OperationTracker::new(EventBus::new()),
+        lantern_daemon::runtime::RuntimeAdapters {
+            preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+            router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+            services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+        },
+        true,
+    );
+    let op = rt.start(&id, StartOpts).await.unwrap();
+    let snapshot = op.wait(Duration::from_secs(3)).await.unwrap();
+    assert_eq!(
+        snapshot.status,
+        OperationStatus::Failed,
+        "manifest timeout was ignored: {snapshot:?}"
+    );
+    assert_eq!(
+        rt.state(&id).unwrap().issue.unwrap().code,
+        IssueCode::ReadinessTimeout
+    );
+    let started = backend.started.lock().unwrap();
+    let unit = started.first().unwrap();
+    let main = std::fs::read_to_string(&unit.script).unwrap();
+    assert!(main.contains("echo pre-${LANTERN_BRANCH}"), "{main}");
+    let post = std::fs::read_to_string(
+        unit.post_stop
+            .as_ref()
+            .expect("post-stop script must be attached"),
+    )
+    .unwrap();
+    assert!(post.contains("echo post-${LANTERN_BRANCH}"), "{post}");
+    drop(started);
+    let oneshot = rt
+        .prepare_oneshot(
+            &id,
+            lantern_daemon::runtime::OneShotLaunch {
+                verb: "setup".into(),
+                cwd: temp.0.clone(),
+                shell_command: "echo setup".into(),
+                env: BTreeMap::new(),
+                timeout: Duration::from_secs(5),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(oneshot.unit.post_stop.is_none());
+    assert!(
+        !std::fs::read_to_string(oneshot.unit.script)
+            .unwrap()
+            .contains("echo pre-")
+    );
+    rt.shutdown_background();
+}
+
 #[tokio::test]
 async fn runtime_crash_retries_and_stops_at_crash_loop() {
     let temp = Temp::new();
@@ -605,6 +715,58 @@ async fn runtime_real_reconcile_backfills_adopted_unit_logs() {
     .await
     .expect("follower missed a line after reconciliation");
     restarted.shutdown_background();
+}
+
+#[tokio::test]
+#[ignore = "real system: executes hooks in its own transient test unit"]
+async fn runtime_real_pre_start_and_post_stop_hooks_run() {
+    use lantern_core::template::TemplateString;
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert(&format!("hook{}", std::process::id()), &temp.0, "sleep 60", &[]);
+    {
+        let mut all = store.instances.lock().unwrap();
+        let run = &mut Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest).run;
+        run.pre_start = Some(TemplateString::parse("printf '%s' \"${PORT}\" > pre.txt").0);
+        run.post_stop = Some(TemplateString::parse("printf '%s' \"${PORT}\" > post.txt").0);
+    }
+    let cfg = config(&temp);
+    let _guard = RealGuard {
+        unit: cfg.names.instance(&id),
+    };
+    let backend = Arc::new(RecordingReal::default());
+    let rt = Runtime::with_scoped_journal(
+        cfg,
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        backend,
+        OperationTracker::new(EventBus::new()),
+        lantern_daemon::runtime::RuntimeAdapters {
+            preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+            router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+            services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+        },
+        true,
+    );
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    let port = rt.state(&id).unwrap().port.unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !temp.0.join("pre.txt").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(temp.0.join("pre.txt")).unwrap(), port);
+    assert_eq!(
+        completed(&rt.stop(&id, StopOpts::default()).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    assert_eq!(std::fs::read_to_string(temp.0.join("post.txt")).unwrap(), port);
+    rt.shutdown_background();
 }
 impl Drop for RealGuard {
     fn drop(&mut self) {
@@ -1192,9 +1354,15 @@ async fn runtime_reconcile_unready_unit_uses_elapsed_startup_time() {
     let store = Arc::new(Store::default());
     let id = store.insert("old", &temp.0, "server ${PORT}", &[]);
     store.instances.lock().unwrap().get_mut(&id).unwrap().runtime.port = Some(39180);
+    {
+        let mut all = store.instances.lock().unwrap();
+        Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest)
+            .run
+            .startup_timeout = Some(1);
+    }
     let backend = Arc::new(FakeSystemd::default());
     let mut row = running_snapshot("lantern-test-supervisor-inst-old.service");
-    row.started_at = Some(Timestamp::from_second(Timestamp::now().as_second() - 10).unwrap());
+    row.started_at = Some(Timestamp::from_second(Timestamp::now().as_second() - 2).unwrap());
     backend.set_snapshot(row);
     let rt = Runtime::with_scoped_journal(
         config(&temp),

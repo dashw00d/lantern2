@@ -207,6 +207,12 @@ struct ActiveOperation {
     id: OperationId,
     token: CancellationToken,
 }
+struct ReadinessTarget<'a> {
+    port: u16,
+    unit: &'a str,
+    started_at: Option<Timestamp>,
+    timeout: Duration,
+}
 #[derive(Debug)]
 struct ActorState {
     supervisor: SupervisorState,
@@ -988,6 +994,9 @@ impl Runtime {
             || updated.serve != m.serve
             || updated.upstream_url != m.upstream_url
             || updated.run.cmd != m.run.cmd
+            || updated.run.pre_start != m.run.pre_start
+            || updated.run.post_stop != m.run.post_stop
+            || updated.run.startup_timeout != m.run.startup_timeout
             || updated.deploy.start != m.deploy.start
             || updated.deploy.restart != m.deploy.restart
             || updated.setup != m.setup
@@ -1025,7 +1034,8 @@ impl Runtime {
         if command.is_none() {
             self.event(id, actor, generation, Event::Prepared(StartKind::Site));
             if let Some(url) = &upstream {
-                self.wait_upstream(url, token).await?;
+                self.wait_upstream(url, token, self.startup_timeout(&instance))
+                    .await?;
             }
             let _guard = actor.io_lock.lock().await;
             if token.is_cancelled() {
@@ -1127,20 +1137,44 @@ impl Runtime {
         }
         drop(launch);
         handle.step("wait-ready");
+        let startup_timeout = self.startup_timeout(&instance);
         if let Some(url) = &upstream {
             let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
             if !local || is_deploy {
-                self.wait_upstream(url, token).await?;
+                self.wait_upstream(url, token, startup_timeout).await?;
             } else if let Some(port) = port {
-                self.wait_ready(id, actor, generation, token, port, &unit.unit, None)
-                    .await?;
+                self.wait_ready(
+                    id,
+                    actor,
+                    generation,
+                    token,
+                    ReadinessTarget {
+                        port,
+                        unit: &unit.unit,
+                        started_at: None,
+                        timeout: startup_timeout,
+                    },
+                )
+                .await?;
             }
         } else if requires_process_port {
             if is_deploy {
-                self.wait_any_port(port.unwrap_or(0), token).await?;
-            } else {
-                self.wait_ready(id, actor, generation, token, port.unwrap_or(0), &unit.unit, None)
+                self.wait_any_port(port.unwrap_or(0), token, startup_timeout)
                     .await?;
+            } else {
+                self.wait_ready(
+                    id,
+                    actor,
+                    generation,
+                    token,
+                    ReadinessTarget {
+                        port: port.unwrap_or(0),
+                        unit: &unit.unit,
+                        started_at: None,
+                        timeout: startup_timeout,
+                    },
+                )
+                .await?;
             }
         } else {
             tokio::select! { () = token.cancelled() => return Err(Fault::new("cancelled", IssueCode::Other, "cancelled")), () = tokio::time::sleep(Duration::from_secs(self.inner.config.settings.runtime.settle_secs)) => {} }
@@ -1521,8 +1555,12 @@ impl Runtime {
             variables: vars,
             env_file,
             run_env,
-            pre_start: None,
-            post_stop: None,
+            pre_start: (!oneshot)
+                .then(|| instance.manifest.run.pre_start.as_ref().map(|v| v.render_shell()))
+                .flatten(),
+            post_stop: (!oneshot)
+                .then(|| instance.manifest.run.post_stop.as_ref().map(|v| v.render_shell()))
+                .flatten(),
             command,
         };
         let text = launcher::try_render(&spec)
@@ -1551,6 +1589,24 @@ impl Runtime {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(io_fault)?;
         file.write_all(text.as_bytes()).map_err(io_fault)?;
+        let post_stop = if let Some(text) = launcher::try_render_post_stop(&spec)
+            .map_err(|e| Fault::new("needs_config", IssueCode::ManifestInvalid, e.to_string()))?
+        {
+            let path = run_dir.join(format!("{name}.post-stop.sh"));
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(io_fault)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(io_fault)?;
+            file.write_all(text.as_bytes()).map_err(io_fault)?;
+            Some(path)
+        } else {
+            None
+        };
         Ok((
             spec,
             UnitStart {
@@ -1559,7 +1615,7 @@ impl Runtime {
                 slice: self.inner.config.names.slice.clone(),
                 cwd,
                 script,
-                post_stop: None,
+                post_stop,
                 stop_timeout: Duration::from_secs(self.inner.config.settings.runtime.stop_timeout_secs),
             },
         ))
@@ -1571,17 +1627,30 @@ impl Runtime {
             .map_err(|e| Fault::new("probe_failed", IssueCode::Other, e.to_string()))?
             .map_err(io_fault)
     }
+    fn startup_timeout(&self, instance: &Instance) -> Duration {
+        Duration::from_secs(
+            instance
+                .manifest
+                .run
+                .startup_timeout
+                .map(u64::from)
+                .unwrap_or(self.inner.config.settings.runtime.startup_timeout_secs),
+        )
+    }
     async fn wait_ready(
         &self,
         id: &InstanceId,
         actor: &Arc<Actor>,
         generation: u64,
         token: &CancellationToken,
-        port: u16,
-        unit: &str,
-        started_at: Option<Timestamp>,
+        target: ReadinessTarget<'_>,
     ) -> Result<(), Fault> {
-        let timeout = Duration::from_secs(self.inner.config.settings.runtime.startup_timeout_secs);
+        let ReadinessTarget {
+            port,
+            unit,
+            started_at,
+            timeout,
+        } = target;
         let elapsed = started_at.map_or(Duration::ZERO, |start| {
             let micros = Timestamp::now()
                 .as_microsecond()
@@ -1685,9 +1754,13 @@ impl Runtime {
             .map_err(|e| Fault::new("systemd", IssueCode::SystemdUnavailable, e.to_string()))?;
         Ok(())
     }
-    async fn wait_any_port(&self, port: u16, token: &CancellationToken) -> Result<(), Fault> {
-        let deadline =
-            Instant::now() + Duration::from_secs(self.inner.config.settings.runtime.startup_timeout_secs);
+    async fn wait_any_port(
+        &self,
+        port: u16,
+        token: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<(), Fault> {
+        let deadline = Instant::now() + timeout;
         loop {
             if !matches!(self.probe(port, None).await?, PortBinding::Free) {
                 return Ok(());
@@ -1702,7 +1775,12 @@ impl Runtime {
             tokio::select! { ()=token.cancelled()=>return Err(Fault::new("cancelled",IssueCode::Other,"cancelled")), ()=tokio::time::sleep(self.inner.config.readiness_interval)=>{} }
         }
     }
-    async fn wait_upstream(&self, url: &reqwest::Url, token: &CancellationToken) -> Result<(), Fault> {
+    async fn wait_upstream(
+        &self,
+        url: &reqwest::Url,
+        token: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<(), Fault> {
         let host = url
             .host_str()
             .ok_or_else(|| {
@@ -1720,10 +1798,9 @@ impl Runtime {
                 "upstream URL lacks port",
             )
         })?;
-        let deadline =
-            Instant::now() + Duration::from_secs(self.inner.config.settings.runtime.startup_timeout_secs);
+        let deadline = Instant::now() + timeout;
         loop {
-            let connected = tokio::select! { ()=token.cancelled()=>return Err(Fault::new("cancelled",IssueCode::Other,"cancelled")), r=tokio::time::timeout(Duration::from_secs(3),tokio::net::TcpStream::connect((host.as_str(),port)))=>r.is_ok_and(|v|v.is_ok()) };
+            let connected = tokio::select! { ()=token.cancelled()=>return Err(Fault::new("cancelled",IssueCode::Other,"cancelled")), r=tokio::time::timeout(Duration::from_secs(3).min(deadline.saturating_duration_since(Instant::now())),tokio::net::TcpStream::connect((host.as_str(),port)))=>r.is_ok_and(|v|v.is_ok()) };
             if connected {
                 return Ok(());
             }
@@ -2814,13 +2891,25 @@ impl Runtime {
                     }
                     self.start_health(id.clone(), actor.clone(), generation);
                 } else if let Some(port) = instance.runtime.port {
+                    let timeout = self.startup_timeout(&instance);
                     let rt = self.clone();
                     let id = id.clone();
                     let actor = actor.clone();
                     tokio::spawn(async move {
                         let token = CancellationToken::new();
                         if rt
-                            .wait_ready(&id, &actor, generation, &token, port, &name, row.started_at)
+                            .wait_ready(
+                                &id,
+                                &actor,
+                                generation,
+                                &token,
+                                ReadinessTarget {
+                                    port,
+                                    unit: &name,
+                                    started_at: row.started_at,
+                                    timeout,
+                                },
+                            )
                             .await
                             .is_ok()
                         {
@@ -2865,7 +2954,7 @@ impl Runtime {
                             let token = CancellationToken::new();
                             match tokio::time::timeout(
                                 Duration::from_secs(3),
-                                self.wait_upstream(&url, &token),
+                                self.wait_upstream(&url, &token, self.startup_timeout(&instance)),
                             )
                             .await
                             {
