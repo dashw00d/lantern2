@@ -1,0 +1,21 @@
+[package]
+name = "lantern-desktop"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Lantern's desktop window and tray: the control center in a native window"
+
+# Standalone: keeps WebKitGTK out of the main workspace's builds.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+open = "5"
+
+[profile.release]
+strip = true
+lto = "thin"

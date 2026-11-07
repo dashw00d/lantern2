@@ -2,3 +2,5 @@
 /.reference
 /ui/node_modules
 /ui/dist
+/desktop/target
+/desktop/gen

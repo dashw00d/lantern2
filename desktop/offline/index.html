@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="color-scheme" content="light dark" />
+<title>Lantern</title>
+<style>
+  :root { --bg:#fff; --fg:#09090b; --muted:#71717a; --border:#e4e4e7; --primary:#f97316; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#09090b; --fg:#fafafa; --muted:#a1a1aa; --border:#27272a; } }
+  html,body { height:100%; margin:0; background:var(--bg); color:var(--fg);
+    font: 15px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+  main { height:100%; display:grid; place-items:center; text-align:center; }
+  .logo { width:48px; height:48px; border-radius:12px; background:var(--primary); margin:0 auto 18px; }
+  h1 { font-size:18px; margin:0 0 6px; }
+  p { color:var(--muted); margin:0; }
+  code { font-family: ui-monospace, monospace; font-size:13px; border:1px solid var(--border);
+    border-radius:6px; padding:2px 6px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--primary);
+    margin-right:8px; animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity:.3 } }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <div class="logo"></div>
+    <h1><span class="dot"></span>Waiting for the Lantern daemon…</h1>
+    <p>Start it with <code>systemctl --user start lantern-dev</code>. This window connects on its own.</p>
+  </div>
+</main>
+<script>
+  const daemon = window.__LANTERN_DAEMON__ || 'http://127.0.0.1:4778';
+  // An opaque response means something answered; then hand over to the real page.
+  const tick = () => fetch(daemon + '/api', { mode: 'no-cors', cache: 'no-store' })
+    .then(() => { location.href = daemon + '/'; })
+    .catch(() => setTimeout(tick, 1500));
+  tick();
+</script>
+</body>
+</html>
