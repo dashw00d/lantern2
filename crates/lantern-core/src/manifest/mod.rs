@@ -599,8 +599,11 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
             "static routes do not run a command".into(),
         );
     }
-    if raw.serve.as_deref() == Some("proxy")
-        && raw.upstream_url.is_none()
+    if !matches!(raw.serve.as_deref(), Some("php" | "static"))
+        && raw
+            .upstream_url
+            .as_deref()
+            .is_none_or(|url| url.trim().is_empty())
         && raw.deploy.as_ref().and_then(|d| d.start.as_ref()).is_none()
         && let Some(run) = &raw.run
         && let Some(cmd) = &run.cmd
@@ -1524,6 +1527,11 @@ mod tests {
                 .iter()
                 .any(|d| d.code == "bad_value" && d.path == "setup[0]")
         );
+    }
+    #[test]
+    fn inferred_proxy_warns_when_port_is_not_referenced() {
+        let parsed = parse_manifest("run: {cmd: python server.py}\n", "lantern.yaml");
+        assert!(parsed.diagnostics.iter().any(|d| d.code == "port_not_referenced"));
     }
     #[test]
     fn v1_list_and_safe_relative_paths() {
