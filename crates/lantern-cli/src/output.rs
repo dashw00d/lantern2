@@ -1,6 +1,6 @@
 //! Human output from the same core wire values used for JSON.
 use lantern_core::{
-    api::{InstanceView, ProjectSummary},
+    api::{BranchInfo, InstanceView, ProjectSummary, ServiceStatus},
     model::{InstanceStatus, Listener, LogLine, Stream},
 };
 
@@ -81,6 +81,46 @@ pub(crate) fn projects(projects: &[ProjectSummary]) -> String {
     }
     result
 }
+/// Render repository branches and their upstream state.
+pub(crate) fn branches(branches: &[BranchInfo]) -> String {
+    let mut result =
+        String::from("BRANCH                       UPSTREAM                AHEAD  BEHIND  CHECKOUT\n");
+    for branch in branches {
+        let name = clean(&branch.name, false);
+        let upstream = clean(branch.upstream.as_deref().unwrap_or("-"), false);
+        let path = branch.checked_out_at.as_ref().map_or_else(
+            || "-".to_string(),
+            |path| clean(&path.display().to_string(), false),
+        );
+        result.push_str(&format!(
+            "{name:<28} {upstream:<23} {:<6} {:<7} {path}\n",
+            branch.ahead, branch.behind
+        ));
+    }
+    result
+}
+/// Render shared-service states and their UI addresses.
+pub(crate) fn services(services: &[ServiceStatus]) -> String {
+    let mut result = String::from("SERVICE        STATUS          MODE      URL\n");
+    for service in services {
+        let name = serde_json::to_value(service.name)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let state = serde_json::to_value(service.state)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let mode = serde_json::to_value(service.mode)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let url = clean(service.ui_url.as_deref().unwrap_or("-"), false);
+        result.push_str(&format!("{name:<14} {state:<15} {mode:<9} {url}\n"));
+    }
+    result
+}
+
 /// Strip terminal control sequences, optionally retaining SGR colors on a TTY.
 pub(crate) fn clean(input: &str, keep_sgr: bool) -> String {
     let mut out = String::new();

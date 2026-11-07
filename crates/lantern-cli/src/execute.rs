@@ -803,7 +803,7 @@ async fn actions(
 }
 async fn stop_all(ctx: &mut Context<'_>, args: &OffArgs) -> Result<Reply> {
     if !args.yes {
-        if !ctx.tty {
+        if !ctx.tty || ctx.cli.json {
             return Err(Failure::usage(
                 "off --all requires -y on a non-interactive terminal",
             ));
@@ -866,7 +866,7 @@ async fn worktree(ctx: &mut Context<'_>, command: &WorktreeCommand) -> Result<Re
         WorktreeCommand::Branches { project: name } => {
             let p = project(ctx, &client, name.as_deref()).await?;
             let branches = client.branches(&p).await.map_err(|e| ctx.failure(e))?;
-            Reply::pretty(&branches)
+            Reply::value(&branches, output::branches(&branches))
         }
         WorktreeCommand::Add {
             project: name,
@@ -955,7 +955,7 @@ async fn worktree(ctx: &mut Context<'_>, command: &WorktreeCommand) -> Result<Re
                 ));
             }
             if !*yes {
-                if !ctx.tty {
+                if !ctx.tty || ctx.cli.json {
                     return Err(Failure::usage("wt rm requires -y on a non-interactive terminal"));
                 }
                 if !confirm(ctx, &format!("Remove or forget {id}?"))? {
@@ -1035,7 +1035,7 @@ async fn services(ctx: &Context<'_>, cmd: Option<&ServiceCommand>) -> Result<Rep
     match cmd {
         None => {
             let services = client.services().await.map_err(|e| ctx.failure(e))?;
-            Reply::pretty(&services)
+            Reply::value(&services, output::services(&services))
         }
         Some(ServiceCommand::Open { name }) => {
             let service = client.service_status(name).await.map_err(|e| ctx.failure(e))?;

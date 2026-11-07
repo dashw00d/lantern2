@@ -408,6 +408,9 @@ async fn exit_codes_and_noninteractive_confirmation() {
     let (code, _, err) = run(&["off", "--all"], "http://127.0.0.1:39599", false).await;
     assert_eq!(code, 2);
     assert!(err.contains("requires -y"));
+    let (code, _, err) = run(&["off", "--all", "--json"], "http://127.0.0.1:39599", true).await;
+    assert_eq!(code, 2);
+    assert_eq!(serde_json::from_str::<Value>(&err).unwrap()["exit_code"], 2);
     let (host, server) = serve(1, |_, _, _| {
         (200, json!({"items":[]}).to_string(), "application/json")
     });
