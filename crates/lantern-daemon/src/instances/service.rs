@@ -117,6 +117,7 @@ pub struct InstanceService {
     pub(crate) runner: Arc<dyn OneShot>,
     pub(crate) worktrees_dir: PathBuf,
     pub(crate) timeout: Duration,
+    missing_retention_days: u64,
     pub(crate) setup_slots: Semaphore,
     pub(crate) mutation: Mutex<()>,
     observations: StdMutex<HashMap<InstanceId, CheckoutObservation>>,
@@ -147,12 +148,18 @@ impl InstanceService {
             runner,
             worktrees_dir,
             timeout,
+            missing_retention_days: 30,
             setup_slots: Semaphore::new(max_concurrent_setups.max(1)),
             mutation: Mutex::new(()),
             observations: StdMutex::new(HashMap::new()),
             prepare_locks: StdMutex::new(HashMap::new()),
             refresh: StdMutex::new(HashMap::new()),
         }
+    }
+    /// Override the default 30-day retention for unpinned missing records.
+    pub fn with_missing_retention_days(mut self, days: u64) -> Self {
+        self.missing_retention_days = days;
+        self
     }
     pub(crate) fn project(&self, id: &ProjectId) -> Result<ProjectConfig, InstanceError> {
         self.store
@@ -215,6 +222,55 @@ impl InstanceService {
             state.last = Some(Instant::now());
         }
         Ok(should)
+    }
+    /// Run the polling policy until cancelled; callers provide current repos and listener demand.
+    pub async fn watch_repos(
+        &self,
+        mut repos: tokio::sync::watch::Receiver<Vec<PathBuf>>,
+        mut listeners: tokio::sync::watch::Receiver<bool>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        loop {
+            let current = repos.borrow().clone();
+            for common in current {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                if let Err(error) = self.tick(&common, false).await {
+                    tracing::warn!(path = %common.display(), %error, "checkout refresh failed");
+                }
+            }
+            let interval = Self::refresh_interval(*listeners.borrow());
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {},
+                result = repos.changed() => if result.is_err() { return; },
+                result = listeners.changed() => if result.is_err() { return; },
+            }
+        }
+    }
+    /// Discovery hint for an unknown checkout; repeated hints are limited to one per second.
+    pub async fn hint_path(&self, path: &Path) -> Result<(), InstanceError> {
+        let Some(probe) = self.git.probe(path).await? else {
+            return Ok(());
+        };
+        let should_refresh = {
+            let mut states = self.refresh.lock().expect("refresh lock");
+            let state = states.entry(probe.common_dir.clone()).or_default();
+            if state
+                .last
+                .is_some_and(|time| time.elapsed() < Duration::from_secs(1))
+            {
+                false
+            } else {
+                state.last = Some(Instant::now());
+                true
+            }
+        };
+        if should_refresh {
+            self.refresh_repo(&probe.common_dir).await?;
+        }
+        Ok(())
     }
     /// Refresh a repo immediately (use before destructive or start operations).
     pub async fn refresh_repo(&self, common_dir: &Path) -> Result<(), InstanceError> {
@@ -368,6 +424,48 @@ impl InstanceService {
                 }
                 self.observations.lock().expect("observations lock").remove(&id);
             }
+        }
+        self.purge_missing_unlocked(common)?;
+        Ok(())
+    }
+    fn purge_missing_unlocked(&self, common: &Path) -> Result<(), InstanceError> {
+        let now = Timestamp::now().as_second();
+        let age = self
+            .missing_retention_days
+            .saturating_mul(86_400)
+            .min(i64::MAX as u64) as i64;
+        for (id, record) in self.store.records().map_err(InstanceError::Adapter)? {
+            let Some(since) = record.checkout.missing_since else {
+                continue;
+            };
+            if record.checkout.kind == CheckoutKind::Primary
+                || record.pinned
+                || now.saturating_sub(since.as_second()) < age
+            {
+                continue;
+            }
+            let Some(project) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+            else {
+                continue;
+            };
+            if !project
+                .project
+                .repo
+                .as_ref()
+                .is_some_and(|repo| repo.common_dir == common)
+            {
+                continue;
+            }
+            if !matches!(
+                self.store.status(&id).map_err(InstanceError::Adapter)?,
+                InstanceStatus::Stopped | InstanceStatus::NeedsConfig
+            ) {
+                continue;
+            }
+            self.store.remove(&id).map_err(InstanceError::Adapter)?;
         }
         Ok(())
     }
@@ -750,14 +848,30 @@ impl InstanceService {
         }
         Ok(false)
     }
-    /// Ensure setup is current and return the runtime's expanded environment.
+    /// Ensure setup is current and publish steps through the supplied operation.
     pub async fn ensure_prepared(
         &self,
         id: &InstanceId,
         force: bool,
         op: &OpHandle,
     ) -> Result<Prepared, InstanceError> {
-        let cancel = op.cancel_token();
+        self.prepare_inner(id, force, op.cancel_token(), Some(op)).await
+    }
+    /// Runtime hook: prepare using the supervisor's cancellation token.
+    pub async fn ensure_ready(
+        &self,
+        id: &InstanceId,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Prepared, InstanceError> {
+        self.prepare_inner(id, false, cancel, None).await
+    }
+    async fn prepare_inner(
+        &self,
+        id: &InstanceId,
+        force: bool,
+        cancel: tokio_util::sync::CancellationToken,
+        op: Option<&OpHandle>,
+    ) -> Result<Prepared, InstanceError> {
         if cancel.is_cancelled() {
             return Err(InstanceError::Cancelled);
         }
@@ -798,11 +912,11 @@ impl InstanceService {
         {
             let repo = self.git.repo(pr.common_dir.clone());
             if repo.submodules_need_init(&root).await? {
-                op.step("Initializing submodules");
+                progress(op, "Initializing submodules");
                 repo.submodule_init(&root, &cancel).await?;
             }
         }
-        op.step("Reading manifest");
+        progress(op, "Reading manifest");
         let manifest = self.store.manifest(id).map_err(InstanceError::Adapter)?;
         if !manifest.usable {
             return Err(InstanceError::Refused("needs_config".into()));
@@ -904,7 +1018,7 @@ impl InstanceService {
         }
         if record.checkout.kind != CheckoutKind::Primary {
             let primary_root = pr.map(|r| r.git_root.as_path()).unwrap_or(&p.project.root);
-            op.step("Copying files");
+            progress(op, "Copying files");
             let (copied, copy_result) = files::materialize(
                 primary_root,
                 &p.project.root,
@@ -921,7 +1035,7 @@ impl InstanceService {
                 .upsert(id, record.clone())
                 .map_err(InstanceError::Adapter)?;
             copy_result?;
-            op.step("Linking files");
+            progress(op, "Linking files");
             let (linked, link_result) = files::materialize(
                 primary_root,
                 &p.project.root,
@@ -940,13 +1054,13 @@ impl InstanceService {
             link_result?;
         }
         if !commands.is_empty() {
-            op.step("Waiting for a free setup slot");
+            progress(op, "Waiting for a free setup slot");
             let permit = tokio::select! {_=cancel.cancelled()=>return Err(InstanceError::Cancelled),p=self.setup_slots.acquire()=>p.map_err(|e|InstanceError::Adapter(e.to_string()))?};
             for (i, (cwd, command)) in commands.iter().enumerate() {
                 if cancel.is_cancelled() {
                     return Err(InstanceError::Cancelled);
                 }
-                op.step(&format!("Setup {}/{}: {}", i + 1, commands.len(), command));
+                progress(op, &format!("Setup {}/{}: {}", i + 1, commands.len(), command));
                 let spec = OneShotSpec {
                     instance: id.clone(),
                     cwd: cwd.clone(),
@@ -956,7 +1070,11 @@ impl InstanceService {
                     cancel: cancel.clone(),
                     stream: Stream::Setup,
                 };
-                self.runner.run(spec).await.map_err(InstanceError::Adapter)?;
+                let result = self.runner.run(spec).await;
+                if cancel.is_cancelled() {
+                    return Err(InstanceError::Cancelled);
+                }
+                result.map_err(InstanceError::Adapter)?;
             }
             drop(permit);
         }
@@ -969,11 +1087,17 @@ impl InstanceService {
             finished_at: Timestamp::now(),
         });
         self.store.upsert(id, record).map_err(InstanceError::Adapter)?;
-        op.step("Ready");
+        progress(op, "Ready");
         Ok(Prepared {
             manifest,
             worktree_env,
         })
+    }
+}
+
+fn progress(op: Option<&OpHandle>, step: &str) {
+    if let Some(op) = op {
+        op.step(step);
     }
 }
 

@@ -893,3 +893,175 @@ async fn instances_git_ambiguous_remote_uses_configured_preference() {
     );
     op.finish(OpOutcome::Succeeded(None));
 }
+
+struct BlockingRunner {
+    started: tokio::sync::Notify,
+}
+impl OneShot for BlockingRunner {
+    fn run(&self, spec: OneShotSpec) -> OneShotFuture<'_> {
+        Box::pin(async move {
+            self.started.notify_one();
+            spec.cancel.cancelled().await;
+            Err("unit stopped".into())
+        })
+    }
+}
+
+#[tokio::test]
+async fn instances_setup_cancellation_reaches_runtime_and_leaves_no_stamp() {
+    let t = Temp::new();
+    let (root, _, store, _, _) =
+        fixture(&t, "id: myapp\nrun: {cmd: 'echo ok'}\nsetup: ['echo waiting']\n").await;
+    git_cmd(&root, &["branch", "cancelled"]);
+    let runner = Arc::new(BlockingRunner {
+        started: tokio::sync::Notify::new(),
+    });
+    let service = Arc::new(InstanceService::new(
+        Git::detect().await.unwrap(),
+        store.clone(),
+        runner.clone(),
+        t.0.join("managed"),
+        2,
+        Duration::from_secs(30),
+    ));
+    let tracker = OperationTracker::new(EventBus::new());
+    let op = tracker.begin(OperationKind::Prepare, None);
+    let op_id = op.id().clone();
+    let task = tokio::spawn(async move {
+        let result = service
+            .run_branch(req(BranchTarget::Branch("cancelled".into())), &op)
+            .await;
+        op.finish(OpOutcome::Cancelled);
+        result
+    });
+    tokio::time::timeout(Duration::from_secs(5), runner.started.notified())
+        .await
+        .unwrap();
+    assert!(tracker.cancel(&op_id));
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(lantern_daemon::instances::InstanceError::Cancelled)
+    ));
+    let id = InstanceId::parse("myapp@cancelled").unwrap();
+    assert!(
+        store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|(i, _)| i == &id)
+            .unwrap()
+            .1
+            .checkout
+            .setup
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn instances_missing_retention_preserves_pinned_and_primary_records() {
+    let t = Temp::new();
+    let (root, _, store, _, _) = fixture(&t, EMPTY).await;
+    let runner = Arc::new(FakeRunner::default());
+    let service = InstanceService::new(
+        Git::detect().await.unwrap(),
+        store.clone(),
+        runner,
+        t.0.join("managed"),
+        2,
+        Duration::from_secs(30),
+    )
+    .with_missing_retention_days(0);
+    git_cmd(&root, &["branch", "missing-one"]);
+    git_cmd(&root, &["branch", "missing-two"]);
+    let a = t.0.join("gone-a");
+    let b = t.0.join("gone-b");
+    git_cmd(
+        &root,
+        &["worktree", "add", "--", a.to_str().unwrap(), "missing-one"],
+    );
+    git_cmd(
+        &root,
+        &["worktree", "add", "--", b.to_str().unwrap(), "missing-two"],
+    );
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let retained = InstanceId::parse("myapp@missing-two").unwrap();
+    service.set_pinned(&retained, true).unwrap();
+    git_cmd(&root, &["worktree", "remove", "--", a.to_str().unwrap()]);
+    git_cmd(&root, &["worktree", "remove", "--", b.to_str().unwrap()]);
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let records = store.records().unwrap();
+    assert!(!records.iter().any(|(id, _)| id.as_str() == "myapp@missing-one"));
+    assert!(
+        records
+            .iter()
+            .any(|(id, r)| id == &retained && r.checkout.missing_since.is_some())
+    );
+    assert!(records.iter().any(|(id, _)| id.is_primary()));
+}
+
+#[tokio::test]
+async fn instances_runtime_preparer_token_stops_the_setup_unit() {
+    let t = Temp::new();
+    let (root, _, store, _, _) =
+        fixture(&t, "id: myapp\nrun: {cmd: 'echo ok'}\nsetup: ['echo waiting']\n").await;
+    git_cmd(&root, &["branch", "runtime-prepare"]);
+    let checkout = t.0.join("runtime-prepare");
+    git_cmd(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--",
+            checkout.to_str().unwrap(),
+            "runtime-prepare",
+        ],
+    );
+    let runner = Arc::new(BlockingRunner {
+        started: tokio::sync::Notify::new(),
+    });
+    let service = Arc::new(InstanceService::new(
+        Git::detect().await.unwrap(),
+        store.clone(),
+        runner.clone(),
+        t.0.join("managed"),
+        2,
+        Duration::from_secs(30),
+    ));
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let id = InstanceId::parse("myapp@runtime-prepare").unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task = {
+        let service = service.clone();
+        let cancel = cancel.clone();
+        let id = id.clone();
+        tokio::spawn(async move { service.ensure_ready(&id, cancel).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), runner.started.notified())
+        .await
+        .unwrap();
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(lantern_daemon::instances::InstanceError::Cancelled)
+    ));
+    assert!(
+        store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|(i, _)| i == &id)
+            .unwrap()
+            .1
+            .checkout
+            .setup
+            .is_none()
+    );
+}
