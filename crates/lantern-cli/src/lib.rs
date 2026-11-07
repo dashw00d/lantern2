@@ -1,8 +1,13 @@
 //! Command-line interface and binary dispatch boundary.
 
 pub mod args;
+mod error;
+mod execute;
+mod output;
+mod target;
 
-use args::{DaemonCommand, GuiArgs};
+use args::GuiArgs;
+pub use execute::dispatch;
 
 /// Arguments forwarded to the daemon implementation by the binary.
 #[derive(Debug, Clone, Default)]
@@ -47,14 +52,13 @@ impl SystemActions for UnassembledSystem {
 
 /// Parse and run the CLI, returning the process action to the binary.
 pub fn run() -> CliAction {
+    use std::io::IsTerminal;
     use clap::Parser;
     let cli = args::Cli::parse();
-    match cli.command {
-        Some(args::Command::Daemon { command: None | Some(DaemonCommand::Run) }) => CliAction::RunDaemon(DaemonArgs::default()),
-        Some(args::Command::Gui(args)) => CliAction::RunGui(args),
-        _ => {
-            eprintln!("CLI commands not assembled yet");
-            CliAction::Exit(2)
-        }
-    }
+    let tty = std::io::stdout().is_terminal();
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => { eprintln!("error: cannot start async runtime: {error}"); return CliAction::Exit(1); }
+    };
+    runtime.block_on(dispatch(cli, &UnassembledSystem, &mut std::io::stdout(), &mut std::io::stderr(), tty))
 }
