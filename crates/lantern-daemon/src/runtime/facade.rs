@@ -777,6 +777,12 @@ impl Runtime {
         {
             let status = self.state(id).map(|r| r.status);
             if status == Some(InstanceStatus::Starting) {
+                if let Some(unit) = self.state(id).and_then(|r| r.unit)
+                    && let Err(error) = self.stop_failed_unit(actor, &unit, generation).await
+                {
+                    self.event(id, actor, generation, Event::CleanupFailed(error.issue));
+                    return Err(error);
+                }
                 self.event(id, actor, generation, Event::DeployFailed(fault.issue));
             }
             if status == Some(InstanceStatus::Preparing) {
@@ -1057,6 +1063,7 @@ impl Runtime {
                 }
                 state.deploy_started = true;
             }
+            self.update(id, actor, generation, |r| r.started_at = Some(Timestamp::now()));
             let spec = OneShotSpec {
                 unit: unit.clone(),
                 timeout: Duration::from_secs(self.inner.config.settings.runtime.deploy_timeout_secs),
@@ -1129,11 +1136,12 @@ impl Runtime {
                 && instance.manifest.upstream_url.is_none()
                 && !is_deploy;
             if site_companion && let Err(error) = &route {
-                self.event(id, actor, generation, Event::PlanInvalid(IssueCode::RouteFailed));
                 drop(_guard);
-                if !is_deploy {
-                    self.stop_failed_unit(actor, &unit.unit).await;
+                if let Err(stop_error) = self.stop_failed_unit(actor, &unit.unit, generation).await {
+                    self.event(id, actor, generation, Event::CleanupFailed(stop_error.issue));
+                    return Err(stop_error);
                 }
+                self.event(id, actor, generation, Event::PlanInvalid(IssueCode::RouteFailed));
                 return Err(error.clone());
             }
             if !self.event(id, actor, generation, Event::Ready) {
@@ -1580,8 +1588,11 @@ impl Runtime {
             if let Some(addr) = mismatch {
                 let since = mismatch_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= self.inner.config.mismatch_after || Instant::now() >= deadline {
+                    if let Err(error) = self.stop_failed_unit(actor, unit, generation).await {
+                        self.event(id, actor, generation, Event::CleanupFailed(error.issue));
+                        return Err(error);
+                    }
                     self.event(id, actor, generation, Event::PortMismatch);
-                    self.stop_failed_unit(actor, unit).await;
                     return Err(Fault::new(
                         "port_mismatch",
                         IssueCode::PortMismatch,
@@ -1594,8 +1605,11 @@ impl Runtime {
                 mismatch_since = None;
             }
             if Instant::now() >= deadline {
+                if let Err(error) = self.stop_failed_unit(actor, unit, generation).await {
+                    self.event(id, actor, generation, Event::CleanupFailed(error.issue));
+                    return Err(error);
+                }
                 self.event(id, actor, generation, Event::ReadinessTimeout);
-                self.stop_failed_unit(actor, unit).await;
                 return Err(Fault::new(
                     "readiness_timeout",
                     IssueCode::ReadinessTimeout,
@@ -1605,17 +1619,25 @@ impl Runtime {
             tokio::select! { () = token.cancelled() => return Err(Fault::new("cancelled", IssueCode::Other, "cancelled")), _ = rx.changed() => {}, () = tokio::time::sleep(self.inner.config.readiness_interval) => {} }
         }
     }
-    async fn stop_failed_unit(&self, actor: &Actor, unit: &str) {
+    async fn stop_failed_unit(&self, actor: &Actor, unit: &str, generation: u64) -> Result<(), Fault> {
         let _guard = actor.io_lock.lock().await;
-        let _ = self
-            .inner
+        if actor.state.lock().unwrap().generation != generation {
+            return Err(Fault::new("cancelled", IssueCode::Other, "stale cleanup"));
+        }
+        self.inner
             .backend
             .stop(
                 unit,
                 Duration::from_secs(self.inner.config.settings.runtime.stop_timeout_secs),
             )
-            .await;
-        let _ = self.inner.backend.reset_failed(unit).await;
+            .await
+            .map_err(|e| Fault::new("stop_timeout", IssueCode::Other, e.to_string()))?;
+        self.inner
+            .backend
+            .reset_failed(unit)
+            .await
+            .map_err(|e| Fault::new("systemd", IssueCode::SystemdUnavailable, e.to_string()))?;
+        Ok(())
     }
     async fn wait_any_port(&self, port: u16, token: &CancellationToken) -> Result<(), Fault> {
         let deadline =
@@ -1856,6 +1878,12 @@ impl Runtime {
                             },
                             Err(e) => Err(e.to_string()),
                         }
+                    } else if inst.manifest.deploy.start.is_some() && inst.manifest.deploy.status.is_some() {
+                        match rt.deploy_status(&id).await {
+                            Ok(status) if status.alive => Ok(None),
+                            Ok(status) => Err(format!("deploy.status exited {:?}", status.exit_code)),
+                            Err(e) => Err(e.to_string()),
+                        }
                     } else if inst.manifest.deploy.start.is_some() {
                         match inst.runtime.port {
                             Some(port) => match rt.probe(port, None).await {
@@ -1923,7 +1951,7 @@ impl Runtime {
         });
     }
     /// Build a launcher-backed setup or deploy one-shot from shell-rendered code and data.
-    pub fn prepare_oneshot(
+    pub async fn prepare_oneshot(
         &self,
         id: &InstanceId,
         request: OneShotLaunch,
@@ -1952,12 +1980,13 @@ impl Runtime {
             .ok_or_else(|| {
                 RuntimeError::Other("reserve the instance port before preparing a one-shot".into())
             })?;
+        self.ensure_shell_env().await?;
+        let cwd = confined_path(&instance.checkout.path, &request.cwd)
+            .map_err(|e| RuntimeError::Other(e.message))?;
         let actor = self.actor(&instance);
         let worktree_env = actor.state.lock().unwrap().worktree_env.clone();
         let (mut launch, mut unit) = self
             .launch(&instance, port, request.shell_command, true, &worktree_env, false)
-            .map_err(|e| RuntimeError::Other(e.message))?;
-        let cwd = confined_path(&instance.checkout.path, &request.cwd)
             .map_err(|e| RuntimeError::Other(e.message))?;
         launch.cwd = cwd.clone();
         launch.run_env.extend(request.env);
@@ -1996,23 +2025,62 @@ impl Runtime {
             _ => None,
         }
         .ok_or_else(|| RuntimeError::Other(format!("deploy.{verb} is not configured")))?;
+        self.ensure_shell_env().await?;
         let actor = self.actor(&instance);
         let _guard = actor.io_lock.lock().await;
-        let spec = self.prepare_oneshot(
-            id,
-            OneShotLaunch {
-                verb: "deploy".into(),
-                cwd: instance.checkout.path.clone(),
-                shell_command: command.render_shell(),
-                env: BTreeMap::new(),
-                timeout: Duration::from_secs(15),
-            },
-        )?;
+        let port = instance
+            .runtime
+            .port
+            .or_else(|| {
+                self.inner
+                    .store
+                    .port_leases()
+                    .ok()
+                    .and_then(|m| m.get(id).copied())
+            })
+            .unwrap_or(0);
+        let worktree_env = actor.state.lock().unwrap().worktree_env.clone();
+        let (_, unit) = self
+            .launch(
+                &instance,
+                port,
+                command.render_shell(),
+                true,
+                &worktree_env,
+                false,
+            )
+            .map_err(|e| RuntimeError::Other(e.message))?;
+        let spec = OneShotSpec {
+            unit,
+            timeout: Duration::from_secs(15),
+            poll_interval: self.inner.config.poll_interval,
+        };
         let unit = spec.unit.unit.clone();
-        let cancel = CancellationToken::new();
-        let result = systemd::run_oneshot(self.inner.backend.as_ref(), &spec, cancel.cancelled())
-            .await
-            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        let handle = self.inner.tracker.begin(OperationKind::ApiCall, Some(id.clone()));
+        let token = handle.cancel_token();
+        let result = match systemd::run_oneshot(self.inner.backend.as_ref(), &spec, token.cancelled()).await {
+            Ok(result) => {
+                if result.exit_kind == ExitCodeKind::Exited && result.exit_code == Some(0) {
+                    handle.finish(OpOutcome::Succeeded(None));
+                } else {
+                    handle.finish(OpOutcome::Failed(ApiError {
+                        code: "deploy_failed".into(),
+                        message: format!("deploy.{verb} exited {:?}", result.exit_code),
+                        details: serde_json::Value::Null,
+                    }));
+                }
+                result
+            }
+            Err(e) => {
+                let message = e.to_string();
+                handle.finish(OpOutcome::Failed(ApiError {
+                    code: "deploy_failed".into(),
+                    message: message.clone(),
+                    details: serde_json::Value::Null,
+                }));
+                return Err(RuntimeError::Other(message));
+            }
+        };
         let output = tokio::process::Command::new("journalctl")
             .args([
                 "--user",
@@ -2506,7 +2574,38 @@ impl Runtime {
                     s.generation
                 };
                 self.event(id, &actor, generation, Event::ReconcileSite);
-                match self.publish_route(&instance, None).await {
+                let readiness = if let Some(raw) = &instance.manifest.upstream_url {
+                    match reqwest::Url::parse(raw) {
+                        Ok(url) => {
+                            let token = CancellationToken::new();
+                            match tokio::time::timeout(
+                                Duration::from_secs(3),
+                                self.wait_upstream(&url, &token),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(Fault::new(
+                                    "readiness_timeout",
+                                    IssueCode::ReadinessTimeout,
+                                    "upstream was unreachable during reconciliation",
+                                )),
+                            }
+                        }
+                        Err(e) => Err(Fault::new(
+                            "needs_config",
+                            IssueCode::ManifestInvalid,
+                            e.to_string(),
+                        )),
+                    }
+                } else {
+                    Ok(())
+                };
+                let publication = match readiness {
+                    Ok(()) => self.publish_route(&instance, None).await,
+                    Err(error) => Err(error),
+                };
+                match publication {
                     Ok(()) => {
                         self.event(id, &actor, generation, Event::Ready);
                         self.start_health(id.clone(), actor.clone(), generation);

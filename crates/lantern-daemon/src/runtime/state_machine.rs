@@ -151,6 +151,8 @@ pub enum Event {
     HealthRecovered,
     /// A managed unit finished stopping or was absent.
     UnitInactive,
+    /// Cleanup after a failed start could not stop the unit.
+    CleanupFailed(IssueCode),
     /// A stop deadline expired while processes were still present.
     StopTimeout,
     /// A deploy stop left the externally managed listener alive.
@@ -432,6 +434,12 @@ pub fn transition(state: &SupervisorState, event: Event) -> (SupervisorState, Ve
                 next.status = S::Stopped;
                 finish(&mut next, &mut effects);
             }
+        }
+        Event::CleanupFailed(issue) if next.status == S::Starting => {
+            next.status = S::Stopping;
+            next.desired_up = false;
+            next.issue = Some(issue);
+            finish(&mut next, &mut effects);
         }
         Event::StopIncomplete if next.status == S::Stopping => {
             next.status = S::Running;

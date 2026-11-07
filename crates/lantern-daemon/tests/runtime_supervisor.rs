@@ -192,10 +192,14 @@ enum ProbeMode {
     Ready,
     Waiting,
     Wrong,
+    Error,
 }
 struct FakeProbe(Mutex<ProbeMode>);
 impl PortProbe for FakeProbe {
     fn port_binding(&self, port: u16, unit: Option<&str>) -> io::Result<PortBinding> {
+        if unit.is_some() && matches!(*self.0.lock().unwrap(), ProbeMode::Error) {
+            return Err(io::Error::other("fake discovery failure"));
+        }
         Ok(match (unit, *self.0.lock().unwrap()) {
             (Some(_), ProbeMode::Ready) => PortBinding::BoundByUnit {
                 pid: 1234,
@@ -468,6 +472,59 @@ async fn runtime_deterministic_exits_are_not_retried() {
     }
 }
 
+#[derive(Default)]
+struct RecordingReal {
+    units: Mutex<Vec<String>>,
+    backend: SystemctlBackend,
+}
+impl UserSystemd for RecordingReal {
+    fn start<'a>(
+        &'a self,
+        spec: &'a lantern_daemon::runtime::systemd::UnitStart,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.units.lock().unwrap().push(spec.unit.clone());
+        self.backend.start(spec)
+    }
+    fn stop<'a>(
+        &'a self,
+        unit: &'a str,
+        timeout: Duration,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.backend.stop(unit, timeout)
+    }
+    fn reset_failed<'a>(&'a self, unit: &'a str) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.backend.reset_failed(unit)
+    }
+    fn poll<'a>(
+        &'a self,
+        units: &'a [String],
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, Vec<UnitSnapshot>> {
+        self.backend.poll(units)
+    }
+    fn list_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, Vec<String>> {
+        self.backend.list_prefix(prefix)
+    }
+}
+impl Drop for RecordingReal {
+    fn drop(&mut self) {
+        for unit in self.units.lock().unwrap().iter() {
+            if unit.starts_with("lantern-test-supervisor-") {
+                for action in ["stop", "reset-failed"] {
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", action, "--", unit])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+        }
+    }
+}
+
 struct RealGuard {
     unit: String,
 }
@@ -496,7 +553,18 @@ async fn runtime_real_systemd_discovery_logs_and_stop() {
         "python3 -m http.server ${PORT} --bind 127.0.0.1",
         &[],
     );
-    let cfg = config(&temp);
+    {
+        let mut all = store.instances.lock().unwrap();
+        let manifest = Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest);
+        manifest.health_endpoint = Some("/".into());
+        manifest.deploy.status =
+            Some(lantern_core::template::TemplateString::parse("printf 'supervisor-status\\n'").0);
+        manifest.deploy.logs =
+            Some(lantern_core::template::TemplateString::parse("printf 'supervisor-custom-log\\n'").0);
+    }
+    let mut cfg = config(&temp);
+    cfg.settings.health.interval_secs = 1;
+    cfg.settings.health.grace_secs = 0;
     let unit = cfg.names.instance(&id);
     let _guard = RealGuard { unit: unit.clone() };
     let scanner = Scanner::new(
@@ -504,12 +572,8 @@ async fn runtime_real_systemd_discovery_logs_and_stop() {
         CheckoutIndex::new([], temp.0.clone()),
         HideSettings::default(),
     );
-    let rt = runtime(
-        cfg,
-        store,
-        Arc::new(ScannerProbe::new(scanner)),
-        Arc::new(SystemctlBackend),
-    );
+    let backend = Arc::new(RecordingReal::default());
+    let rt = runtime(cfg, store, Arc::new(ScannerProbe::new(scanner)), backend.clone());
     let (_, mut lines) = rt.subscribe_logs(&id, 0);
     let op = rt.start(&id, StartOpts).await.unwrap();
     let result = op.wait(Duration::from_secs(25)).await.unwrap();
@@ -518,6 +582,10 @@ async fn runtime_real_systemd_discovery_logs_and_stop() {
     assert_eq!(state.status, InstanceStatus::Running);
     let port = state.port.unwrap();
     assert!((39100..=39199).contains(&port));
+    wait_state(&rt, &id, |s| {
+        s.health.state == lantern_core::model::HealthState::Healthy
+    })
+    .await;
     let mut socket = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
         .await
         .unwrap();
@@ -533,6 +601,42 @@ async fn runtime_real_systemd_discovery_logs_and_stop() {
     .await
     .expect("journal follower did not deliver HTTP access log");
     assert_eq!(line.instance, id);
+    let setup = rt
+        .prepare_oneshot(
+            &id,
+            lantern_daemon::runtime::OneShotLaunch {
+                verb: "setup".into(),
+                cwd: temp.0.clone(),
+                shell_command: "printf 'supervisor-setup-line\\n'".into(),
+                env: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap();
+    let setup_unit = setup.unit.unit.clone();
+    let _setup_guard = RealGuard { unit: setup_unit };
+    let setup_op = rt.run_oneshot(setup);
+    assert_eq!(
+        setup_op.wait(Duration::from_secs(20)).await.unwrap().status,
+        OperationStatus::Succeeded
+    );
+    let setup_line = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let line = lines.recv().await.unwrap();
+            if line.line.contains("supervisor-setup-line") {
+                break line;
+            }
+        }
+    })
+    .await
+    .expect("setup line missing from journal follower");
+    assert_eq!(setup_line.stream, lantern_core::model::Stream::Setup);
+    let status = rt.deploy_status(&id).await.unwrap();
+    assert!(status.alive);
+    assert!(status.output.contains("supervisor-status"));
+    let deploy_log = rt.deploy_logs(&id).await.unwrap();
+    assert!(deploy_log.contains("supervisor-custom-log"));
     let history = rt
         .log_history(&id, lantern_daemon::runtime::HistoryQuery { limit: 100 })
         .await
@@ -543,8 +647,13 @@ async fn runtime_real_systemd_discovery_logs_and_stop() {
     );
     let stop = rt.stop(&id, StopOpts::default()).await.unwrap();
     assert_eq!(completed(&stop).await, OperationStatus::Succeeded);
-    let rows = SystemctlBackend.poll(&[unit]).await.unwrap();
-    assert!(rows.is_empty() || rows.iter().all(|r| r.load == Load::NotFound));
+    let units = backend.units.lock().unwrap().clone();
+    assert!(units.contains(&unit));
+    let rows = SystemctlBackend.poll(&units).await.unwrap();
+    assert!(
+        rows.is_empty() || rows.iter().all(|r| r.load == Load::NotFound),
+        "test units remain loaded: {rows:?}"
+    );
 }
 
 #[derive(Default)]
@@ -1068,7 +1177,7 @@ async fn runtime_retries_atomic_lease_conflicts_without_losing_other_writes() {
 }
 
 #[tokio::test]
-async fn runtime_reserves_port_before_prepare_and_keeps_it() {
+async fn runtime_reserves_port_before_prepare_and_rechecks_it() {
     let temp = Temp::new();
     let store = Arc::new(Store::default());
     let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
@@ -1086,7 +1195,9 @@ async fn runtime_reserves_port_before_prepare_and_keeps_it() {
         completed(&rt.start(&id, StartOpts).await.unwrap()).await,
         OperationStatus::Succeeded
     );
-    assert_eq!(rt.state(&id).unwrap().port, Some(port));
+    let active_port = rt.state(&id).unwrap().port.unwrap();
+    assert!((temp.1..=temp.1 + 2).contains(&active_port));
+    assert_eq!(store.port_leases().unwrap().get(&id), Some(&active_port));
 }
 
 #[tokio::test]
@@ -1186,6 +1297,7 @@ async fn runtime_setup_oneshot_uses_launcher_and_is_cancellable() {
                 timeout: Duration::from_secs(5),
             },
         )
+        .await
         .unwrap();
     assert!(
         spec.unit
@@ -1205,4 +1317,76 @@ async fn runtime_setup_oneshot_uses_launcher_and_is_cancellable() {
     assert!(op.cancel());
     assert_eq!(completed(&op).await, OperationStatus::Cancelled);
     assert!(backend.calls().iter().any(|s| s.starts_with("stop ")));
+}
+
+#[tokio::test]
+async fn runtime_probe_failure_stops_the_started_unit() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let fake = Arc::new(FakeSystemd::default());
+    fake.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Error))),
+        fake.clone(),
+    );
+    let op = rt.start(&id, StartOpts).await.unwrap();
+    assert_eq!(completed(&op).await, OperationStatus::Failed);
+    assert_eq!(rt.state(&id).unwrap().status, InstanceStatus::Crashed);
+    assert!(fake.calls().iter().any(|s| s.starts_with("stop ")));
+}
+
+struct RefuseStop(FakeSystemd);
+impl UserSystemd for RefuseStop {
+    fn start<'a>(
+        &'a self,
+        spec: &'a lantern_daemon::runtime::systemd::UnitStart,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.0.start(spec)
+    }
+    fn stop<'a>(
+        &'a self,
+        _: &'a str,
+        _: Duration,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        Box::pin(async {
+            Err(lantern_daemon::runtime::systemd::UnitError::Timeout(
+                "test stop".into(),
+            ))
+        })
+    }
+    fn reset_failed<'a>(&'a self, unit: &'a str) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, ()> {
+        self.0.reset_failed(unit)
+    }
+    fn poll<'a>(
+        &'a self,
+        units: &'a [String],
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, Vec<UnitSnapshot>> {
+        self.0.poll(units)
+    }
+    fn list_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> lantern_daemon::runtime::systemd::SystemdFuture<'a, Vec<String>> {
+        self.0.list_prefix(prefix)
+    }
+}
+#[tokio::test]
+async fn runtime_failed_cleanup_is_not_reported_as_stopped() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("app", &temp.0, "python3 -m http.server ${PORT}", &[]);
+    let fake = Arc::new(RefuseStop(FakeSystemd::default()));
+    fake.0.set_auto_start(true);
+    let rt = runtime(
+        config(&temp),
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Wrong))),
+        fake,
+    );
+    let op = rt.start(&id, StartOpts).await.unwrap();
+    assert_eq!(completed(&op).await, OperationStatus::Failed);
+    assert_eq!(rt.state(&id).unwrap().status, InstanceStatus::Stopping);
 }
