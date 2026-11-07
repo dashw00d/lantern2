@@ -1,1 +1,3 @@
-//! Listening-server discovery (docs/12-discovery.md). Owner: lane `discovery`.
+//! Listening-server discovery (docs/12-discovery.md).
+
+pub mod source;
