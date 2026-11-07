@@ -320,7 +320,6 @@ impl InstanceService {
             }
         }
         let mut observed = HashSet::new();
-        let mut trees = trees;
         trees.sort_by(|a, b| a.path.cmp(&b.path));
         for p in projects {
             let pr = p.project.repo.as_ref().ok_or(InstanceError::NotARepo)?;

@@ -504,8 +504,7 @@ async fn runtime_run_hooks_and_manifest_startup_timeout() {
         rt.state(&id).unwrap().issue.unwrap().code,
         IssueCode::ReadinessTimeout
     );
-    let started = backend.started.lock().unwrap();
-    let unit = started.first().unwrap();
+    let unit = backend.started.lock().unwrap().first().unwrap().clone();
     let main = std::fs::read_to_string(&unit.script).unwrap();
     assert!(main.contains("echo pre-${LANTERN_BRANCH}"), "{main}");
     let post = std::fs::read_to_string(
@@ -515,7 +514,6 @@ async fn runtime_run_hooks_and_manifest_startup_timeout() {
     )
     .unwrap();
     assert!(post.contains("echo post-${LANTERN_BRANCH}"), "{post}");
-    drop(started);
     let oneshot = rt
         .prepare_oneshot(
             &id,
@@ -837,7 +835,19 @@ async fn runtime_real_systemd_discovery_logs_and_stop() {
         HideSettings::default(),
     );
     let backend = Arc::new(RecordingReal::default());
-    let rt = runtime(cfg, store, Arc::new(ScannerProbe::new(scanner)), backend.clone());
+    let rt = Runtime::with_scoped_journal(
+        cfg,
+        store,
+        Arc::new(ScannerProbe::new(scanner)),
+        backend.clone(),
+        OperationTracker::new(EventBus::new()),
+        lantern_daemon::runtime::RuntimeAdapters {
+            preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+            router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+            services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+        },
+        true,
+    );
     let (_, mut lines) = rt.subscribe_logs(&id, 0);
     let op = rt.start(&id, StartOpts).await.unwrap();
     let result = op.wait(Duration::from_secs(25)).await.unwrap();
@@ -871,7 +881,7 @@ async fn runtime_real_systemd_discovery_logs_and_stop() {
             lantern_daemon::runtime::OneShotLaunch {
                 verb: "setup".into(),
                 cwd: temp.0.clone(),
-                shell_command: "printf 'supervisor-setup-line\\n'".into(),
+                shell_command: "sleep 3; printf 'supervisor-setup-line\\n'; sleep 1".into(),
                 env: BTreeMap::new(),
                 timeout: Duration::from_secs(10),
             },
