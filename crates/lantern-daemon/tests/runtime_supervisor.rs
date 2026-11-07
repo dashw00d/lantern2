@@ -541,6 +541,46 @@ async fn runtime_run_hooks_and_manifest_startup_timeout() {
 }
 
 #[tokio::test]
+async fn runtime_portless_worker_honors_manifest_startup_timeout() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("portless", &temp.0, "sleep 60", &[]);
+    {
+        let mut all = store.instances.lock().unwrap();
+        let manifest = Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest);
+        manifest.serve = lantern_core::model::ServeMode::Static;
+        manifest.root = Some(".".into());
+        manifest.run.startup_timeout = Some(1);
+    }
+    let backend = Arc::new(FakeSystemd::default());
+    backend.set_auto_start(true);
+    let mut cfg = config(&temp);
+    cfg.settings.runtime.settle_secs = 4;
+    let rt = Runtime::with_scoped_journal(
+        cfg,
+        store,
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Waiting))),
+        backend.clone(),
+        OperationTracker::new(EventBus::new()),
+        lantern_daemon::runtime::RuntimeAdapters {
+            preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+            router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+            services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+        },
+        true,
+    );
+    let op = rt.start(&id, StartOpts).await.unwrap();
+    let snapshot = op.wait(Duration::from_secs(3)).await.unwrap();
+    assert_eq!(snapshot.status, OperationStatus::Failed, "{snapshot:?}");
+    assert_eq!(
+        rt.state(&id).unwrap().issue.unwrap().code,
+        IssueCode::ReadinessTimeout
+    );
+    assert!(backend.calls().iter().any(|call| call.starts_with("stop ")));
+    rt.shutdown_background();
+}
+
+#[tokio::test]
 async fn runtime_crash_retries_and_stops_at_crash_loop() {
     let temp = Temp::new();
     let store = Arc::new(Store::default());

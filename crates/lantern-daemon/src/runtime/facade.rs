@@ -1190,7 +1190,20 @@ impl Runtime {
                 .await?;
             }
         } else {
-            tokio::select! { () = token.cancelled() => return Err(Fault::new("cancelled", IssueCode::Other, "cancelled")), () = tokio::time::sleep(Duration::from_secs(self.inner.config.settings.runtime.settle_secs)) => {} }
+            let settle = Duration::from_secs(self.inner.config.settings.runtime.settle_secs);
+            tokio::select! { () = token.cancelled() => return Err(Fault::new("cancelled", IssueCode::Other, "cancelled")), () = tokio::time::sleep(settle.min(startup_timeout)) => {} }
+            if settle > startup_timeout {
+                if !is_deploy && let Err(error) = self.stop_failed_unit(actor, &unit.unit, generation).await {
+                    self.event(id, actor, generation, Event::CleanupFailed(error.issue));
+                    return Err(error);
+                }
+                self.event(id, actor, generation, Event::ReadinessTimeout);
+                return Err(Fault::new(
+                    "readiness_timeout",
+                    IssueCode::ReadinessTimeout,
+                    "process did not settle before startup timeout",
+                ));
+            }
         }
         {
             let _guard = actor.io_lock.lock().await;
