@@ -334,6 +334,20 @@ case**, and the code follows it:
 | 12 §3.13 Docker pid / container IP fields | v2.0's `DockerInfo` is `{ label, container_port }`. The Docker API comes in v2.1, so foreign Docker sockets keep `pid: None`. |
 | `php.fpm_socket` default | `"auto"`: probe `/run/php/php*-fpm.sock`, newest version first (13 §3.10 decides a user pool later, spike S7). |
 
+**Found in wave 2** (the code follows these):
+- `GET` never mutates. Checkout refresh is `POST /api/projects/{id}/sync`, and
+  `GET …/checkouts?refresh=true` returns `400`. Intel `GET` is cache-only; refresh is a `POST`.
+- D19 wins over 14 §3.11: manifest `features.auto_start` does **not** start anything at boot.
+  Only the active profile does.
+- Dirty checks use `git status --porcelain --untracked-files=all`, minus the files materialized
+  by `worktree.copy`/`worktree.link`.
+- Being located under the managed worktrees dir does not prove a checkout is Lantern-made. Only
+  a `managed` record created by Lantern does.
+- The CA name constraint is the permitted subtree `.glow`, which excludes the apex `glow`. That
+  is intended: no instance uses the apex.
+- `ResolvedRun` gains `pre_start`, `post_stop` and `startup_timeout` (10 §3.2). Until then the
+  runtime treats them as absent.
+
 **v1's self-registered `lantern` project:** parsing accepts `id: lantern`, so v1 manifests still
 load (C5). Resolution reports `reserved_id` and the project is not usable. `migrate-v1` **skips
 it with a note**, because self-registration was dropped (15 §3.10).
