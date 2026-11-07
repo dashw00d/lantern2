@@ -38,6 +38,11 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 getrandom = "0.4"
+rmcp = { version = "3.9.0", features = ["server", "macros", "transport-streamable-http-server"] }
+
+libc = "0.2"
+serde-saphyr = "=2.1.1"
+base64 = "0.23"
 
 [dev-dependencies]
 lantern-client = { workspace = true }

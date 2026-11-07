@@ -1,0 +1,873 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Call an HTTP API of a registered project through Lantern, e.g. tool=\"browser\", method=\"POST\", path=\"/tasks/execute\", body={...}. Lantern finds the running server's address; you give the project and a path. Returns the response body (cut at `max_bytes`, default 100000). Only registered projects are reachable. Endpoints marked risk high/critical, or projects needing confirmation, are not sent until `confirm=true`: ask the user first. For calls over ~50s set `async=true` to get a `job_id`, then use `get_operation` or `get_job_result`. See `get_project_endpoints` for what exists.",
+    "inputSchema": {
+      "$defs": {
+        "BodySchema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "items": true,
+              "type": "array"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "async": {
+          "description": "Run as a job.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "body": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BodySchema"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "JSON string, object or array."
+        },
+        "branch": {
+          "description": "Existing branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "confirm": {
+          "description": "True only after user approval for a risky call.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_bytes": {
+          "default": null,
+          "description": "Response cap; default 100000, maximum 1000000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "method": {
+          "description": "GET, POST, PUT, PATCH or DELETE; default GET.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Absolute path on the registered server, optionally with query.",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": null,
+          "description": "Timeout seconds; default 50, maximum 300.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tool": {
+          "description": "Registered project name or id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "call_tool_api"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Health of Lantern itself (dns, caddy, tls, daemon) and of every instance (healthy, unhealthy, unreachable, unknown; latency; last check). With `name` returns only that instance. `refresh=true` runs a check now instead of using the cached result.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Existing branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; omit for all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refresh": {
+          "description": "Run a new health check.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "check_health"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Dependency graph between projects (`depends_on` in manifests): what each needs and what depends on it. Pass `name` for one project. Check it before stopping or restarting something others rely on.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "name": {
+          "description": "Project name; omit for all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "get_dependencies"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Fetch the result of an async `call_tool_api` job by `job_id`. While running: status and elapsed time. When done: the response body. On failure: the error. Jobs are kept for 1 hour after they finish. (`get_operation` returns the same job as an operation.)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "job_id": {
+          "description": "Job id returned by call_tool_api.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id"
+      ],
+      "type": "object"
+    },
+    "name": "get_job_result"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Check a long operation started by `start_project`, `start_branch`, `restart_project` or `call_tool_api` with `async=true`. Returns status (running, succeeded, failed, cancelled), the current step, and the error if it failed. `wait_seconds` (max 55) blocks until it finishes or the time passes, so you do not need to poll in a loop.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "operation_id": {
+          "description": "Operation id returned by a long-running tool.",
+          "type": "string"
+        },
+        "wait_seconds": {
+          "default": null,
+          "description": "Seconds to wait; maximum 55.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "operation_id"
+      ],
+      "type": "object"
+    },
+    "name": "get_operation"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Show assigned ports by instance id, with status, health and URL. Matched hand-started listeners may add source, pid and branch. Use list_listeners for unmatched sockets; never guess a port.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "project": {
+          "description": "Restrict to a project.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "get_ports"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Full details of one project: path, URLs, status, run command, health endpoint, dependencies, risk/confirmation metadata, docs and endpoint counts, and all its instances (branches). Pass `branch` or `instance` for that specific checkout instead of the primary.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Branch of an existing instance; omit for primary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id; takes precedence over branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; an instance id also works.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "get_project"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Show how Lantern found a project's docs and endpoints: the auto-discovery settings (docs_auto, api_auto), discovered versus manual entries, sources tried, errors, last refresh time. Use to debug missing docs or endpoints.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Branch of an existing instance; omit for primary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id; takes precedence over branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; an instance id also works.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "get_project_discovery"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "List or read a project's documentation files (README, AGENTS.md, CLAUDE.md, docs/**/*.md, plus anything its manifest lists). Without `path`: the list with kind and size. With `path`: the file text, paged by `offset`/`max_chars`. Reads the targeted branch's checkout, so the docs match that branch. Only listed files can be read.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Branch of an existing instance; omit for primary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id; takes precedence over branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_chars": {
+          "default": null,
+          "description": "Maximum characters; default 40000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; an instance id also works.",
+          "type": "string"
+        },
+        "offset": {
+          "default": null,
+          "description": "Character offset.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Listed document path; omit to list.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "get_project_docs"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "List the HTTP API endpoints of a project (from its manifest and its OpenAPI/Swagger document): method, path, description, category, risk, body hint. Use before `call_tool_api`. `q` filters by substring of path, description or category; `limit` caps the list (default 200).",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Branch of an existing instance; omit for primary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id; takes precedence over branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Maximum endpoints; default 200.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; an instance id also works.",
+          "type": "string"
+        },
+        "q": {
+          "description": "Filter by path, description, or category.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "get_project_endpoints"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Recent log output (stdout and stderr, newest last) of a project's dev server. First stop when something fails to start or returns errors. `tail` lines (default 200, max 2000), `since` (\"15m\", \"2h\" or an ISO time), `stream` (stdout, stderr or all), `grep` (case-insensitive substring filter). Targets the primary unless `branch`/`instance` is given.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Branch of an existing instance; omit for primary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "grep": {
+          "description": "Case-insensitive text filter.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id; takes precedence over branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; an instance id also works.",
+          "type": "string"
+        },
+        "since": {
+          "description": "Time or duration, such as 15m.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream": {
+          "description": "stdout, stderr, or all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tail": {
+          "default": null,
+          "description": "Number of lines; default 200, maximum 2000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "get_project_logs"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "List instances (one per git checkout) with branch, status, port, URL, health, dirty flag and checkout path. Filter by `project`, `status` or `branch`. Use to see which branches are running side by side, or to find the instance id for other tools.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Filter by branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project": {
+          "description": "Restrict to project.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Filter by status.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_instances"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Raw list of TCP sockets listening on localhost with owning process, command line, working directory, and the matched project/instance. Finds servers started by hand in a terminal. Filters: `project`, `port`, `unmatched_only`.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "port": {
+          "default": null,
+          "description": "Restrict to a port.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project": {
+          "description": "Restrict to a project.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unmatched_only": {
+          "description": "Only listeners with no matching instance.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_listeners"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "List projects registered in Lantern (local dev servers, tools, websites) with status, URL and port. Start here to see what exists and what is running. Shows the primary checkout's status and how many branch instances exist; use `list_instances` for per-branch detail, `get_project` for full config. Filters: `tag`; `kind` (project, service, tool, capability, website); `status` (running, stopped, starting, stopping, crashed, unhealthy, needs_config, external; `error` also accepted).",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "kind": {
+          "description": "Filter by project kind.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Filter by primary status.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tag": {
+          "description": "Filter by tag.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_projects"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "List the tools agents can call through Lantern: projects of kind `tool` or `capability` (browser automation, data services, ...). Shows description, status, domain, risk, whether calls need confirmation, trigger keywords and endpoints. Then use `get_project_docs`, `get_project_endpoints` and `call_tool_api`. Filters: `tag`, `status`, `kind`.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "kind": {
+          "description": "Filter by tool or capability.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Filter by status.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tag": {
+          "description": "Filter by tag.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_tools"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Re-scan docs and re-fetch OpenAPI documents now (normally refreshed every 10 minutes and when a server starts). Pass a project/instance, or nothing to refresh all. Takes up to 30 seconds.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Existing branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; omit for all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "refresh_discovery"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Restart a project's dev server (stop, then start). Acts on the primary unless `branch`/`instance` is given. Waits up to `wait_seconds` (default 40, max 55), then returns an `operation_id`.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Branch of an existing instance; omit for primary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id; takes precedence over branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; an instance id also works.",
+          "type": "string"
+        },
+        "wait_seconds": {
+          "default": null,
+          "description": "Seconds to wait; maximum 55.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "restart_project"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Find projects by free text (case-insensitive substring of name, description, tags, or git branch names). Use when you remember only part of a name or want projects related to a topic such as \"browser\" or \"postgres\".",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "query": {
+          "description": "Search name, description, tags or branch.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "search_projects"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Run a git branch of a project side by side with the others: creates a git worktree for `branch` if there is none (new branches start from `base`, default the primary's current branch), runs setup (copies .env, installs dependencies), starts it, and returns its own URL such as https://feature-x.myapp.glow. Safe to repeat; an existing instance is reused. Can take minutes: after `wait_seconds` (default 45, max 55) you get an `operation_id` and the work continues; poll `get_operation`. `start=false` only prepares the worktree.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "base": {
+          "description": "Base for a new branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branch": {
+          "description": "Git branch to run.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Project name or id.",
+          "type": "string"
+        },
+        "start": {
+          "description": "Start the server; defaults to true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "wait_seconds": {
+          "default": null,
+          "description": "Seconds to wait; default 45, maximum 55.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "branch"
+      ],
+      "type": "object"
+    },
+    "name": "start_branch"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Start a project's dev server. Safe to repeat: if it is already running, reports its URL. Acts on the primary checkout unless `branch` (an existing instance) or `instance` is given; to run a branch with no instance yet use `start_branch`. Waits up to `wait_seconds` (default 30, max 55) for the server to accept connections; if still starting it returns an `operation_id` for `get_operation`.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Branch of an existing instance; omit for primary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id; takes precedence over branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; an instance id also works.",
+          "type": "string"
+        },
+        "wait_seconds": {
+          "default": null,
+          "description": "Seconds to wait; maximum 55.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "start_project"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Stop a project's dev server (its whole process group). Safe to repeat. Acts on the primary unless `branch`/`instance` is given. Deletes nothing. Check `get_dependencies` first if other projects rely on it.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "branch": {
+          "description": "Branch of an existing instance; omit for primary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "description": "Existing instance id; takes precedence over branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Project name or id; an instance id also works.",
+          "type": "string"
+        },
+        "wait_seconds": {
+          "default": null,
+          "description": "Seconds to wait; maximum 55.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "stop_project"
+  }
+]
