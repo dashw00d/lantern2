@@ -959,6 +959,56 @@ async fn instances_git_user_worktree_inside_managed_directory_stays_user_owned()
 }
 
 #[tokio::test]
+async fn instances_prune_only_missing_managed_worktree() {
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    git_cmd(&root, &["branch", "managed-gone"]);
+    git_cmd(&root, &["branch", "user-gone"]);
+    let user = t.0.join("user-wt");
+    git_cmd(
+        &root,
+        &["worktree", "add", "--", user.to_str().unwrap(), "user-gone"],
+    );
+    let op = operation();
+    let managed = service
+        .run_branch_unprepared(req(BranchTarget::Branch("managed-gone".into())), &op)
+        .await
+        .unwrap();
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let record = store
+        .records
+        .lock()
+        .unwrap()
+        .get(&managed.instance)
+        .unwrap()
+        .clone();
+    let managed_root = record
+        .checkout
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::remove_dir_all(&managed_root).unwrap();
+    fs::remove_dir_all(&user).unwrap();
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let rows = Git::detect()
+        .await
+        .unwrap()
+        .repo(root.join(".git"))
+        .list_worktrees()
+        .await
+        .unwrap();
+    assert!(!rows.iter().any(|row| row.path == managed_root));
+    assert!(rows.iter().any(|row| row.path == user && row.prunable.is_some()));
+    let records = store.records.lock().unwrap();
+    assert!(!records.contains_key(&managed.instance));
+    assert!(records.contains_key(&InstanceId::parse("myapp@user-gone").unwrap()));
+    op.finish(OpOutcome::Succeeded(None));
+}
+
+#[tokio::test]
 async fn instances_gc_apply_only_clean_managed_checkouts() {
     let t = Temp::new();
     let (root, _, store, _, service) = fixture(&t, EMPTY).await;

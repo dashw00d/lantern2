@@ -291,8 +291,11 @@ impl InstanceService {
     }
     pub(crate) async fn refresh_unlocked(&self, common: &Path) -> Result<(), InstanceError> {
         let repo = self.git.repo(common.to_path_buf());
-        let trees = repo.list_worktrees().await?;
+        let mut trees = repo.list_worktrees().await?;
         self.recover_creating(common, &trees)?;
+        if self.prune_missing_managed(common, &repo, &trees).await? {
+            trees = repo.list_worktrees().await?;
+        }
         let mut projects = self
             .store
             .projects_in_repo(common)
@@ -477,6 +480,71 @@ impl InstanceService {
             }
         }
         Ok(())
+    }
+    async fn prune_missing_managed(
+        &self,
+        common: &Path,
+        repo: &RepoHandle,
+        trees: &[Worktree],
+    ) -> Result<bool, InstanceError> {
+        let mut by_root: HashMap<PathBuf, Vec<(InstanceId, CheckoutKind, CheckoutPhase)>> = HashMap::new();
+        for (id, record) in self.store.records().map_err(InstanceError::Adapter)? {
+            let Some(project) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+            else {
+                continue;
+            };
+            let Some(info) = project
+                .project
+                .repo
+                .as_ref()
+                .filter(|info| info.common_dir == common)
+            else {
+                continue;
+            };
+            let root = strip_subpath(&record.checkout.path, &info.subpath)?;
+            by_root
+                .entry(root)
+                .or_default()
+                .push((id, record.checkout.kind, record.checkout.phase));
+        }
+        let mut changed = false;
+        for tree in trees
+            .iter()
+            .filter(|tree| tree.prunable.is_some() && tree.locked.is_none())
+        {
+            let Some(records) = by_root.get(&tree.path) else {
+                continue;
+            };
+            if records
+                .iter()
+                .any(|(_, kind, phase)| *kind != CheckoutKind::Managed || *phase != CheckoutPhase::Ready)
+            {
+                continue;
+            }
+            if records.iter().any(|(id, _, _)| {
+                !matches!(
+                    self.store.status(id),
+                    Ok(InstanceStatus::Stopped | InstanceStatus::NeedsConfig)
+                )
+            }) {
+                continue;
+            }
+            if !matches!(std::fs::symlink_metadata(&tree.path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
+            // Unlike global `worktree prune`, remove targets only this missing entry;
+            // do not use --force, and never act on user-owned or locked siblings.
+            repo.remove_worktree(&tree.path, false).await?;
+            for (id, _, _) in records {
+                self.store.remove(id).map_err(InstanceError::Adapter)?;
+            }
+            changed = true;
+        }
+        Ok(changed)
     }
     fn recover_creating(&self, common: &Path, trees: &[Worktree]) -> Result<(), InstanceError> {
         for (id, mut record) in self.store.records().map_err(InstanceError::Adapter)? {
