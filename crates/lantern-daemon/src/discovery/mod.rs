@@ -2,6 +2,8 @@
 
 pub mod source;
 
+mod classify;
+pub mod hide;
 pub mod matcher;
 mod owners;
 pub mod procinfo;
