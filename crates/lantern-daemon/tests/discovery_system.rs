@@ -98,3 +98,29 @@ fn discovery_real_scan_timing() {
         socket.local_addr().unwrap().port()
     );
 }
+
+#[test]
+#[ignore = "real system: compare netlink and procfs tables"]
+fn discovery_real_source_parity() {
+    use std::collections::HashSet;
+    let _listener = listener();
+    for attempt in 0..2 {
+        let netlink: HashSet<_> = SockDiag.listening_tcp().unwrap().into_iter().collect();
+        let proc: HashSet<_> = ProcNetTcp::default()
+            .listening_tcp()
+            .unwrap()
+            .into_iter()
+            .collect();
+        if netlink == proc {
+            println!("sock_diag/proc parity: {} sockets", netlink.len());
+            return;
+        }
+        if attempt == 1 {
+            panic!(
+                "socket sources differ: netlink only {:?}; proc only {:?}",
+                netlink.difference(&proc).collect::<Vec<_>>(),
+                proc.difference(&netlink).collect::<Vec<_>>()
+            );
+        }
+    }
+}

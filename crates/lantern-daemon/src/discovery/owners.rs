@@ -38,7 +38,9 @@ impl Owners {
             .find(|path| Self::matches(path, inode))
     }
     fn topmost(reader: &mut ProcReader, mut owner: Owner, inode: u64, now: Instant) -> Owner {
-        if let Some(proc) = reader.read(owner.key.pid, now) {
+        if let Some(proc) = reader.read(owner.key.pid, now)
+            && proc.key == owner.key
+        {
             for ancestor in proc.ancestors {
                 if ancestor.uid != reader.root.uid() {
                     break;
@@ -58,7 +60,7 @@ impl Owners {
         sockets: &[RawSocket],
         reader: &mut ProcReader,
         now: Instant,
-    ) -> HashMap<u64, u32> {
+    ) -> HashMap<u64, ProcKey> {
         self.unreadable_fds
             .retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(60));
         let wanted_all: HashSet<_> = sockets
@@ -120,7 +122,8 @@ impl Owners {
                     }) else {
                         continue;
                     };
-                    if wanted.remove(&inode) {
+                    if wanted.contains(&inode) && reader.key(pid).ok() == Some(key) {
+                        wanted.remove(&inode);
                         let owner = Self::topmost(reader, Owner { key, fd: path }, inode, now);
                         self.positive.insert(inode, owner);
                         self.negative.remove(&inode);
@@ -143,7 +146,7 @@ impl Owners {
         }
         self.positive
             .iter()
-            .map(|(inode, owner)| (*inode, owner.key.pid))
+            .map(|(inode, owner)| (*inode, owner.key))
             .collect()
     }
 }
@@ -192,7 +195,10 @@ mod tests {
             owners
                 .resolve(&[socket], &mut reader, now + Duration::from_secs(62))
                 .get(&999),
-            Some(&123)
+            Some(&ProcKey {
+                pid: 123,
+                start_ticks: 5
+            })
         );
     }
     #[test]
@@ -230,7 +236,10 @@ mod tests {
             owners
                 .resolve(std::slice::from_ref(&socket), &mut reader, now)
                 .get(&456),
-            Some(&100)
+            Some(&ProcKey {
+                pid: 100,
+                start_ticks: 40
+            })
         );
         let info = reader.read(200, now).unwrap();
         assert_eq!(info.ancestors[0].key.pid, 100);
@@ -246,7 +255,13 @@ mod tests {
             &["other"],
             "/user.slice/app.service",
         );
-        assert_eq!(owners.resolve(&[socket], &mut reader, now).get(&456), Some(&200));
+        assert_eq!(
+            owners.resolve(&[socket], &mut reader, now).get(&456),
+            Some(&ProcKey {
+                pid: 200,
+                start_ticks: 50
+            })
+        );
         assert!(reader.read(100, now).unwrap().cwd.is_none());
         assert_eq!(reader.read(100, now).unwrap().key.start_ticks, 99);
     }

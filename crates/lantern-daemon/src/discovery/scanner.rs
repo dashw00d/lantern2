@@ -1,5 +1,6 @@
 //! Synchronous scanner intended for a blocking worker.
 use super::build::{Observation, build};
+use super::docker::DockerCache;
 use super::hide::HideSettings;
 use super::matcher::CheckoutIndex;
 use super::owners::Owners;
@@ -35,6 +36,7 @@ pub struct Scanner {
     source: Source,
     reader: ProcReader,
     owners: Owners,
+    docker: DockerCache,
     index: CheckoutIndex,
     settings: HideSettings,
     seq: u64,
@@ -69,6 +71,7 @@ impl Scanner {
             source,
             reader: ProcReader::new(root),
             owners: Owners::default(),
+            docker: DockerCache::default(),
             index,
             settings,
             seq: 0,
@@ -91,11 +94,15 @@ impl Scanner {
     }
     fn observe(&mut self, sockets: Vec<RawSocket>, now: Instant) -> Vec<Observation> {
         let owners = self.owners.resolve(&sockets, &mut self.reader, now);
+        let docker = self.docker.enrich(&sockets, &self.reader.root);
         sockets
             .into_iter()
             .map(|s| {
-                let info = owners.get(&s.inode).and_then(|pid| self.reader.read(*pid, now));
-                (s, info)
+                let info = owners
+                    .get(&s.inode)
+                    .and_then(|key| self.reader.read(key.pid, now).filter(|proc| proc.key == *key));
+                let docker = docker.get(&s.inode).cloned();
+                (s, info, docker)
             })
             .collect()
     }
@@ -145,7 +152,11 @@ impl Scanner {
     pub fn scan(&mut self) -> io::Result<Snapshot> {
         let start = Instant::now();
         let (source, sockets) = self.sockets()?;
+        let source_ms = start.elapsed().as_secs_f32() * 1000.0;
+        let observe_start = Instant::now();
         let observations = self.observe(sockets, start);
+        let observe_ms = observe_start.elapsed().as_secs_f32() * 1000.0;
+        let build_start = Instant::now();
         let (listeners, hidden) = build(
             observations,
             &self.index,
@@ -157,13 +168,20 @@ impl Scanner {
             self.seq = self.seq.saturating_add(1);
             self.listeners.clone_from(&listeners);
         }
+        let scan_ms = start.elapsed().as_secs_f32() * 1000.0;
+        if scan_ms > 50.0 {
+            eprintln!(
+                "lantern discovery: slow scan {scan_ms:.1} ms (source {source_ms:.1} ms, proc {observe_ms:.1} ms, build {:.1} ms)",
+                build_start.elapsed().as_secs_f32() * 1000.0
+            );
+        }
         Ok(Snapshot {
             seq: self.seq,
             taken_at: SystemTime::now(),
             listeners,
             hidden,
             source,
-            scan_ms: start.elapsed().as_secs_f32() * 1000.0,
+            scan_ms,
         })
     }
 }
@@ -181,6 +199,61 @@ mod tests {
         fn listening_tcp(&mut self) -> io::Result<Vec<RawSocket>> {
             Ok(self.0.clone())
         }
+    }
+    #[test]
+    fn discovery_foreign_docker_is_labelled_without_pid() {
+        use lantern_core::model::ListenerClass;
+        let t = Tree::new();
+        t.process(
+            400,
+            1,
+            20,
+            "docker-proxy",
+            "/",
+            &[
+                "docker-proxy",
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "127.0.0.1",
+                "-host-port",
+                "39203",
+                "-container-port",
+                "80",
+            ],
+            "/system.slice/docker.service",
+        );
+        std::fs::write(t.0.join("400/comm"), "docker-proxy\n").unwrap();
+        let root = ProcRoot::new(&t.0);
+        let uid = root.uid();
+        let sockets = vec![RawSocket {
+            addr: "127.0.0.1:39203".parse().unwrap(),
+            uid: uid + 1,
+            inode: 987,
+        }];
+        let settings = HideSettings {
+            hide_defaults: false,
+            ..HideSettings::default()
+        };
+        let mut scanner = Scanner::with_source(
+            root,
+            CheckoutIndex::new([], "/home/test"),
+            settings,
+            Box::new(Fixed(sockets)),
+            SocketSourceKind::ProcNetTcp,
+        );
+        let snapshot = scanner.scan().unwrap();
+        let row = &snapshot.listeners[0];
+        assert_eq!(row.class, ListenerClass::Docker);
+        assert_eq!(row.pid, None);
+        assert_eq!(row.label, "Docker");
+        assert_eq!(row.docker.as_ref().unwrap().container_port, Some(80));
+        let holder: super::super::PortHolder = row.into();
+        assert_eq!(
+            serde_json::from_str::<super::super::PortHolder>(&serde_json::to_string(&holder).unwrap())
+                .unwrap(),
+            holder
+        );
     }
     #[test]
     fn discovery_user_hide_and_settings_change() {

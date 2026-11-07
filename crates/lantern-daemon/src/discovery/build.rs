@@ -5,11 +5,11 @@ use super::matcher::{CheckoutIndex, match_owner};
 use super::procinfo::{ProcInfo, is_lantern_inst};
 use super::redact::redact;
 use super::source::RawSocket;
-use lantern_core::model::{Exposure, Listener};
+use lantern_core::model::{DockerInfo, Exposure, Listener};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-pub(super) type Observation = (RawSocket, Option<ProcInfo>);
+pub(super) type Observation = (RawSocket, Option<ProcInfo>, Option<DockerInfo>);
 fn rank(addr: &SocketAddr) -> (u8, SocketAddr) {
     let ip = addr.ip();
     let rank = match ip {
@@ -48,13 +48,22 @@ pub(super) fn build(
     let mut visible = Vec::new();
     let mut hidden_rows = Vec::new();
     for (_, mut group) in groups {
-        group.sort_by_key(|(socket, _)| rank(&socket.addr));
-        let (first, proc) = &group[0];
-        let mut addrs: Vec<_> = group.iter().map(|(s, _)| s.addr).collect();
+        group.sort_by_key(|(socket, _, _)| rank(&socket.addr));
+        let (first, proc, _) = &group[0];
+        let docker = group.iter().find_map(|(_, _, docker)| docker.clone());
+        let mut addrs: Vec<_> = group.iter().map(|(s, _, _)| s.addr).collect();
         addrs.sort_by_key(rank);
         addrs.dedup();
         let matched = proc.as_ref().and_then(|p| match_owner(p, index, me, daemon_pid));
-        let (class, label) = classify(proc.as_ref(), first.uid, me, index, matched.is_some(), daemon_pid);
+        let (class, label) = classify(
+            proc.as_ref(),
+            first.uid,
+            me,
+            index,
+            matched.is_some(),
+            daemon_pid,
+            docker.is_some(),
+        );
         let unit = proc.as_ref().and_then(|p| p.unit.clone());
         let managed = unit.as_deref().is_some_and(is_lantern_inst);
         let mut listener = Listener {
@@ -81,7 +90,7 @@ pub(super) fn build(
             class,
             label,
             probe: None,
-            docker: None,
+            docker,
             adopted: false,
             hidden: None,
         };

@@ -241,6 +241,10 @@ impl ProcReader {
             started_at: self.root.started_at(key.start_ticks),
             ancestors: Vec::new(),
         };
+        // The pid may have been reused while its attributes were being read.
+        if self.key(pid).ok() != Some(key) {
+            return None;
+        }
         self.cache.insert(
             key,
             Cached {
@@ -271,6 +275,16 @@ impl ProcReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discovery_fixture_cmdline_cap() {
+        let tree = super::fixture::Tree::new();
+        tree.process(100, 1, 50, "node", "/repo", &["node"], "/app.service");
+        fs::write(tree.0.join("100/cmdline"), vec![b'a'; 20000]).unwrap();
+        let mut reader = ProcReader::new(ProcRoot::new(&tree.0));
+        let info = reader.read(100, Instant::now()).unwrap();
+        assert_eq!(info.cmdline_raw.len(), 1);
+        assert_eq!(info.cmdline_raw[0].len(), 16384);
+    }
     #[test]
     fn discovery_stat_cgroup_cmdline() {
         let stat = format!("44 (npm (exec) vite) S 12 {} 12345 0", vec!["0"; 17].join(" "));

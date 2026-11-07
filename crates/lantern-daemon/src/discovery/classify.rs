@@ -143,7 +143,11 @@ pub(super) fn classify(
     index: &CheckoutIndex,
     matched: bool,
     daemon_pid: u32,
+    docker: bool,
 ) -> (ListenerClass, String) {
+    if docker {
+        return (ListenerClass::Docker, "Docker".into());
+    }
     let Some(proc) = p else {
         return (
             if uid == me {
