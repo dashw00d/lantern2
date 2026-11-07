@@ -28,6 +28,9 @@ pub struct ProjectConfig {
     pub primary_domain: String,
 }
 
+/// Asynchronous registry durability barrier.
+pub type InstanceStoreFlushFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
 /// Synchronous registry operations required by the instance service.
 /// Mutations must persist state, allocate a port when needed, and publish changed views.
 pub trait InstanceStore: Send + Sync {
@@ -49,6 +52,14 @@ pub trait InstanceStore: Send + Sync {
     fn status(&self, id: &InstanceId) -> Result<InstanceStatus, String>;
     /// Obtain the sticky port lease created with the record.
     fn port(&self, id: &InstanceId) -> Result<Option<u16>, String>;
+    /// Publish the derived setup-staleness flag for an instance.
+    fn set_setup_stale(&self, _id: &InstanceId, _stale: bool) -> Result<(), String> {
+        Ok(())
+    }
+    /// Persist pending instance mutations before an irreversible Git operation.
+    fn flush(&self) -> InstanceStoreFlushFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// One setup command, rendered for the shell with values supplied only in the environment.

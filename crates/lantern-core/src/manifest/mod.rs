@@ -153,7 +153,7 @@ const ROOT: &[&str] = &[
 fn fields(parent: &str) -> Option<&'static [&'static str]> {
     match parent {
         "" => Some(ROOT),
-        "run" => Some(&["cmd", "cwd", "env", "pre_start", "post_stop"]),
+        "run" => Some(&["cmd", "cwd", "env", "pre_start", "post_stop", "startup_timeout"]),
         "worktree" => Some(&["copy", "link", "env"]),
         "deploy" => Some(&[
             "start", "stop", "restart", "logs", "status", "install", "env_file",
@@ -460,14 +460,22 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
     }
     if let Some(run) = &raw.run {
         for (k, v) in [("pre_start", &run.pre_start), ("post_stop", &run.post_stop)] {
-            if v.is_some() {
+            if v.as_ref().is_some_and(|value| value.contains('\0')) {
                 add(
-                    Severity::Warning,
-                    "ignored_key",
+                    Severity::Error,
+                    "bad_value",
                     &format!("run.{k}"),
-                    "this key is ignored".into(),
+                    "command must not contain NUL".into(),
                 );
             }
+        }
+        if run.startup_timeout == Some(0) {
+            add(
+                Severity::Error,
+                "bad_value",
+                "run.startup_timeout",
+                "must be at least one second".into(),
+            );
         }
     }
     if raw.deploy.as_ref().is_some_and(|d| d.install.is_some()) {
@@ -803,6 +811,15 @@ pub struct ResolvedRun {
     pub cmd: Option<TemplateString>,
     pub cwd: TemplateString,
     pub env: BTreeMap<String, TemplateString>,
+    /// Shell command run before the managed process.
+    #[serde(default)]
+    pub pre_start: Option<TemplateString>,
+    /// Shell command run by systemd after the managed process stops.
+    #[serde(default)]
+    pub post_stop: Option<TemplateString>,
+    /// Optional positive readiness timeout in seconds.
+    #[serde(default)]
+    pub startup_timeout: Option<u32>,
 }
 /// Worktree materialization instructions.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1361,6 +1378,9 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
             cmd: nonblank(run.cmd).map(t),
             cwd: t(run.cwd.unwrap_or_else(|| ".".into())),
             env: env_t(run.env),
+            pre_start: nonblank(run.pre_start).map(t),
+            post_stop: nonblank(run.post_stop).map(t),
+            startup_timeout: run.startup_timeout,
         },
         setup: raw.setup.map(|v| v.into_iter().map(t).collect()),
         worktree: WorktreeSpec {
@@ -1420,6 +1440,39 @@ mod tests {
             let p = parse_manifest(text, "lantern.yaml");
             assert!(p.usable, "{:?}", p.diagnostics);
         }
+    }
+    #[test]
+    fn run_hooks_and_startup_timeout_resolve_and_validate() {
+        let parsed = parse_manifest(
+            "id: app\nrun: {cmd: 'echo ${PORT}', pre_start: 'echo ${BRANCH}', post_stop: 'echo bye', startup_timeout: 7}\n",
+            "lantern.yaml",
+        );
+        assert!(parsed.usable, "{:?}", parsed.diagnostics);
+        assert!(!parsed.diagnostics.iter().any(|d| d.code == "ignored_key"));
+        let resolved = resolve(ResolveInput {
+            dir_name: "app",
+            is_primary: true,
+            primary: Some(&parsed),
+            checkout: None,
+            overrides: &RawManifest::default(),
+            templates: &NoTemplates,
+            detection: &crate::detect::Detection::default(),
+            settings: &crate::settings::Settings::default(),
+        });
+        let value = serde_json::to_value(&resolved).unwrap();
+        assert!(value.pointer("/run/pre_start").is_some());
+        assert!(value.pointer("/run/post_stop").is_some());
+        assert_eq!(value.pointer("/run/startup_timeout"), Some(&serde_json::json!(7)));
+        let roundtrip: ResolvedManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, resolved);
+        let bad = parse_manifest("run: {cmd: server, startup_timeout: 0}\n", "bad.yaml");
+        assert!(!bad.usable && bad.diagnostics.iter().any(|d| d.path == "run.startup_timeout"));
+        for invalid in ["-1", "oops", "4294967296"] {
+            let input = format!("run: {{cmd: server, startup_timeout: {invalid}}}\n");
+            assert!(!parse_manifest(&input, "bad.yaml").usable, "accepted {invalid}");
+        }
+        let invalid_hook = parse_manifest("run: {cmd: server, pre_start: \"bad\\0command\"}\n", "bad.yaml");
+        assert!(!invalid_hook.usable && invalid_hook.diagnostics.iter().any(|d| d.path == "run.pre_start"));
     }
     #[test]
     fn nested_type_error_is_located_and_other_fields_survive() {

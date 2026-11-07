@@ -3,6 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU32, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use super::procinfo::{ProcKey, ProcReader};
@@ -92,46 +96,79 @@ impl Owners {
                 .filter_map(|e| e.file_name().to_str()?.parse().ok())
                 .collect();
             pids.sort_unstable_by(|a, b| b.cmp(a));
-            for pid in pids {
-                if wanted.is_empty() {
-                    break;
-                }
-                if reader.root.uid_of(pid).ok() != Some(reader.root.uid()) {
-                    continue;
-                }
-                let Ok(key) = reader.key(pid) else {
-                    continue;
-                };
-                if self.unreadable_fds.contains_key(&key) {
-                    continue;
-                }
-                let fds = match fs::read_dir(reader.root.pid_path(pid).join("fd")) {
-                    Ok(fds) => fds,
-                    Err(err) => {
-                        if err.kind() == std::io::ErrorKind::PermissionDenied {
-                            self.unreadable_fds.insert(key, now);
+            let found = Mutex::new(HashMap::<u64, Owner>::new());
+            let unreadable = Mutex::new(Vec::new());
+            // After finding all inodes, finish higher PIDs to preserve newest-first selection.
+            let floor = AtomicU32::new(0);
+            let workers = if pids.len() < 16 { 1 } else { 6 };
+            let reader_ref: &ProcReader = reader;
+            let wanted_ref = &wanted;
+            let denied = &self.unreadable_fds;
+            std::thread::scope(|scope| {
+                for worker in 0..workers {
+                    let found = &found;
+                    let unreadable = &unreadable;
+                    let floor = &floor;
+                    let pids = &pids;
+                    scope.spawn(move || {
+                        for &pid in pids.iter().skip(worker).step_by(workers) {
+                            if pid < floor.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            if reader_ref.root.uid_of(pid).ok() != Some(reader_ref.root.uid()) {
+                                continue;
+                            }
+                            let Ok(key) = reader_ref.key(pid) else {
+                                continue;
+                            };
+                            if denied.contains_key(&key) {
+                                continue;
+                            }
+                            let fds = match fs::read_dir(reader_ref.root.pid_path(pid).join("fd")) {
+                                Ok(fds) => fds,
+                                Err(err) => {
+                                    if err.kind() == std::io::ErrorKind::PermissionDenied {
+                                        unreadable.lock().unwrap().push(key);
+                                    }
+                                    continue;
+                                }
+                            };
+                            for fd in fds.flatten() {
+                                let path = fd.path();
+                                let Some(inode) = fs::read_link(&path).ok().and_then(|p| {
+                                    let s = p.to_string_lossy();
+                                    s.strip_prefix("socket:[")?.strip_suffix(']')?.parse::<u64>().ok()
+                                }) else {
+                                    continue;
+                                };
+                                if wanted_ref.contains(&inode) && reader_ref.key(pid).ok() == Some(key) {
+                                    let mut found = found.lock().unwrap();
+                                    if found.get(&inode).is_none_or(|old| pid > old.key.pid) {
+                                        found.insert(inode, Owner { key, fd: path });
+                                        if found.len() == wanted_ref.len() {
+                                            floor.store(
+                                                found.values().map(|owner| owner.key.pid).min().unwrap_or(0),
+                                                Ordering::Relaxed,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        continue;
-                    }
-                };
-                for fd in fds.flatten() {
-                    let path = fd.path();
-                    let Some(inode) = fs::read_link(&path).ok().and_then(|p| {
-                        let s = p.to_string_lossy();
-                        s.strip_prefix("socket:[")?.strip_suffix(']')?.parse::<u64>().ok()
-                    }) else {
-                        continue;
-                    };
-                    if wanted.contains(&inode) && reader.key(pid).ok() == Some(key) {
-                        wanted.remove(&inode);
-                        let owner = Self::topmost(reader, Owner { key, fd: path }, inode, now);
-                        self.positive.insert(inode, owner);
-                        self.negative.remove(&inode);
-                    }
-                    if wanted.is_empty() {
-                        break;
-                    }
+                    });
                 }
+            });
+            for key in unreadable.into_inner().unwrap() {
+                self.unreadable_fds.insert(key, now);
+            }
+            for (inode, owner) in found.into_inner().unwrap() {
+                if reader.key(owner.key.pid).ok() != Some(owner.key) || !Self::matches(&owner.fd, inode) {
+                    continue;
+                }
+                wanted.remove(&inode);
+                let owner = Self::topmost(reader, owner, inode, now);
+                self.positive.insert(inode, owner);
+                self.negative.remove(&inode);
             }
         }
         for inode in wanted {
@@ -155,6 +192,38 @@ impl Owners {
 mod tests {
     use super::*;
     use crate::discovery::procinfo::{ProcRoot, fixture::Tree};
+    #[test]
+    fn discovery_parallel_search_preserves_newest_and_distinct_holders() {
+        let tree = Tree::new();
+        for pid in 100..132 {
+            tree.process(
+                pid,
+                1,
+                u64::from(pid),
+                "worker",
+                "/repo",
+                &["worker"],
+                "/app.service",
+            );
+        }
+        tree.socket(105, 3, 900);
+        tree.socket(130, 3, 900);
+        tree.socket(102, 4, 901);
+        let mut reader = ProcReader::new(ProcRoot::new(&tree.0));
+        let sockets: Vec<_> = [900, 901]
+            .into_iter()
+            .enumerate()
+            .map(|(i, inode)| RawSocket {
+                addr: format!("127.0.0.1:{}", 39100 + i).parse().unwrap(),
+                uid: reader.root.uid(),
+                inode,
+            })
+            .collect();
+        let mut owners = Owners::default();
+        let found = owners.resolve(&sockets, &mut reader, Instant::now());
+        assert_eq!(found.get(&900).unwrap().pid, 130);
+        assert_eq!(found.get(&901).unwrap().pid, 102);
+    }
     #[test]
     fn discovery_negative_inode_backoff_and_retry() {
         let t = Tree::new();

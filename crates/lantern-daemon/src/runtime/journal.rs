@@ -202,7 +202,7 @@ pub fn follow_args(slice: &str, after_cursor: Option<&str>) -> Result<Vec<String
 
 #[derive(Debug)]
 struct InstanceLogs {
-    ring: VecDeque<LogLine>,
+    ring: VecDeque<JournalLine>,
     bytes: usize,
     sender: broadcast::Sender<LogLine>,
 }
@@ -244,20 +244,56 @@ impl LogHub {
         })
     }
     /// Append a line to its bounded ring and broadcast while holding the same lock.
-    pub fn push(&self, mut line: LogLine) {
-        line.line = truncate_line(&line.line);
+    pub fn push(&self, line: LogLine) {
+        self.push_journal(JournalLine { line, cursor: None });
+    }
+    pub(super) fn push_journal(&self, mut entry: JournalLine) {
+        entry.line.line = truncate_line(&entry.line.line);
         let mut map = self.instances.lock().unwrap();
-        let logs = self.instance(&mut map, &line.instance);
-        logs.bytes += line.line.len();
-        logs.ring.push_back(line.clone());
+        let logs = self.instance(&mut map, &entry.line.instance);
+        if entry
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| logs.ring.iter().any(|old| old.cursor.as_ref() == Some(cursor)))
+        {
+            return;
+        }
+        logs.bytes += entry.line.line.len();
+        logs.ring.push_back(entry.clone());
         while logs.ring.len() > self.max_lines || logs.bytes > self.max_bytes {
             if let Some(removed) = logs.ring.pop_front() {
-                logs.bytes -= removed.line.len();
+                logs.bytes -= removed.line.line.len();
             } else {
                 break;
             }
         }
-        let _ = logs.sender.send(line);
+        let _ = logs.sender.send(entry.line);
+    }
+    // Merge the history with any follower entries that arrived during the query.
+    pub(super) fn backfill(&self, id: &InstanceId, entries: Vec<JournalLine>) {
+        let mut map = self.instances.lock().unwrap();
+        let logs = self.instance(&mut map, id);
+        let mut seen = std::collections::HashSet::new();
+        let mut combined: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| &entry.line.instance == id)
+            .chain(logs.ring.drain(..))
+            .filter(|entry| entry.cursor.as_ref().is_none_or(|c| seen.insert(c.clone())))
+            .collect();
+        combined.sort_by_key(|entry| entry.line.ts);
+        logs.bytes = 0;
+        for mut entry in combined {
+            entry.line.line = truncate_line(&entry.line.line);
+            logs.bytes += entry.line.line.len();
+            logs.ring.push_back(entry);
+        }
+        while logs.ring.len() > self.max_lines || logs.bytes > self.max_bytes {
+            if let Some(removed) = logs.ring.pop_front() {
+                logs.bytes -= removed.line.line.len();
+            } else {
+                break;
+            }
+        }
     }
     /// Return the most recent `n` retained lines in chronological order.
     pub fn tail(&self, id: &InstanceId, n: usize) -> Vec<LogLine> {
@@ -267,7 +303,7 @@ impl LogHub {
                 logs.ring
                     .iter()
                     .skip(logs.ring.len().saturating_sub(n))
-                    .cloned()
+                    .map(|entry| entry.line.clone())
                     .collect()
             })
             .unwrap_or_default()
@@ -284,7 +320,7 @@ impl LogHub {
             .ring
             .iter()
             .skip(logs.ring.len().saturating_sub(backlog))
-            .cloned()
+            .map(|entry| entry.line.clone())
             .collect();
         let receiver = logs.sender.subscribe();
         (lines, receiver)
@@ -360,6 +396,33 @@ mod tests {
         ));
         assert!(hub.tail(&id, 10).is_empty());
         assert!(clean_message(&"é".repeat(MAX_LINE_BYTES)).len() <= MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn journal_backfill_merges_with_live_entries_by_cursor() {
+        let hub = LogHub::new(10, 1000, 10);
+        let id = InstanceId::parse("app").unwrap();
+        let entry = |text: &str, cursor: &str, ts: i64| JournalLine {
+            line: LogLine {
+                ts: Timestamp::from_second(ts).unwrap(),
+                ..line(&id, text)
+            },
+            cursor: Some(cursor.into()),
+        };
+        hub.push_journal(entry("live", "c2", 2));
+        let (_, mut rx) = hub.subscribe_logs(&id, 0);
+        hub.backfill(&id, vec![entry("older", "c1", 1), entry("live", "c2", 2)]);
+        hub.push_journal(entry("live", "c2", 2));
+        hub.push_journal(entry("later", "c3", 3));
+        assert_eq!(
+            hub.tail(&id, 10)
+                .iter()
+                .map(|l| l.line.as_str())
+                .collect::<Vec<_>>(),
+            ["older", "live", "later"]
+        );
+        assert_eq!(rx.try_recv().unwrap().line, "later");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

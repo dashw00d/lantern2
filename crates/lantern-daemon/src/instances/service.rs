@@ -230,6 +230,8 @@ impl InstanceService {
             let state = all.entry(common_dir.to_path_buf()).or_default();
             state.fp = fp;
             state.last = Some(Instant::now());
+        } else {
+            self.publish_setup_staleness(common_dir)?;
         }
         Ok(should)
     }
@@ -289,7 +291,11 @@ impl InstanceService {
     }
     pub(crate) async fn refresh_unlocked(&self, common: &Path) -> Result<(), InstanceError> {
         let repo = self.git.repo(common.to_path_buf());
-        let trees = repo.list_worktrees().await?;
+        let mut trees = repo.list_worktrees().await?;
+        self.recover_creating(common, &trees)?;
+        if self.prune_missing_managed(common, &repo, &trees).await? {
+            trees = repo.list_worktrees().await?;
+        }
         let mut projects = self
             .store
             .projects_in_repo(common)
@@ -314,7 +320,6 @@ impl InstanceService {
             }
         }
         let mut observed = HashSet::new();
-        let mut trees = trees;
         trees.sort_by(|a, b| a.path.cmp(&b.path));
         for p in projects {
             let pr = p.project.repo.as_ref().ok_or(InstanceError::NotARepo)?;
@@ -443,6 +448,141 @@ impl InstanceService {
             }
         }
         self.purge_missing_unlocked(common)?;
+        self.publish_setup_staleness(common)?;
+        Ok(())
+    }
+    fn publish_setup_staleness(&self, common: &Path) -> Result<(), InstanceError> {
+        for (id, record) in self.store.records().map_err(InstanceError::Adapter)? {
+            let Some(project) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+            else {
+                continue;
+            };
+            if !project
+                .project
+                .repo
+                .as_ref()
+                .is_some_and(|repo| repo.common_dir == common)
+                || record.checkout.phase != CheckoutPhase::Ready
+                || !record.checkout.path.is_dir()
+            {
+                continue;
+            }
+            match self.setup_stale(&id) {
+                Ok(stale) => self
+                    .store
+                    .set_setup_stale(&id, stale)
+                    .map_err(InstanceError::Adapter)?,
+                Err(error) => tracing::warn!(%id, %error, "could not calculate setup staleness"),
+            }
+        }
+        Ok(())
+    }
+    async fn prune_missing_managed(
+        &self,
+        common: &Path,
+        repo: &RepoHandle,
+        trees: &[Worktree],
+    ) -> Result<bool, InstanceError> {
+        let mut by_root: HashMap<PathBuf, Vec<(InstanceId, CheckoutKind, CheckoutPhase)>> = HashMap::new();
+        for (id, record) in self.store.records().map_err(InstanceError::Adapter)? {
+            let Some(project) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+            else {
+                continue;
+            };
+            let Some(info) = project
+                .project
+                .repo
+                .as_ref()
+                .filter(|info| info.common_dir == common)
+            else {
+                continue;
+            };
+            let root = strip_subpath(&record.checkout.path, &info.subpath)?;
+            by_root
+                .entry(root)
+                .or_default()
+                .push((id, record.checkout.kind, record.checkout.phase));
+        }
+        let mut changed = false;
+        for tree in trees
+            .iter()
+            .filter(|tree| tree.prunable.is_some() && tree.locked.is_none())
+        {
+            let Some(records) = by_root.get(&tree.path) else {
+                continue;
+            };
+            if records
+                .iter()
+                .any(|(_, kind, phase)| *kind != CheckoutKind::Managed || *phase != CheckoutPhase::Ready)
+            {
+                continue;
+            }
+            if records.iter().any(|(id, _, _)| {
+                !matches!(
+                    self.store.status(id),
+                    Ok(InstanceStatus::Stopped | InstanceStatus::NeedsConfig)
+                )
+            }) {
+                continue;
+            }
+            if !matches!(std::fs::symlink_metadata(&tree.path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
+            // Unlike global `worktree prune`, remove targets only this missing entry;
+            // do not use --force, and never act on user-owned or locked siblings.
+            repo.remove_worktree(&tree.path, false).await?;
+            for (id, _, _) in records {
+                self.store.remove(id).map_err(InstanceError::Adapter)?;
+            }
+            changed = true;
+        }
+        Ok(changed)
+    }
+    fn recover_creating(&self, common: &Path, trees: &[Worktree]) -> Result<(), InstanceError> {
+        for (id, mut record) in self.store.records().map_err(InstanceError::Adapter)? {
+            if record.checkout.phase != CheckoutPhase::Creating {
+                continue;
+            }
+            let Some(project) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+            else {
+                continue;
+            };
+            let Some(repo) = project
+                .project
+                .repo
+                .as_ref()
+                .filter(|repo| repo.common_dir == common)
+            else {
+                continue;
+            };
+            let root = strip_subpath(&record.checkout.path, &repo.subpath)?;
+            if record.checkout.path.is_dir() && trees.iter().any(|tree| !tree.bare && tree.path == root) {
+                // Creating records predate proof that Git made the path. Keep the usable
+                // checkout, but do not grant the right to delete it as managed data.
+                record.checkout.phase = CheckoutPhase::Ready;
+                record.checkout.kind = CheckoutKind::Worktree;
+                record.checkout.missing_since = None;
+                self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+                tracing::warn!(%id, path = %root.display(), "recovered checkout without managed ownership proof");
+            } else {
+                // The path can be absent, half-created, or a raced-in user directory.
+                // Dropping only the intent is safe in all three cases.
+                self.store.remove(&id).map_err(InstanceError::Adapter)?;
+                if root.exists() {
+                    tracing::warn!(%id, path = %root.display(), "preserved ambiguous interrupted checkout directory");
+                }
+            }
+        }
         Ok(())
     }
     fn purge_missing_unlocked(&self, common: &Path) -> Result<(), InstanceError> {
@@ -831,11 +971,32 @@ impl InstanceService {
         self.store
             .upsert(&id, record.clone())
             .map_err(InstanceError::Adapter)?;
+        if let Err(error) = self.store.flush().await {
+            if let Some(previous) = previous.clone() {
+                self.store.upsert(&id, previous).map_err(InstanceError::Adapter)?;
+            } else {
+                self.store.remove(&id).map_err(InstanceError::Adapter)?;
+            }
+            return Err(InstanceError::Adapter(format!(
+                "worktree intent flush failed: {error}"
+            )));
+        }
         op.step("Creating worktree");
         if let Err(e) = repo.add_worktree(&root, &mode, &cancel).await {
             // A failed git call does not establish ownership of an on-disk path.
             // Restore a revived record rather than treating a raced-in user worktree as managed.
-            if let Some(previous) = previous {
+            if let Ok(trees) = repo.list_worktrees().await
+                && project_path.is_dir()
+                && trees.iter().any(|tree| !tree.bare && tree.path == root)
+            {
+                record.checkout.phase = CheckoutPhase::Ready;
+                record.checkout.kind = CheckoutKind::Worktree;
+                self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+                tracing::warn!(%id, path = %root.display(), "preserved checkout after interrupted git creation without claiming ownership");
+            } else if let Some(mut previous) = previous {
+                if root.exists() && previous.checkout.path == project_path {
+                    previous.checkout.kind = CheckoutKind::Worktree;
+                }
                 self.store.upsert(&id, previous).map_err(InstanceError::Adapter)?;
             } else {
                 self.store.remove(&id).map_err(InstanceError::Adapter)?;
@@ -1098,7 +1259,7 @@ impl InstanceService {
         if record.checkout.kind != CheckoutKind::Primary {
             let primary_root = pr.map(|r| r.git_root.as_path()).unwrap_or(&p.project.root);
             progress(op, "Copying files");
-            let (copied, copy_result) = files::materialize(
+            let (copied, copy_result, warnings) = files::materialize_detailed(
                 primary_root,
                 &p.project.root,
                 &root,
@@ -1107,6 +1268,9 @@ impl InstanceService {
                 false,
                 &cancel,
             );
+            for warning in warnings {
+                progress(op, &warning);
+            }
             record.checkout.materialized.extend(copied);
             record.checkout.materialized.sort();
             record.checkout.materialized.dedup();
@@ -1115,7 +1279,7 @@ impl InstanceService {
                 .map_err(InstanceError::Adapter)?;
             copy_result?;
             progress(op, "Linking files");
-            let (linked, link_result) = files::materialize(
+            let (linked, link_result, warnings) = files::materialize_detailed(
                 primary_root,
                 &p.project.root,
                 &root,
@@ -1124,6 +1288,9 @@ impl InstanceService {
                 true,
                 &cancel,
             );
+            for warning in warnings {
+                progress(op, &warning);
+            }
             record.checkout.materialized.extend(linked);
             record.checkout.materialized.sort();
             record.checkout.materialized.dedup();
@@ -1166,6 +1333,10 @@ impl InstanceService {
             finished_at: Timestamp::now(),
         });
         self.store.upsert(id, record).map_err(InstanceError::Adapter)?;
+        let stale = self.setup_stale(id)?;
+        self.store
+            .set_setup_stale(id, stale)
+            .map_err(InstanceError::Adapter)?;
         progress(op, "Ready");
         Ok(Prepared {
             manifest,

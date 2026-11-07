@@ -128,8 +128,18 @@ impl Scanner {
         }
     }
     fn observe(&mut self, sockets: Vec<RawSocket>, now: Instant) -> Vec<Observation> {
-        let owners = self.owners.resolve(&sockets, &mut self.reader, now);
-        let docker = self.docker.enrich(&sockets, &self.reader.root);
+        let root = self.reader.root.clone();
+        let (owners, docker) = if self.docker.needs_refresh(&sockets, &root) {
+            std::thread::scope(|scope| {
+                let docker = scope.spawn(|| self.docker.enrich(&sockets, &root));
+                let owners = self.owners.resolve(&sockets, &mut self.reader, now);
+                (owners, docker.join().expect("docker enrichment worker panicked"))
+            })
+        } else {
+            let owners = self.owners.resolve(&sockets, &mut self.reader, now);
+            let docker = self.docker.enrich(&sockets, &root);
+            (owners, docker)
+        };
         sockets
             .into_iter()
             .map(|s| {
@@ -182,6 +192,31 @@ impl Scanner {
         }
         let first = rows.first().expect("nonempty sockets yield listeners");
         Ok(super::PortBinding::HeldByOther(first.into()))
+    }
+    /// Enumerate all fresh socket addresses owned by a unit, without snapshot truncation.
+    pub fn unit_listeners(&mut self, unit: &str) -> io::Result<Vec<std::net::SocketAddr>> {
+        let (_, sockets) = self.sockets()?;
+        let now = Instant::now();
+        let owners = self.owners.resolve(&sockets, &mut self.reader, now);
+        let expected = super::procinfo::normalize_unit(unit);
+        let mut addresses: Vec<_> = sockets
+            .iter()
+            .filter(|socket| {
+                owners.get(&socket.inode).is_some_and(|key| {
+                    self.reader.read(key.pid, now).is_some_and(|proc| {
+                        proc.key == *key
+                            && proc
+                                .unit
+                                .as_deref()
+                                .is_some_and(|found| super::procinfo::normalize_unit(found) == expected)
+                    })
+                })
+            })
+            .map(|socket| socket.addr)
+            .collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        Ok(addresses)
     }
     /// Perform a fresh blocking scan and increment sequence only for visible changes.
     pub fn scan(&mut self) -> io::Result<Snapshot> {
@@ -238,6 +273,42 @@ mod tests {
         fn listening_tcp(&mut self) -> io::Result<Vec<RawSocket>> {
             Ok(self.0.clone())
         }
+    }
+    #[test]
+    fn discovery_unit_listeners_are_not_limited_by_snapshot_cap() {
+        use crate::runtime::seams::{PortProbe, ScannerProbe};
+        let t = Tree::new();
+        t.process(111, 1, 10, "unknown", "/", &["unknown"], "/test-app.service");
+        t.socket(111, 3, 123);
+        let root = ProcRoot::new(&t.0);
+        let uid = root.uid();
+        let mut sockets: Vec<_> = (1..=1000)
+            .map(|n| RawSocket {
+                addr: "127.0.0.1:39100".parse().unwrap(),
+                inode: 1000 + n,
+                uid: uid + n as u32,
+            })
+            .collect();
+        sockets.push(RawSocket {
+            addr: "127.0.0.1:39299".parse().unwrap(),
+            inode: 123,
+            uid,
+        });
+        let scanner = Scanner::with_source(
+            root,
+            CheckoutIndex::new([], "/home/test"),
+            HideSettings {
+                hide_defaults: false,
+                ..HideSettings::default()
+            },
+            Box::new(Fixed(sockets)),
+            SocketSourceKind::ProcNetTcp,
+        );
+        let probe = ScannerProbe::new(scanner);
+        assert_eq!(
+            probe.unit_listeners("test-app.service").unwrap(),
+            vec!["127.0.0.1:39299".parse().unwrap()]
+        );
     }
     #[test]
     fn discovery_foreign_docker_is_labelled_without_pid() {

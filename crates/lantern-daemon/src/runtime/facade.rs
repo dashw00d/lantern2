@@ -27,7 +27,7 @@ use super::launcher::{self, LaunchSpec};
 use super::ports::{PortAvailability, PortLeases, PortRange};
 use super::seams::{
     InstancePreparer, NoopPreparer, PortProbe, RouteTarget, RuntimeRouter, RuntimeStore, ServiceControl,
-    UnavailableRouter, UnavailableServices,
+    StoreError, UnavailableRouter, UnavailableServices,
 };
 use super::shell_env;
 use super::state_machine::{
@@ -207,12 +207,19 @@ struct ActiveOperation {
     id: OperationId,
     token: CancellationToken,
 }
+struct ReadinessTarget<'a> {
+    port: u16,
+    unit: &'a str,
+    started_at: Option<Timestamp>,
+    timeout: Duration,
+}
 #[derive(Debug)]
 struct ActorState {
     supervisor: SupervisorState,
     active: Option<ActiveOperation>,
     generation: u64,
     retry_streak: u32,
+    deploy_status_failures: u32,
     ready_at: Option<Instant>,
     deploy_started: bool,
     worktree_env: BTreeMap<String, String>,
@@ -237,6 +244,7 @@ impl Actor {
                 active: None,
                 generation: 0,
                 retry_streak: 0,
+                deploy_status_failures: 0,
                 ready_at: None,
                 deploy_started: false,
                 worktree_env: BTreeMap::new(),
@@ -264,6 +272,7 @@ struct Inner {
     env_sources: Mutex<Option<shell_env::SourceMtimes>>,
     shutdown: CancellationToken,
     restrict_journal_to_units: bool,
+    journal_since: i64,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -387,6 +396,8 @@ impl Runtime {
             env_sources: Mutex::new(initial_sources),
             shutdown: CancellationToken::new(),
             restrict_journal_to_units,
+            // Include the preceding second to cover journal timestamp granularity.
+            journal_since: Timestamp::now().as_second().saturating_sub(1),
         });
         tokio::spawn(poll_loop(Arc::downgrade(&inner)));
         tokio::spawn(journal_loop(Arc::downgrade(&inner)));
@@ -569,14 +580,27 @@ impl Runtime {
         generation: u64,
         f: impl FnOnce(&mut RuntimeState) + Send + 'static,
     ) -> bool {
+        match self.update_checked(id, actor, generation, f) {
+            Ok(applied) => applied,
+            Err(error) => {
+                tracing::error!(%error, %id, "runtime update failed");
+                true
+            }
+        }
+    }
+    fn update_checked(
+        &self,
+        id: &InstanceId,
+        actor: &Actor,
+        generation: u64,
+        f: impl FnOnce(&mut RuntimeState) + Send + 'static,
+    ) -> Result<bool, StoreError> {
         let guard = actor.state.lock().unwrap();
         if guard.generation != generation {
-            return false;
+            return Ok(false);
         }
-        if let Err(e) = self.inner.store.update_runtime(id, Box::new(f)) {
-            tracing::error!(%e, %id, "runtime update failed");
-        }
-        true
+        self.inner.store.update_runtime(id, Box::new(f))?;
+        Ok(true)
     }
     async fn operation_worker(
         &self,
@@ -983,6 +1007,9 @@ impl Runtime {
             || updated.serve != m.serve
             || updated.upstream_url != m.upstream_url
             || updated.run.cmd != m.run.cmd
+            || updated.run.pre_start != m.run.pre_start
+            || updated.run.post_stop != m.run.post_stop
+            || updated.run.startup_timeout != m.run.startup_timeout
             || updated.deploy.start != m.deploy.start
             || updated.deploy.restart != m.deploy.restart
             || updated.setup != m.setup
@@ -1020,7 +1047,8 @@ impl Runtime {
         if command.is_none() {
             self.event(id, actor, generation, Event::Prepared(StartKind::Site));
             if let Some(url) = &upstream {
-                self.wait_upstream(url, token).await?;
+                self.wait_upstream(url, token, self.startup_timeout(&instance))
+                    .await?;
             }
             let _guard = actor.io_lock.lock().await;
             if token.is_cancelled() {
@@ -1122,23 +1150,60 @@ impl Runtime {
         }
         drop(launch);
         handle.step("wait-ready");
+        let startup_timeout = self.startup_timeout(&instance);
         if let Some(url) = &upstream {
             let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
             if !local || is_deploy {
-                self.wait_upstream(url, token).await?;
+                self.wait_upstream(url, token, startup_timeout).await?;
             } else if let Some(port) = port {
-                self.wait_ready(id, actor, generation, token, port, &unit.unit)
-                    .await?;
+                self.wait_ready(
+                    id,
+                    actor,
+                    generation,
+                    token,
+                    ReadinessTarget {
+                        port,
+                        unit: &unit.unit,
+                        started_at: None,
+                        timeout: startup_timeout,
+                    },
+                )
+                .await?;
             }
         } else if requires_process_port {
             if is_deploy {
-                self.wait_any_port(port.unwrap_or(0), token).await?;
-            } else {
-                self.wait_ready(id, actor, generation, token, port.unwrap_or(0), &unit.unit)
+                self.wait_any_port(port.unwrap_or(0), token, startup_timeout)
                     .await?;
+            } else {
+                self.wait_ready(
+                    id,
+                    actor,
+                    generation,
+                    token,
+                    ReadinessTarget {
+                        port: port.unwrap_or(0),
+                        unit: &unit.unit,
+                        started_at: None,
+                        timeout: startup_timeout,
+                    },
+                )
+                .await?;
             }
         } else {
-            tokio::select! { () = token.cancelled() => return Err(Fault::new("cancelled", IssueCode::Other, "cancelled")), () = tokio::time::sleep(Duration::from_secs(self.inner.config.settings.runtime.settle_secs)) => {} }
+            let settle = Duration::from_secs(self.inner.config.settings.runtime.settle_secs);
+            tokio::select! { () = token.cancelled() => return Err(Fault::new("cancelled", IssueCode::Other, "cancelled")), () = tokio::time::sleep(settle.min(startup_timeout)) => {} }
+            if settle > startup_timeout {
+                if !is_deploy && let Err(error) = self.stop_failed_unit(actor, &unit.unit, generation).await {
+                    self.event(id, actor, generation, Event::CleanupFailed(error.issue));
+                    return Err(error);
+                }
+                self.event(id, actor, generation, Event::ReadinessTimeout);
+                return Err(Fault::new(
+                    "readiness_timeout",
+                    IssueCode::ReadinessTimeout,
+                    "process did not settle before startup timeout",
+                ));
+            }
         }
         {
             let _guard = actor.io_lock.lock().await;
@@ -1181,6 +1246,7 @@ impl Runtime {
             let mut s = actor.state.lock().unwrap();
             if s.generation == generation {
                 s.ready_at = Some(Instant::now());
+                s.deploy_status_failures = 0;
             }
         }
         let _ = self.inner.store.record_started(id);
@@ -1338,11 +1404,25 @@ impl Runtime {
                     self.inner.config.settings.ports.range_end,
                 ]);
             let range = PortRange { start, end };
+            let dns = self
+                .inner
+                .config
+                .settings
+                .dns
+                .listen
+                .parse::<SocketAddr>()
+                .map_err(|e| {
+                    Fault::new(
+                        "needs_config",
+                        IssueCode::ManifestInvalid,
+                        format!("invalid DNS listen address: {e}"),
+                    )
+                })?;
             let reserved = vec![
                 self.inner.config.settings.daemon.port,
                 self.inner.config.settings.proxy.http_port,
                 self.inner.config.settings.proxy.https_port,
-                5354,
+                dns.port(),
                 2019,
             ];
             let (port, table) = tokio::task::spawn_blocking(move || {
@@ -1515,8 +1595,12 @@ impl Runtime {
             variables: vars,
             env_file,
             run_env,
-            pre_start: None,
-            post_stop: None,
+            pre_start: (!oneshot)
+                .then(|| instance.manifest.run.pre_start.as_ref().map(|v| v.render_shell()))
+                .flatten(),
+            post_stop: (!oneshot)
+                .then(|| instance.manifest.run.post_stop.as_ref().map(|v| v.render_shell()))
+                .flatten(),
             command,
         };
         let text = launcher::try_render(&spec)
@@ -1545,6 +1629,24 @@ impl Runtime {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(io_fault)?;
         file.write_all(text.as_bytes()).map_err(io_fault)?;
+        let post_stop = if let Some(text) = launcher::try_render_post_stop(&spec)
+            .map_err(|e| Fault::new("needs_config", IssueCode::ManifestInvalid, e.to_string()))?
+        {
+            let path = run_dir.join(format!("{name}.post-stop.sh"));
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(io_fault)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(io_fault)?;
+            file.write_all(text.as_bytes()).map_err(io_fault)?;
+            Some(path)
+        } else {
+            None
+        };
         Ok((
             spec,
             UnitStart {
@@ -1553,7 +1655,7 @@ impl Runtime {
                 slice: self.inner.config.names.slice.clone(),
                 cwd,
                 script,
-                post_stop: None,
+                post_stop,
                 stop_timeout: Duration::from_secs(self.inner.config.settings.runtime.stop_timeout_secs),
             },
         ))
@@ -1565,17 +1667,38 @@ impl Runtime {
             .map_err(|e| Fault::new("probe_failed", IssueCode::Other, e.to_string()))?
             .map_err(io_fault)
     }
+    fn startup_timeout(&self, instance: &Instance) -> Duration {
+        Duration::from_secs(
+            instance
+                .manifest
+                .run
+                .startup_timeout
+                .map(u64::from)
+                .unwrap_or(self.inner.config.settings.runtime.startup_timeout_secs),
+        )
+    }
     async fn wait_ready(
         &self,
         id: &InstanceId,
         actor: &Arc<Actor>,
         generation: u64,
         token: &CancellationToken,
-        port: u16,
-        unit: &str,
+        target: ReadinessTarget<'_>,
     ) -> Result<(), Fault> {
-        let deadline =
-            Instant::now() + Duration::from_secs(self.inner.config.settings.runtime.startup_timeout_secs);
+        let ReadinessTarget {
+            port,
+            unit,
+            started_at,
+            timeout,
+        } = target;
+        let elapsed = started_at.map_or(Duration::ZERO, |start| {
+            let micros = Timestamp::now()
+                .as_microsecond()
+                .saturating_sub(start.as_microsecond())
+                .max(0);
+            Duration::from_micros(micros as u64)
+        });
+        let deadline = Instant::now() + timeout.saturating_sub(elapsed);
         let mut mismatch_since = None;
         let mut rx = actor.snapshot.subscribe();
         loop {
@@ -1671,9 +1794,13 @@ impl Runtime {
             .map_err(|e| Fault::new("systemd", IssueCode::SystemdUnavailable, e.to_string()))?;
         Ok(())
     }
-    async fn wait_any_port(&self, port: u16, token: &CancellationToken) -> Result<(), Fault> {
-        let deadline =
-            Instant::now() + Duration::from_secs(self.inner.config.settings.runtime.startup_timeout_secs);
+    async fn wait_any_port(
+        &self,
+        port: u16,
+        token: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<(), Fault> {
+        let deadline = Instant::now() + timeout;
         loop {
             if !matches!(self.probe(port, None).await?, PortBinding::Free) {
                 return Ok(());
@@ -1688,7 +1815,12 @@ impl Runtime {
             tokio::select! { ()=token.cancelled()=>return Err(Fault::new("cancelled",IssueCode::Other,"cancelled")), ()=tokio::time::sleep(self.inner.config.readiness_interval)=>{} }
         }
     }
-    async fn wait_upstream(&self, url: &reqwest::Url, token: &CancellationToken) -> Result<(), Fault> {
+    async fn wait_upstream(
+        &self,
+        url: &reqwest::Url,
+        token: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<(), Fault> {
         let host = url
             .host_str()
             .ok_or_else(|| {
@@ -1706,10 +1838,9 @@ impl Runtime {
                 "upstream URL lacks port",
             )
         })?;
-        let deadline =
-            Instant::now() + Duration::from_secs(self.inner.config.settings.runtime.startup_timeout_secs);
+        let deadline = Instant::now() + timeout;
         loop {
-            let connected = tokio::select! { ()=token.cancelled()=>return Err(Fault::new("cancelled",IssueCode::Other,"cancelled")), r=tokio::time::timeout(Duration::from_secs(3),tokio::net::TcpStream::connect((host.as_str(),port)))=>r.is_ok_and(|v|v.is_ok()) };
+            let connected = tokio::select! { ()=token.cancelled()=>return Err(Fault::new("cancelled",IssueCode::Other,"cancelled")), r=tokio::time::timeout(Duration::from_secs(3).min(deadline.saturating_duration_since(Instant::now())),tokio::net::TcpStream::connect((host.as_str(),port)))=>r.is_ok_and(|v|v.is_ok()) };
             if connected {
                 return Ok(());
             }
@@ -1872,7 +2003,7 @@ impl Runtime {
                     break;
                 };
                 let started = Instant::now();
-                let result = rt.health_probe(&inst, &client).await;
+                let (result, deploy_alive) = rt.health_probe(&inst, &client).await;
                 let ok = result.is_ok();
                 failures = if ok {
                     0
@@ -1910,7 +2041,9 @@ impl Runtime {
                     );
                     h.recent.truncate(10);
                 });
-                if state == HealthState::Failing {
+                if rt.deploy_liveness(&inst, &actor, generation, deploy_alive).await {
+                    break;
+                } else if state == HealthState::Failing && deploy_alive != Some(false) {
                     rt.event(&id, &actor, generation, Event::HealthFailed);
                 } else if ok {
                     rt.event(&id, &actor, generation, Event::HealthRecovered);
@@ -1918,7 +2051,31 @@ impl Runtime {
             }
         });
     }
-    async fn health_probe(&self, inst: &Instance, client: &reqwest::Client) -> Result<Option<u16>, String> {
+    async fn health_probe(
+        &self,
+        inst: &Instance,
+        client: &reqwest::Client,
+    ) -> (Result<Option<u16>, String>, Option<bool>) {
+        if inst.manifest.deploy.start.is_some() && inst.manifest.deploy.status.is_some() {
+            match self.deploy_status(&inst.id).await {
+                Ok(status) if !status.alive => {
+                    return (
+                        Err(format!("deploy.status exited {:?}", status.exit_code)),
+                        Some(false),
+                    );
+                }
+                Ok(_) if inst.manifest.health_endpoint.is_none() => return (Ok(None), Some(true)),
+                Ok(_) => return (self.ordinary_health_probe(inst, client).await, Some(true)),
+                Err(error) => return (Err(error.to_string()), None),
+            }
+        }
+        (self.ordinary_health_probe(inst, client).await, None)
+    }
+    async fn ordinary_health_probe(
+        &self,
+        inst: &Instance,
+        client: &reqwest::Client,
+    ) -> Result<Option<u16>, String> {
         let health = &self.inner.config.settings.health;
         if let Some(endpoint) = &inst.manifest.health_endpoint {
             let base = inst
@@ -1957,12 +2114,6 @@ impl Runtime {
                 },
                 Err(e) => Err(e.to_string()),
             }
-        } else if inst.manifest.deploy.start.is_some() && inst.manifest.deploy.status.is_some() {
-            match self.deploy_status(&inst.id).await {
-                Ok(status) if status.alive => Ok(None),
-                Ok(status) => Err(format!("deploy.status exited {:?}", status.exit_code)),
-                Err(e) => Err(e.to_string()),
-            }
         } else if inst.manifest.deploy.start.is_some() {
             match inst.runtime.port {
                 Some(port) => match self.probe(port, None).await {
@@ -1988,6 +2139,55 @@ impl Runtime {
         } else {
             Ok(None)
         }
+    }
+    async fn deploy_liveness(
+        &self,
+        inst: &Instance,
+        actor: &Arc<Actor>,
+        generation: u64,
+        alive: Option<bool>,
+    ) -> bool {
+        let Some(alive) = alive else {
+            return false;
+        };
+        let _io = actor.io_lock.lock().await;
+        let crashed = {
+            let mut state = actor.state.lock().unwrap();
+            if state.generation != generation
+                || !matches!(
+                    state.supervisor.status,
+                    InstanceStatus::Running | InstanceStatus::Unhealthy
+                )
+            {
+                return false;
+            }
+            state.deploy_status_failures = if alive {
+                0
+            } else {
+                state.deploy_status_failures.saturating_add(1)
+            };
+            state.deploy_status_failures >= 3
+        };
+        if crashed {
+            let row = UnitSnapshot {
+                unit: String::new(),
+                load: Load::Loaded,
+                active: Active::Failed,
+                sub: "failed".into(),
+                result: "deploy.status reported the process unavailable".into(),
+                main_pid: None,
+                exit_code: None,
+                exit_kind: ExitCodeKind::Unknown,
+                started_at: inst.runtime.started_at,
+                invocation_id: None,
+                cgroup: None,
+            };
+            self.handle_exit(&inst.id, actor, generation, &row, false);
+            if let Err(error) = self.inner.router.unpublish(&inst.id).await {
+                tracing::warn!(id = %inst.id, %error, "failed to unpublish crashed deploy");
+            }
+        }
+        crashed
     }
     /// Run an immediate health probe for a running instance and publish its sample.
     pub async fn check_health_now(
@@ -2016,7 +2216,7 @@ impl Runtime {
             .build()
             .map_err(|e| RuntimeError::Other(e.to_string()))?;
         let started = Instant::now();
-        let result = self.health_probe(&inst, &client).await;
+        let (result, deploy_alive) = self.health_probe(&inst, &client).await;
         let latency = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
         let ok = result.is_ok();
         let status = result.as_ref().ok().copied().flatten();
@@ -2037,28 +2237,36 @@ impl Runtime {
         } else {
             HealthState::Unknown
         };
-        if !self.update(id, &actor, generation, move |r| {
-            let h = &mut r.health;
-            h.state = state;
-            h.checked_at = Some(Timestamp::now());
-            h.latency_ms = Some(latency);
-            h.consecutive_failures = failures;
-            h.last_error = error.clone();
-            h.recent.insert(
-                0,
-                HealthSample {
-                    at: Timestamp::now(),
-                    ok,
-                    status,
-                    latency_ms: Some(latency),
-                    error,
-                },
-            );
-            h.recent.truncate(10);
-        }) {
+        if !self
+            .update_checked(id, &actor, generation, move |r| {
+                let h = &mut r.health;
+                h.state = state;
+                h.checked_at = Some(Timestamp::now());
+                h.latency_ms = Some(latency);
+                h.consecutive_failures = failures;
+                h.last_error = error.clone();
+                h.recent.insert(
+                    0,
+                    HealthSample {
+                        at: Timestamp::now(),
+                        ok,
+                        status,
+                        latency_ms: Some(latency),
+                        error,
+                    },
+                );
+                h.recent.truncate(10);
+            })
+            .map_err(|error| RuntimeError::Other(format!("health state publication failed: {error}")))?
+        {
             return Err(RuntimeError::Other("instance changed during health check".into()));
         }
-        if state == HealthState::Failing {
+        if self
+            .deploy_liveness(&inst, &actor, generation, deploy_alive)
+            .await
+        {
+            // The crash transition and retry are handled by deploy_liveness.
+        } else if state == HealthState::Failing && deploy_alive != Some(false) {
             self.event(id, &actor, generation, Event::HealthFailed);
         } else if ok {
             self.event(id, &actor, generation, Event::HealthRecovered);
@@ -2208,26 +2416,29 @@ impl Runtime {
                 return Err(RuntimeError::Other(message));
             }
         };
-        let output = tokio::process::Command::new("journalctl")
-            .args([
-                "--user",
-                "--no-pager",
-                "--output=cat",
-                "--lines=1000",
-                "--user-unit",
-                &unit,
-            ])
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| RuntimeError::Other(e.to_string()))?;
-        if !output.status.success() {
-            return Err(RuntimeError::Other(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
+        // The unit can exit just before journald makes its last messages visible.
+        // Retry an empty exact-unit query briefly; silent commands remain valid.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let output = tokio::process::Command::new("journalctl")
+                .args(["--user", "--no-pager", "--output=cat", "--lines=1000"])
+                .arg(format!("_SYSTEMD_USER_SLICE={}", self.inner.config.names.slice))
+                .arg(format!("_SYSTEMD_USER_UNIT={unit}"))
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| RuntimeError::Other(e.to_string()))?;
+            if !output.status.success() {
+                return Err(RuntimeError::Other(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ));
+            }
+            if !output.stdout.is_empty() || Instant::now() >= deadline {
+                let bytes = &output.stdout[..output.stdout.len().min(1024 * 1024)];
+                return Ok((result, String::from_utf8_lossy(bytes).into_owned()));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let bytes = &output.stdout[..output.stdout.len().min(1024 * 1024)];
-        Ok((result, String::from_utf8_lossy(bytes).into_owned()))
     }
     /// Run configured deploy logs and return its bounded journal output.
     pub async fn deploy_logs(&self, id: &InstanceId) -> Result<String, RuntimeError> {
@@ -2389,14 +2600,18 @@ impl Runtime {
     }
     /// Read recent journal history for an instance from the configured slice.
     pub async fn log_history(&self, id: &InstanceId, q: HistoryQuery) -> Result<Vec<LogLine>, RuntimeError> {
-        let count = q.limit.min(10000).to_string();
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let count = q.limit.min(10000);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let mut args = vec![
             "--user".to_owned(),
             "--output=json".into(),
             "--all".into(),
             "--no-pager".into(),
-            "--lines".into(),
-            count,
+            "--reverse".into(),
+            "--lines=all".into(),
         ];
         if self.inner.restrict_journal_to_units {
             let mut units = vec![self.inner.config.names.instance(id)];
@@ -2414,8 +2629,55 @@ impl Runtime {
         } else {
             args.push(format!("_SYSTEMD_USER_SLICE={}", self.inner.config.names.slice));
         }
-        let output = tokio::process::Command::new("journalctl")
+        let mut child = tokio::process::Command::new("journalctl")
             .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        let stdout = child.stdout.take().expect("piped journal stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let mut result = Vec::with_capacity(count);
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| RuntimeError::Other(e.to_string()))?
+        {
+            if let Ok(Some(entry)) = journal::parse_line(&line, &self.inner.config.names)
+                && &entry.line.instance == id
+            {
+                result.push(entry.line);
+                if result.len() == count {
+                    // The newest matching entries have been found; no need to read the rest of the slice.
+                    let _ = child.kill().await;
+                    result.reverse();
+                    return Ok(result);
+                }
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        if !output.status.success() {
+            return Err(RuntimeError::Other(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        result.reverse();
+        Ok(result)
+    }
+    async fn backfill_unit_logs(&self, id: &InstanceId, unit: &str) -> Result<(), RuntimeError> {
+        let limit = self.inner.config.settings.logs.ring_lines.min(10000);
+        if limit == 0 {
+            return Ok(());
+        }
+        let output = tokio::process::Command::new("journalctl")
+            .args(["--user", "--output=json", "--all", "--no-pager"])
+            .arg(format!("--lines={limit}"))
+            .arg(format!("_SYSTEMD_USER_SLICE={}", self.inner.config.names.slice))
+            .arg(format!("_SYSTEMD_USER_UNIT={unit}"))
             .kill_on_drop(true)
             .output()
             .await
@@ -2425,12 +2687,12 @@ impl Runtime {
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout)
+        let entries = String::from_utf8_lossy(&output.stdout)
             .lines()
-            .filter_map(|s| journal::parse_line(s, &self.inner.config.names).ok().flatten())
-            .map(|j| j.line)
-            .filter(|l| &l.instance == id)
-            .collect())
+            .filter_map(|line| journal::parse_line(line, &self.inner.config.names).ok().flatten())
+            .collect();
+        self.inner.logs.backfill(id, entries);
+        Ok(())
     }
     /// Capture and persist the shell environment, falling back to manager environment on failure.
     pub async fn refresh_shell_env(&self) -> Result<EnvReport, RuntimeError> {
@@ -2664,6 +2926,9 @@ impl Runtime {
                 });
                 actor.snapshot.send_replace(Some(row.clone()));
                 report.adopted.push(id.clone());
+                if let Err(error) = self.backfill_unit_logs(id, &name).await {
+                    report.errors.push(format!("{id}: journal backfill: {error}"));
+                }
                 if ready {
                     let upstream = binding.map(|(_, addr)| addr);
                     if let Err(error) = self.publish_route(&instance, upstream).await {
@@ -2672,13 +2937,25 @@ impl Runtime {
                     }
                     self.start_health(id.clone(), actor.clone(), generation);
                 } else if let Some(port) = instance.runtime.port {
+                    let timeout = self.startup_timeout(&instance);
                     let rt = self.clone();
                     let id = id.clone();
                     let actor = actor.clone();
                     tokio::spawn(async move {
                         let token = CancellationToken::new();
                         if rt
-                            .wait_ready(&id, &actor, generation, &token, port, &name)
+                            .wait_ready(
+                                &id,
+                                &actor,
+                                generation,
+                                &token,
+                                ReadinessTarget {
+                                    port,
+                                    unit: &name,
+                                    started_at: row.started_at,
+                                    timeout,
+                                },
+                            )
                             .await
                             .is_ok()
                         {
@@ -2723,7 +3000,7 @@ impl Runtime {
                             let token = CancellationToken::new();
                             match tokio::time::timeout(
                                 Duration::from_secs(3),
-                                self.wait_upstream(&url, &token),
+                                self.wait_upstream(&url, &token, self.startup_timeout(&instance)),
                             )
                             .await
                             {
@@ -3073,8 +3350,9 @@ async fn journal_loop(weak: Weak<Inner>) {
         let names = inner.config.names.clone();
         let hub = inner.logs.clone();
         let shutdown = inner.shutdown.clone();
+        let since = inner.journal_since;
         drop(inner);
-        journal_loop_slice(names, hub, shutdown).await;
+        journal_loop_slice(names, hub, shutdown, since).await;
         return;
     }
     drop(inner);
@@ -3090,6 +3368,7 @@ async fn journal_loop(weak: Weak<Inner>) {
         }
         let names = inner.config.names.clone();
         let hub = inner.logs.clone();
+        let since = inner.journal_since;
         let mut units: Vec<_> = inner
             .store
             .instances()
@@ -3117,7 +3396,8 @@ async fn journal_loop(weak: Weak<Inner>) {
         if let Some(cursor) = cursor.as_ref() {
             args.push(format!("--after-cursor={cursor}"));
         } else {
-            args.push("--lines=0".into());
+            args.push("--lines=all".into());
+            args.push(format!("--since=@{since}"));
         }
         for (index, unit) in units.iter().enumerate() {
             if index > 0 {
@@ -3142,8 +3422,8 @@ async fn journal_loop(weak: Weak<Inner>) {
                     match line {
                         Ok(Some(line)) => {
                             if let Ok(Some(entry)) = journal::parse_line(&line, &names) {
-                                cursor = entry.cursor;
-                                hub.push(entry.line);
+                                cursor.clone_from(&entry.cursor);
+                                hub.push_journal(entry);
                             }
                         }
                         _ => break,
@@ -3155,7 +3435,7 @@ async fn journal_loop(weak: Weak<Inner>) {
         tokio::select! { ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(Duration::from_millis(250))=>{} }
     }
 }
-async fn journal_loop_slice(names: UnitNames, hub: Arc<LogHub>, shutdown: CancellationToken) {
+async fn journal_loop_slice(names: UnitNames, hub: Arc<LogHub>, shutdown: CancellationToken, since: i64) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut cursor: Option<String> = None;
     loop {
@@ -3170,7 +3450,8 @@ async fn journal_loop_slice(names: UnitNames, hub: Arc<LogHub>, shutdown: Cancel
             }
         };
         if cursor.is_none() {
-            args.push("--lines=0".into());
+            args.push("--lines=all".into());
+            args.push(format!("--since=@{since}"));
         }
         let child = tokio::process::Command::new("journalctl")
             .args(args)
@@ -3186,8 +3467,8 @@ async fn journal_loop_slice(names: UnitNames, hub: Arc<LogHub>, shutdown: Cancel
                     match line {
                         Ok(Some(line)) => {
                             if let Ok(Some(entry)) = journal::parse_line(&line, &names) {
-                                cursor = entry.cursor;
-                                hub.push(entry.line);
+                                cursor.clone_from(&entry.cursor);
+                                hub.push_journal(entry);
                             }
                         }
                         _ => break,

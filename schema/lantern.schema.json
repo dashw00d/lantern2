@@ -443,6 +443,16 @@
             "string",
             "null"
           ]
+        },
+        "startup_timeout": {
+          "default": null,
+          "description": "Positive readiness timeout in seconds, overriding runtime settings.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "type": "object"

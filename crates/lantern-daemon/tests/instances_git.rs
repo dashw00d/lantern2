@@ -106,6 +106,8 @@ struct FakeStore {
     manifest: Mutex<Option<Arc<ResolvedManifest>>>,
     statuses: Mutex<BTreeMap<InstanceId, InstanceStatus>>,
     port: Mutex<Option<u16>>,
+    stale: Mutex<BTreeMap<InstanceId, bool>>,
+    fail_flush: std::sync::atomic::AtomicBool,
 }
 impl InstanceStore for FakeStore {
     fn project(&self, id: &ProjectId) -> Result<Option<ProjectConfig>, String> {
@@ -157,6 +159,19 @@ impl InstanceStore for FakeStore {
     }
     fn port(&self, _: &InstanceId) -> Result<Option<u16>, String> {
         Ok(*self.port.lock().unwrap())
+    }
+    fn set_setup_stale(&self, id: &InstanceId, stale: bool) -> Result<(), String> {
+        self.stale.lock().unwrap().insert(id.clone(), stale);
+        Ok(())
+    }
+    fn flush(&self) -> lantern_daemon::instances::InstanceStoreFlushFuture<'_> {
+        Box::pin(async move {
+            if self.fail_flush.load(Ordering::SeqCst) {
+                Err("fake flush failure".into())
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 #[derive(Default)]
@@ -641,6 +656,197 @@ async fn instances_setup_stale_and_copy_guards() {
 }
 
 #[tokio::test]
+async fn instances_tick_publishes_stale_without_git_metadata_change() {
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    let common = root.join(".git");
+    service.tick(&common, false).await.unwrap();
+    service.tick(&common, false).await.unwrap();
+    let id = InstanceId::primary(&ProjectId::parse("myapp").unwrap());
+    assert_eq!(store.stale.lock().unwrap().get(&id), Some(&false));
+    let lock = root.join("apps/web/package-lock.json");
+    fs::write(&lock, "changed").unwrap();
+    assert!(!service.tick(&common, false).await.unwrap());
+    assert_eq!(store.stale.lock().unwrap().get(&id), Some(&true));
+    fs::remove_file(lock).unwrap();
+    service.tick(&common, false).await.unwrap();
+    assert_eq!(store.stale.lock().unwrap().get(&id), Some(&false));
+}
+
+#[tokio::test]
+async fn instances_missing_copy_and_link_patterns_warn_in_progress() {
+    let t = Temp::new();
+    let (root, _, _, _, service) = fixture(&t, "id: myapp\nrun: {cmd: 'echo ok'}\nsetup: []\nworktree: {copy: [missing.env], link: [missing-cache]}\n").await;
+    git_cmd(&root, &["branch", "missing-patterns"]);
+    let tracker = OperationTracker::new(EventBus::new());
+    let op = tracker.begin(OperationKind::Prepare, None);
+    let id = op.id().clone();
+    service
+        .run_branch(req(BranchTarget::Branch("missing-patterns".into())), &op)
+        .await
+        .unwrap();
+    let snapshot = tracker.get(&id).unwrap();
+    let steps = snapshot
+        .steps
+        .iter()
+        .map(|step| step.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.contains("copy") && step.contains("missing.env")),
+        "{steps:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.contains("link") && step.contains("missing-cache")),
+        "{steps:?}"
+    );
+    op.finish(OpOutcome::Succeeded(None));
+}
+
+#[tokio::test]
+async fn instances_recover_interrupted_creation_without_claiming_user_data() {
+    use lantern_core::{model::CheckoutKind, state::CheckoutPhase};
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    git_cmd(&root, &["branch", "interrupted"]);
+    let op = operation();
+    let created = service
+        .run_branch_unprepared(req(BranchTarget::Branch("interrupted".into())), &op)
+        .await
+        .unwrap();
+    let mut record = store
+        .records
+        .lock()
+        .unwrap()
+        .get(&created.instance)
+        .unwrap()
+        .clone();
+    record.checkout.phase = CheckoutPhase::Creating;
+    store.upsert(&created.instance, record.clone()).unwrap();
+
+    let ambiguous_id = InstanceId::parse("myapp@ambiguous").unwrap();
+    let ambiguous_root = t.0.join("managed/mono/ambiguous");
+    fs::create_dir_all(ambiguous_root.join("apps/web")).unwrap();
+    fs::write(ambiguous_root.join("user-data"), "keep").unwrap();
+    record.checkout.path = ambiguous_root.join("apps/web");
+    store.upsert(&ambiguous_id, record).unwrap();
+
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let records = store.records.lock().unwrap();
+    let recovered = records.get(&created.instance).unwrap();
+    assert_eq!(recovered.checkout.phase, CheckoutPhase::Ready);
+    assert_eq!(recovered.checkout.kind, CheckoutKind::Worktree);
+    assert!(!records.contains_key(&ambiguous_id));
+    assert_eq!(
+        fs::read_to_string(ambiguous_root.join("user-data")).unwrap(),
+        "keep"
+    );
+    op.finish(OpOutcome::Succeeded(None));
+}
+
+#[tokio::test]
+async fn instances_creation_waits_for_durable_intent() {
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    git_cmd(&root, &["branch", "flush-fail"]);
+    store.fail_flush.store(true, Ordering::SeqCst);
+    let op = operation();
+    let result = service
+        .run_branch_unprepared(req(BranchTarget::Branch("flush-fail".into())), &op)
+        .await;
+    assert!(result.unwrap_err().to_string().contains("flush"));
+    assert!(!t.0.join("managed/mono/flush-fail").exists());
+    assert!(
+        !store
+            .records
+            .lock()
+            .unwrap()
+            .contains_key(&InstanceId::parse("myapp@flush-fail").unwrap())
+    );
+    op.finish(OpOutcome::Cancelled);
+}
+
+#[tokio::test]
+async fn instances_cancelled_git_creation_retains_completed_checkout_as_user_owned() {
+    use lantern_core::{model::CheckoutKind, state::CheckoutPhase};
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(marker) = std::env::var_os("LANTERN_GIT_CANCEL_MARKER") {
+        let t = Temp::new();
+        let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+        git_cmd(&root, &["branch", "cancel-git"]);
+        let service = Arc::new(service);
+        let tracker = OperationTracker::new(EventBus::new());
+        let op = tracker.begin(OperationKind::Prepare, None);
+        let op_id = op.id().clone();
+        let task = tokio::spawn(async move {
+            let result = service
+                .run_branch_unprepared(req(BranchTarget::Branch("cancel-git".into())), &op)
+                .await;
+            op.finish(OpOutcome::Cancelled);
+            result
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !Path::new(&marker).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(tracker.cancel(&op_id));
+        assert!(task.await.unwrap().is_err());
+        let id = InstanceId::parse("myapp@cancel-git").unwrap();
+        let records = store.records.lock().unwrap();
+        let record = records
+            .get(&id)
+            .expect("completed checkout must remain discoverable");
+        assert_eq!(record.checkout.phase, CheckoutPhase::Ready);
+        assert_eq!(record.checkout.kind, CheckoutKind::Worktree);
+        assert!(record.checkout.path.join("app.txt").exists());
+        return;
+    }
+    let t = Temp::new();
+    let wrapper = t.0.join("git");
+    fs::write(
+        &wrapper,
+        r##"#!/usr/bin/python3
+import os, subprocess, sys, time
+args = sys.argv[1:]
+if 'worktree' in args and 'add' in args:
+    result = subprocess.run(['/usr/bin/git'] + args)
+    if result.returncode: sys.exit(result.returncode)
+    open(os.environ['LANTERN_GIT_CANCEL_MARKER'], 'w').close()
+    time.sleep(60)
+    sys.exit(0)
+os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "instances_cancelled_git_creation_retains_completed_checkout_as_user_owned",
+            "--nocapture",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", t.0.display()))
+        .env("LANTERN_GIT_CANCEL_MARKER", t.0.join("created"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn instances_git_guard_copied_directory_and_running_sibling() {
     let t = Temp::new();
     let yaml = "id: myapp\nrun: {cmd: 'echo ok'}\nsetup: []\nworktree: {copy: [fixtures]}\n";
@@ -815,6 +1021,56 @@ async fn instances_git_user_worktree_inside_managed_directory_stays_user_owned()
         .unwrap();
     assert!(result.forgotten);
     assert!(path.is_dir());
+}
+
+#[tokio::test]
+async fn instances_prune_only_missing_managed_worktree() {
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    git_cmd(&root, &["branch", "managed-gone"]);
+    git_cmd(&root, &["branch", "user-gone"]);
+    let user = t.0.join("user-wt");
+    git_cmd(
+        &root,
+        &["worktree", "add", "--", user.to_str().unwrap(), "user-gone"],
+    );
+    let op = operation();
+    let managed = service
+        .run_branch_unprepared(req(BranchTarget::Branch("managed-gone".into())), &op)
+        .await
+        .unwrap();
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let record = store
+        .records
+        .lock()
+        .unwrap()
+        .get(&managed.instance)
+        .unwrap()
+        .clone();
+    let managed_root = record
+        .checkout
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::remove_dir_all(&managed_root).unwrap();
+    fs::remove_dir_all(&user).unwrap();
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let rows = Git::detect()
+        .await
+        .unwrap()
+        .repo(root.join(".git"))
+        .list_worktrees()
+        .await
+        .unwrap();
+    assert!(!rows.iter().any(|row| row.path == managed_root));
+    assert!(rows.iter().any(|row| row.path == user && row.prunable.is_some()));
+    let records = store.records.lock().unwrap();
+    assert!(!records.contains_key(&managed.instance));
+    assert!(records.contains_key(&InstanceId::parse("myapp@user-gone").unwrap()));
+    op.finish(OpOutcome::Succeeded(None));
 }
 
 #[tokio::test]
