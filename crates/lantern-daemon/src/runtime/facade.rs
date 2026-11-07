@@ -27,7 +27,7 @@ use super::launcher::{self, LaunchSpec};
 use super::ports::{PortAvailability, PortLeases, PortRange};
 use super::seams::{
     InstancePreparer, NoopPreparer, PortProbe, RouteTarget, RuntimeRouter, RuntimeStore, ServiceControl,
-    UnavailableRouter, UnavailableServices,
+    StoreError, UnavailableRouter, UnavailableServices,
 };
 use super::shell_env;
 use super::state_machine::{
@@ -580,14 +580,27 @@ impl Runtime {
         generation: u64,
         f: impl FnOnce(&mut RuntimeState) + Send + 'static,
     ) -> bool {
+        match self.update_checked(id, actor, generation, f) {
+            Ok(applied) => applied,
+            Err(error) => {
+                tracing::error!(%error, %id, "runtime update failed");
+                true
+            }
+        }
+    }
+    fn update_checked(
+        &self,
+        id: &InstanceId,
+        actor: &Actor,
+        generation: u64,
+        f: impl FnOnce(&mut RuntimeState) + Send + 'static,
+    ) -> Result<bool, StoreError> {
         let guard = actor.state.lock().unwrap();
         if guard.generation != generation {
-            return false;
+            return Ok(false);
         }
-        if let Err(e) = self.inner.store.update_runtime(id, Box::new(f)) {
-            tracing::error!(%e, %id, "runtime update failed");
-        }
-        true
+        self.inner.store.update_runtime(id, Box::new(f))?;
+        Ok(true)
     }
     async fn operation_worker(
         &self,
@@ -2211,25 +2224,28 @@ impl Runtime {
         } else {
             HealthState::Unknown
         };
-        if !self.update(id, &actor, generation, move |r| {
-            let h = &mut r.health;
-            h.state = state;
-            h.checked_at = Some(Timestamp::now());
-            h.latency_ms = Some(latency);
-            h.consecutive_failures = failures;
-            h.last_error = error.clone();
-            h.recent.insert(
-                0,
-                HealthSample {
-                    at: Timestamp::now(),
-                    ok,
-                    status,
-                    latency_ms: Some(latency),
-                    error,
-                },
-            );
-            h.recent.truncate(10);
-        }) {
+        if !self
+            .update_checked(id, &actor, generation, move |r| {
+                let h = &mut r.health;
+                h.state = state;
+                h.checked_at = Some(Timestamp::now());
+                h.latency_ms = Some(latency);
+                h.consecutive_failures = failures;
+                h.last_error = error.clone();
+                h.recent.insert(
+                    0,
+                    HealthSample {
+                        at: Timestamp::now(),
+                        ok,
+                        status,
+                        latency_ms: Some(latency),
+                        error,
+                    },
+                );
+                h.recent.truncate(10);
+            })
+            .map_err(|error| RuntimeError::Other(format!("health state publication failed: {error}")))?
+        {
             return Err(RuntimeError::Other("instance changed during health check".into()));
         }
         if self

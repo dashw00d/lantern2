@@ -61,6 +61,7 @@ struct Store {
     changes: Mutex<Vec<(InstanceId, InstanceStatus)>>,
     conflict_once: std::sync::atomic::AtomicBool,
     conflict_port: std::sync::atomic::AtomicU16,
+    fail_runtime_update: std::sync::atomic::AtomicBool,
 }
 impl Store {
     fn insert(&self, name: &str, root: &Path, cmd: &str, deps: &[&str]) -> InstanceId {
@@ -161,6 +162,9 @@ impl RuntimeStore for Store {
         id: &InstanceId,
         f: Box<dyn FnOnce(&mut RuntimeState) + Send>,
     ) -> Result<(), StoreError> {
+        if self.fail_runtime_update.load(Ordering::SeqCst) {
+            return Err(StoreError("injected publication failure".into()));
+        }
         let mut map = self.instances.lock().unwrap();
         let i = map.get_mut(id).ok_or_else(|| StoreError("missing".into()))?;
         let before = i.runtime.status;
@@ -1316,6 +1320,36 @@ async fn runtime_health_failure_and_recovery_updates_status() {
     })
     .await;
     assert!(recovered.health.recent.len() >= 2);
+}
+
+#[tokio::test]
+async fn runtime_health_check_returns_registry_publication_failure() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let id = store.insert("health-publish", &temp.0, "server ${PORT}", &[]);
+    let backend = Arc::new(FakeSystemd::default());
+    backend.set_auto_start(true);
+    let rt = Runtime::with_scoped_journal(
+        config(&temp),
+        store.clone(),
+        Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+        backend,
+        OperationTracker::new(EventBus::new()),
+        lantern_daemon::runtime::RuntimeAdapters {
+            preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+            router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+            services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+        },
+        true,
+    );
+    assert_eq!(
+        completed(&rt.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    store.fail_runtime_update.store(true, Ordering::SeqCst);
+    let error = rt.check_health_now(&id).await.unwrap_err().to_string();
+    assert!(error.contains("injected publication failure"), "{error}");
+    rt.shutdown_background();
 }
 
 #[tokio::test]
