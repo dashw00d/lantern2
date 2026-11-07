@@ -4,3 +4,4 @@ pub mod source;
 
 mod owners;
 pub mod procinfo;
+mod redact;
