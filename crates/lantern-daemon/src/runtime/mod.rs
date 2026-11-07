@@ -5,3 +5,6 @@ pub mod launcher;
 
 /// Login-shell environment capture and cache.
 pub mod shell_env;
+
+/// systemd user-unit boundary and test fake.
+pub mod systemd;
