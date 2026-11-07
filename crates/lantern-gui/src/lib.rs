@@ -5,6 +5,7 @@ mod fonts;
 mod logs;
 mod model;
 mod platform;
+mod prefs;
 
 use lantern_cli::args::GuiArgs;
 

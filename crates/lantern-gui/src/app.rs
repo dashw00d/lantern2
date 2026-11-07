@@ -2,6 +2,7 @@ use crate::fonts::Fonts;
 use crate::logs::{LogBuffer, ROW_HEIGHT};
 use crate::model::{Connection, Effect, Mirror};
 use crate::platform::{UiEvent, UiReceiver, tray::TraySnapshot};
+use crate::prefs::{GuiPrefs, PrefsStore, ThemePreference};
 use futures_util::StreamExt;
 use iced::{
     Element, Font, Length, Subscription, Task, Theme, theme,
@@ -29,8 +30,25 @@ pub(crate) fn run(
     tray_tx: tokio::sync::watch::Sender<TraySnapshot>,
 ) -> iced::Result {
     let ui_key = UiKey(Arc::new(Mutex::new(Some(ui_rx))));
+    let prefs_store = PrefsStore::from_env();
+    let (prefs, prefs_error) = match prefs_store.as_ref().map(PrefsStore::load).transpose() {
+        Ok(prefs) => (prefs.unwrap_or_default(), None),
+        Err(error) => (
+            GuiPrefs::default(),
+            Some(format!("Could not load GUI preferences: {error}")),
+        ),
+    };
     iced::daemon(
-        move || App::boot(&args, fonts, client.clone(), ui_key.clone(), tray_tx.clone()),
+        move || {
+            App::boot(
+                &args,
+                fonts,
+                client.clone(),
+                ui_key.clone(),
+                tray_tx.clone(),
+                (prefs_store.clone(), prefs.clone(), prefs_error.clone()),
+            )
+        },
         App::update,
         App::view,
     )
@@ -91,6 +109,9 @@ struct App {
     ui_key: UiKey,
     tray_tx: tokio::sync::watch::Sender<TraySnapshot>,
     tray_available: Option<bool>,
+    prefs: GuiPrefs,
+    prefs_store: Option<PrefsStore>,
+    prefs_saving: bool,
 }
 #[derive(Debug, Clone)]
 enum Message {
@@ -99,7 +120,7 @@ enum Message {
     Theme(theme::Mode),
     Stream(Box<StreamEvent>),
     Command(Command),
-    CommandDone(InstanceId, Result<OperationResponse, String>),
+    CommandDone(InstanceId, Box<Result<OperationResponse, String>>),
     Tick(Instant),
     Filter(String),
     Dismiss(usize),
@@ -114,6 +135,8 @@ enum Message {
     LogScrolled(scrollable::Viewport),
     LogFollow,
     Ui(UiEvent),
+    CycleTheme,
+    PrefsSaved(Result<(), String>),
 }
 impl App {
     fn boot(
@@ -122,7 +145,9 @@ impl App {
         client: Client,
         ui_key: UiKey,
         tray_tx: tokio::sync::watch::Sender<TraySnapshot>,
+        initial_prefs: (Option<PrefsStore>, GuiPrefs, Option<String>),
     ) -> (Self, Task<Message>) {
+        let (prefs_store, prefs, prefs_error) = initial_prefs;
         let mut app = Self {
             window: None,
             mode: theme::Mode::Dark,
@@ -130,7 +155,7 @@ impl App {
             client,
             mirror: Mirror::default(),
             pending: BTreeMap::new(),
-            toasts: vec![],
+            toasts: prefs_error.into_iter().collect(),
             filter: String::new(),
             why: None,
             stream_generation: 0,
@@ -142,6 +167,9 @@ impl App {
             ui_key,
             tray_tx,
             tray_available: None,
+            prefs,
+            prefs_store,
+            prefs_saving: false,
         };
         let open = if args.tray { Task::none() } else { app.open() };
         (
@@ -220,35 +248,35 @@ impl App {
                 UiEvent::Quit => iced::exit(),
             },
             Message::Stream(event) => {
-                if matches!(&*event, StreamEvent::Connected) {
-                    if let Some(id) = self.log_target.clone() {
-                        self.mirror.stream(StreamEvent::Connected);
-                        let _ = self.tray_tx.send(TraySnapshot::from_mirror(&self.mirror));
-                        self.log_epoch = self.log_epoch.wrapping_add(1);
-                        let epoch = self.log_epoch;
-                        self.log_loading = true;
-                        self.log_live.clear();
-                        let client = self.client.clone();
-                        let requested = id.clone();
-                        return Task::perform(
-                            async move {
-                                client
-                                    .logs(
-                                        &requested,
-                                        LogParams {
-                                            tail: Some(5000),
-                                            since: None,
-                                            stream: None,
-                                            grep: None,
-                                            format: None,
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|e| e.to_string())
-                            },
-                            move |result| Message::LogBacklog(id.clone(), epoch, result),
-                        );
-                    }
+                if matches!(&*event, StreamEvent::Connected)
+                    && let Some(id) = self.log_target.clone()
+                {
+                    self.mirror.stream(StreamEvent::Connected);
+                    let _ = self.tray_tx.send(TraySnapshot::from_mirror(&self.mirror));
+                    self.log_epoch = self.log_epoch.wrapping_add(1);
+                    let epoch = self.log_epoch;
+                    self.log_loading = true;
+                    self.log_live.clear();
+                    let client = self.client.clone();
+                    let requested = id.clone();
+                    return Task::perform(
+                        async move {
+                            client
+                                .logs(
+                                    &requested,
+                                    LogParams {
+                                        tail: Some(5000),
+                                        since: None,
+                                        stream: None,
+                                        grep: None,
+                                        format: None,
+                                    },
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        move |result| Message::LogBacklog(id.clone(), epoch, result),
+                    );
                 }
                 if let StreamEvent::Event(WireEvent::Log { line }) = &*event {
                     if self.log_target.as_ref() == Some(&line.instance) {
@@ -336,11 +364,11 @@ impl App {
                 );
                 let client = self.client.clone();
                 Task::perform(async move { cmd.execute(&client).await }, move |result| {
-                    Message::CommandDone(id.clone(), result)
+                    Message::CommandDone(id.clone(), Box::new(result))
                 })
             }
             Message::CommandDone(id, result) => {
-                match result {
+                match *result {
                     Err(error) => {
                         self.pending.remove(&id);
                         self.toasts.push(error);
@@ -451,6 +479,35 @@ impl App {
                 self.logs.follow = true;
                 iced::widget::operation::snap_to_end("lantern-logs")
             }
+            Message::CycleTheme => {
+                if self.prefs_saving {
+                    return Task::none();
+                }
+                self.prefs.theme = self.prefs.theme.next();
+                if let Some(store) = self.prefs_store.clone() {
+                    self.prefs_saving = true;
+                    let prefs = self.prefs.clone();
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || store.save(&prefs))
+                                .await
+                                .map_err(|e| e.to_string())?
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::PrefsSaved,
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Message::PrefsSaved(result) => {
+                self.prefs_saving = false;
+                if let Err(error) = result {
+                    self.toasts
+                        .push(format!("Could not save GUI preferences: {error}"));
+                }
+                Task::none()
+            }
             Message::Theme(mode) => {
                 self.mode = mode;
                 Task::none()
@@ -458,7 +515,15 @@ impl App {
         }
     }
     fn view(&self, _: window::Id) -> Element<'_, Message> {
-        let mut body = column![text("Lantern").size(28)].spacing(12).padding(20);
+        let theme_button = button(text(format!("Theme: {}", self.prefs.theme.label())));
+        let theme_button = if self.prefs_saving {
+            theme_button
+        } else {
+            theme_button.on_press(Message::CycleTheme)
+        };
+        let mut body = column![row![text("Lantern").size(28).width(Length::Fill), theme_button].spacing(12)]
+            .spacing(12)
+            .padding(20);
         if let Connection::Down { error, retry_in } = &self.mirror.connection {
             let message = if self.mirror.ever_live {
                 format!(
@@ -682,7 +747,12 @@ impl App {
     }
     fn theme(&self, _: window::Id) -> Option<Theme> {
         use iced::{color, theme::Palette};
-        let palette = if self.mode == theme::Mode::Light {
+        let light = match self.prefs.theme {
+            ThemePreference::Light => true,
+            ThemePreference::Dark => false,
+            ThemePreference::System => self.mode == theme::Mode::Light,
+        };
+        let palette = if light {
             Palette {
                 background: color!(0xFAFAF8),
                 text: color!(0x1F2328),
@@ -818,6 +888,7 @@ mod tests {
             client,
             UiKey(Arc::new(Mutex::new(Some(receiver)))),
             tray,
+            (None, GuiPrefs::default(), None),
         )
         .0
     }

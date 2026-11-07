@@ -18,19 +18,15 @@ pub(crate) struct Snapshot {
     pub health: Option<SystemHealth>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum Connection {
+    #[default]
     Connecting,
     Live,
     Down {
         error: String,
         retry_in: std::time::Duration,
     },
-}
-impl Default for Connection {
-    fn default() -> Self {
-        Self::Connecting
-    }
 }
 
 #[derive(Debug, Clone, Default)]
