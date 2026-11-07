@@ -168,6 +168,7 @@ async fn api_guard_and_error_envelopes() {
         req.headers_mut().insert(header, value.parse().unwrap());
         let res = router.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(res.headers()["content-type"], "application/json; charset=utf-8");
         assert_eq!(res.headers()["x-content-type-options"], "nosniff");
         assert!(res.headers().get("access-control-allow-origin").is_none());
         assert_eq!(json_body(res).await["error"]["code"], code);
@@ -627,16 +628,27 @@ async fn api_sse_log_lag_requests_resync() {
 #[tokio::test]
 async fn api_wait_disconnect_does_not_cancel_the_operation() {
     let (router, fake, _) = setup(Mode::Running, 16, 39400);
-    let response = router
-        .clone()
-        .oneshot(request("POST", "/api/instances/myapp%40feature-x/start", "{}"))
-        .await
-        .unwrap();
-    let id = json_body(response).await["operation"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let waiting_router = router.clone();
+    let waiter = tokio::spawn(async move {
+        waiting_router
+            .oneshot(request(
+                "POST",
+                "/api/instances/myapp%40feature-x/start?wait=true",
+                "{}",
+            ))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fake.pending.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
     let handle = fake.pending.lock().unwrap().pop().unwrap();
+    let id = handle.id().0.clone();
     assert!(!handle.cancel_token().is_cancelled());
     handle.finish(OpOutcome::Succeeded(None));
     let response = router
@@ -645,4 +657,664 @@ async fn api_wait_disconnect_does_not_cancel_the_operation() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["status"], "succeeded");
+}
+
+#[derive(Debug)]
+struct ErrorFacade(&'static str);
+#[async_trait]
+impl DaemonFacade for ErrorFacade {
+    async fn settings(&self) -> FacadeResult<Value> {
+        Err(ApiError {
+            code: self.0.into(),
+            message: "failure from adapter".into(),
+            details: json!({"field":"example"}),
+        })
+    }
+    async fn service_action(
+        &self,
+        _: String,
+        _: lantern_daemon::api::facade::ServiceAction,
+    ) -> FacadeResult<lantern_core::api::ServiceStatus> {
+        Err(ApiError {
+            code: self.0.into(),
+            message: "service failed".into(),
+            details: json!({}),
+        })
+    }
+}
+
+#[tokio::test]
+async fn api_every_error_code_mapping_and_service_override() {
+    let cases = [
+        ("bad_request", 400),
+        ("invalid_json", 400),
+        ("validation_failed", 422),
+        ("not_found", 404),
+        ("project_not_found", 404),
+        ("instance_not_found", 404),
+        ("service_not_found", 404),
+        ("operation_not_found", 404),
+        ("doc_not_found", 404),
+        ("already_exists", 409),
+        ("operation_in_progress", 409),
+        ("cannot_remove_primary", 409),
+        ("dirty_worktree", 409),
+        ("port_unavailable", 409),
+        ("builtin_template", 409),
+        ("not_controllable", 409),
+        ("reserved_id", 422),
+        ("needs_config", 422),
+        ("branch_invalid", 422),
+        ("forbidden_host", 403),
+        ("forbidden_origin", 403),
+        ("forbidden", 403),
+        ("unsupported_media_type", 415),
+        ("payload_too_large", 413),
+        ("method_not_allowed", 405),
+        ("timeout", 504),
+        ("unavailable", 503),
+        ("operation_failed", 500),
+        ("internal", 500),
+        ("unknown_error", 500),
+    ];
+    for (code, status) in cases {
+        let bus = EventBus::new();
+        let ops = OperationTracker::new(bus.clone());
+        let router = api::router(ApiState::new(
+            Arc::new(ErrorFacade(code)),
+            bus,
+            ops,
+            ApiConfig::new(39400, "glow", "test"),
+        ));
+        let res = router
+            .clone()
+            .oneshot(request("GET", "/api/settings", ""))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), status, "{code}");
+        let body = json_body(res).await;
+        assert_eq!(body["error"]["code"], code);
+        assert_eq!(body["error"]["details"]["field"], "example");
+        if code == "operation_failed" {
+            let res = router
+                .oneshot(request("POST", "/api/services/redis/start", ""))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(json_body(res).await["error"]["code"], "operation_failed");
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RouteFacade {
+    ops: OperationTracker,
+    calls: Mutex<Vec<String>>,
+    targets: Mutex<Vec<lantern_core::api::CreateInstanceRequest>>,
+}
+impl RouteFacade {
+    fn record(&self, text: String) {
+        self.calls.lock().unwrap().push(text);
+    }
+}
+#[async_trait]
+impl DaemonFacade for RouteFacade {
+    async fn projects(
+        &self,
+        filter: lantern_daemon::api::facade::ProjectFilter,
+    ) -> FacadeResult<Vec<ProjectSummary>> {
+        self.record(format!("projects:{:?}:{:?}", filter.enabled, filter.q));
+        Ok(vec![summary()])
+    }
+    async fn register_project(
+        &self,
+        request: lantern_core::api::RegisterProjectRequest,
+    ) -> FacadeResult<ProjectSummary> {
+        self.record(format!("register:{}", request.path.display()));
+        Ok(summary())
+    }
+    async fn run_branch(
+        &self,
+        id: lantern_core::ids::ProjectId,
+        request: lantern_core::api::CreateInstanceRequest,
+    ) -> FacadeResult<OperationTicket> {
+        self.record(format!("run:{id}"));
+        self.targets.lock().unwrap().push(request);
+        let handle = self.ops.begin(OperationKind::CreateInstance, Some(inst().id));
+        let id = handle.id().clone();
+        handle.finish(OpOutcome::Succeeded(None));
+        Ok(OperationTicket {
+            id,
+            instance: Some(inst()),
+            created: Some(true),
+            forgotten: None,
+        })
+    }
+    async fn checkouts(&self, id: lantern_core::ids::ProjectId) -> FacadeResult<Vec<InstanceView>> {
+        self.record(format!("checkouts:{id}"));
+        Ok(vec![inst()])
+    }
+    async fn settings(&self) -> FacadeResult<Value> {
+        Ok(json!({"api":{"port":39400}}))
+    }
+    async fn patch_settings(&self, patch: Value) -> FacadeResult<lantern_core::api::SettingsPatched> {
+        self.record(format!("patch:{patch}"));
+        Ok(lantern_core::api::SettingsPatched {
+            settings: patch,
+            restart_required: vec!["api.port".into()],
+            overridden_by_env: vec![],
+        })
+    }
+    async fn listeners(
+        &self,
+        filter: lantern_daemon::api::facade::ListenerFilter,
+    ) -> FacadeResult<Vec<lantern_core::model::Listener>> {
+        self.record(format!("listeners:{:?}", filter.port));
+        Ok(vec![])
+    }
+    async fn services(&self) -> FacadeResult<Vec<lantern_core::api::ServiceStatus>> {
+        self.record("services".into());
+        Ok(vec![])
+    }
+    async fn profiles(&self) -> FacadeResult<Vec<Value>> {
+        Ok(vec![json!({"name":"demo"})])
+    }
+    async fn templates(&self) -> FacadeResult<Vec<Value>> {
+        Ok(vec![json!({"name":"web"})])
+    }
+    async fn suggestions(&self) -> FacadeResult<Vec<lantern_core::api::Suggestion>> {
+        Ok(vec![])
+    }
+    async fn schema(&self, name: String) -> FacadeResult<Value> {
+        Ok(json!({"name":name}))
+    }
+    async fn docs(&self, _: InstanceId) -> FacadeResult<Vec<lantern_core::api::DocEntry>> {
+        Ok(vec![lantern_core::api::DocEntry {
+            path: "docs/<guide>.html".into(),
+            kind: "<script>".into(),
+            source: lantern_core::api::IntelSource::Manual,
+            exists: true,
+            size: Some(8),
+            mtime: None,
+        }])
+    }
+    async fn doc(
+        &self,
+        _: InstanceId,
+        path: String,
+        _: Option<u64>,
+        _: Option<u64>,
+    ) -> FacadeResult<lantern_core::api::DocContent> {
+        self.record(format!("doc:{path}"));
+        Ok(lantern_core::api::DocContent {
+            path,
+            content: "<script>danger()</script>".into(),
+            offset: 0,
+            total_chars: 25,
+            truncated: false,
+        })
+    }
+}
+
+#[tokio::test]
+async fn api_successful_route_groups_and_branch_request_shapes() {
+    let bus = EventBus::new();
+    let ops = OperationTracker::new(bus.clone());
+    let facade = Arc::new(RouteFacade {
+        ops: ops.clone(),
+        calls: Mutex::new(vec![]),
+        targets: Mutex::new(vec![]),
+    });
+    let router = api::router(ApiState::new(
+        facade.clone(),
+        bus,
+        ops,
+        ApiConfig::new(39400, "glow", "test"),
+    ));
+    let cases = [
+        ("GET", "/api/projects?q=hello", "", 200, "items"),
+        ("POST", "/api/projects", "{\"path\":\"/fixture\"}", 201, "id"),
+        ("GET", "/api/projects/myapp/checkouts", "", 200, "items"),
+        ("GET", "/api/settings", "", 200, "api"),
+        (
+            "PATCH",
+            "/api/settings",
+            "{\"api\":{\"port\":99}}",
+            200,
+            "restart_required",
+        ),
+        ("GET", "/api/listeners?port=42", "", 200, "items"),
+        ("GET", "/api/services", "", 200, "items"),
+        ("GET", "/api/profiles", "", 200, "items"),
+        ("GET", "/api/templates", "", 200, "items"),
+        ("GET", "/api/suggestions", "", 200, "items"),
+        ("GET", "/api/schema/manifest", "", 200, "name"),
+    ];
+    for (method, path, payload, status, field) in cases {
+        let res = router
+            .clone()
+            .oneshot(request(method, path, payload))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), status, "{method} {path}");
+        assert_eq!(res.headers()["content-type"], "application/json; charset=utf-8");
+        assert!(!json_body(res).await[field].is_null(), "{method} {path}");
+    }
+    for (payload, expected) in [
+        (
+            json!({"branch":"feature/x"}),
+            lantern_core::api::RunTarget::Branch("feature/x".into()),
+        ),
+        (
+            json!({"branch":"next","base":"main"}),
+            lantern_core::api::RunTarget::NewBranch {
+                name: "next".into(),
+                base: Some("main".into()),
+            },
+        ),
+        (
+            json!({"target":{"pr":123},"start":false}),
+            lantern_core::api::RunTarget::Pr(123),
+        ),
+    ] {
+        let res = router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/api/projects/myapp/instances?wait=true",
+                &payload.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(json_body(res).await["created"], true);
+        assert_eq!(facade.targets.lock().unwrap().last().unwrap().target, expected);
+    }
+    let res = router
+        .clone()
+        .oneshot(request("GET", "/api/projects/myapp/checkouts?refresh=true", ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let calls = facade.calls.lock().unwrap();
+    assert_eq!(
+        calls.iter().filter(|call| call.starts_with("checkouts:")).count(),
+        1
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == "projects:Some(\"true\"):Some(\"hello\")")
+    );
+    assert!(calls.iter().any(|c| c == "listeners:Some(42)"));
+}
+
+#[tokio::test]
+async fn api_docs_are_inert_and_paths_are_checked() {
+    let bus = EventBus::new();
+    let ops = OperationTracker::new(bus.clone());
+    let facade = Arc::new(RouteFacade {
+        ops: ops.clone(),
+        calls: Mutex::new(vec![]),
+        targets: Mutex::new(vec![]),
+    });
+    let router = api::router(ApiState::new(
+        facade.clone(),
+        bus,
+        ops,
+        ApiConfig::new(39400, "glow", "test"),
+    ));
+    let response = router
+        .clone()
+        .oneshot(request("GET", "/myapp%40feature-x/docs", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("sandbox")
+    );
+    let body = to_bytes(response.into_body(), 10_000).await.unwrap();
+    let html = std::str::from_utf8(&body).unwrap();
+    assert!(html.contains("&lt;script&gt;") && !html.contains("<script>"));
+    let response = router
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/myapp@feature-x/docs/docs%2F%3Cguide%3E.html",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/plain; charset=utf-8");
+    assert!(response.headers().contains_key("content-security-policy"));
+    for path in [
+        "/api/instances/myapp/docs/%2e%2e%2fsecret",
+        "/myapp/docs/%2e%2e%2fsecret",
+        "/myapp/docs/a%5cb",
+        "/myapp/docs/bad%zz",
+    ] {
+        let res = router.clone().oneshot(request("GET", path, "")).await.unwrap();
+        assert!(res.status().is_client_error(), "{path}");
+        assert!(json_body(res).await["error"]["code"].is_string());
+    }
+    assert_eq!(
+        facade
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.starts_with("doc:"))
+            .count(),
+        1
+    );
+}
+
+#[derive(Debug, Default)]
+struct SnapshotRace {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait]
+impl DaemonFacade for SnapshotRace {
+    async fn event_snapshot(&self) -> FacadeResult<Vec<Event>> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(vec![])
+    }
+}
+
+#[tokio::test]
+async fn api_sse_subscription_precedes_snapshot() {
+    let bus = EventBus::with_capacity(4);
+    let ops = OperationTracker::new(bus.clone());
+    let facade = Arc::new(SnapshotRace::default());
+    let router = api::router(ApiState::new(
+        facade.clone(),
+        bus.clone(),
+        ops,
+        ApiConfig::new(39400, "glow", "test"),
+    ));
+    let request_task =
+        tokio::spawn(async move { router.oneshot(request("GET", "/api/events", "")).await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(1), facade.entered.notified())
+        .await
+        .unwrap();
+    bus.publish(Event::ListenersChanged {
+        seq: 77,
+        listeners: vec![],
+    });
+    facade.release.notify_one();
+    let response = request_task.await.unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    for _ in 0..3 {
+        let chunk = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        seen.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+    let hello = seen.find("event: hello").unwrap();
+    let snapshot = seen.find("event: snapshot_complete").unwrap();
+    let live = seen.find("event: listeners_changed").unwrap();
+    assert!(hello < snapshot && snapshot < live && seen.contains("\"seq\":77"));
+}
+
+#[derive(Debug)]
+struct SlowFacade;
+#[async_trait]
+impl DaemonFacade for SlowFacade {
+    async fn settings(&self) -> FacadeResult<Value> {
+        std::future::pending().await
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn api_module_deadline_and_query_validation() {
+    let bus = EventBus::new();
+    let ops = OperationTracker::new(bus.clone());
+    let mut config = ApiConfig::new(39400, "glow", "test");
+    config.module_timeout = Duration::from_millis(10);
+    let router = api::router(ApiState::new(Arc::new(SlowFacade), bus, ops, config));
+    let res = router
+        .clone()
+        .oneshot(request("GET", "/api/settings", ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(json_body(res).await["error"]["code"], "timeout");
+    for path in [
+        "/api/events?logs=myapp&tail=1001",
+        "/api/events?logs=",
+        "/api/events?state=maybe",
+        "/api/operations/id?wait=true&timeout=601",
+        "/api/instances/myapp/logs?tail=5001",
+        "/api/projects?enabled=maybe",
+    ] {
+        let res = router.clone().oneshot(request("GET", path, "")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(json_body(res).await["error"]["code"], "bad_request");
+    }
+}
+
+#[tokio::test]
+async fn api_wait_completes_after_worker_and_operation_reads_remain_resources() {
+    let (router, fake, _) = setup(Mode::Running, 16, 39400);
+    let waiting_router = router.clone();
+    let waiter = tokio::spawn(async move {
+        waiting_router
+            .oneshot(request(
+                "POST",
+                "/api/instances/myapp@feature-x/start?wait=true&timeout=1",
+                "{}",
+            ))
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fake.pending.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let handle = fake.pending.lock().unwrap().pop().unwrap();
+    handle.finish(OpOutcome::Succeeded(None));
+    let response = waiter.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["operation"]["status"], "succeeded");
+
+    let (router, _, _) = setup(Mode::Failure, 16, 39400);
+    let response = router
+        .clone()
+        .oneshot(request("POST", "/api/instances/myapp@feature-x/start", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let op = json_body(response).await;
+    let id = op["operation"]["id"].as_str().unwrap();
+    let response = router
+        .oneshot(request("GET", &format!("/api/operations/{id}?wait=true"), ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["status"], "failed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn api_sse_without_logs_has_no_log_subscription() {
+    let (router, fake, bus) = setup(Mode::Success, 4, 39400);
+    let response = router
+        .oneshot(request("GET", "/api/events?state=false", ""))
+        .await
+        .unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    for expected in ["event: hello", "event: snapshot_complete"] {
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert!(std::str::from_utf8(&chunk).unwrap().contains(expected));
+    }
+    assert!(fake.logs.send(line("must not be delivered")).is_err());
+    bus.publish(Event::ListenersChanged {
+        seq: 5,
+        listeners: vec![],
+    });
+    tokio::time::advance(Duration::from_millis(50)).await;
+    let chunk = stream.next().await.unwrap().unwrap();
+    let text = std::str::from_utf8(&chunk).unwrap();
+    assert!(text.contains(": ping") && !text.contains("event:"));
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct InvalidPathFacade;
+#[cfg(unix)]
+fn non_utf8_summary() -> ProjectSummary {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    let mut value = summary();
+    value.project.root = std::path::PathBuf::from(OsString::from_vec(vec![b'/', 0xff]));
+    value
+}
+#[cfg(unix)]
+#[async_trait]
+impl DaemonFacade for InvalidPathFacade {
+    async fn projects(
+        &self,
+        _: lantern_daemon::api::facade::ProjectFilter,
+    ) -> FacadeResult<Vec<ProjectSummary>> {
+        Ok(vec![non_utf8_summary()])
+    }
+    async fn event_snapshot(&self) -> FacadeResult<Vec<Event>> {
+        Ok(vec![Event::ProjectUpdated {
+            project: non_utf8_summary(),
+        }])
+    }
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn api_serialization_failures_are_enveloped_or_end_live_stream() {
+    let bus = EventBus::new();
+    let ops = OperationTracker::new(bus.clone());
+    let router = api::router(ApiState::new(
+        Arc::new(InvalidPathFacade),
+        bus,
+        ops,
+        ApiConfig::new(39400, "glow", "test"),
+    ));
+    let response = router
+        .clone()
+        .oneshot(request("GET", "/api/projects", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(json_body(response).await["error"]["code"], "internal");
+    let response = router.oneshot(request("GET", "/api/events", "")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(json_body(response).await["error"]["code"], "internal");
+
+    let (router, _, bus) = setup(Mode::Success, 16, 39400);
+    let response = router.oneshot(request("GET", "/api/events", "")).await.unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    loop {
+        let chunk = stream.next().await.unwrap().unwrap();
+        if std::str::from_utf8(&chunk).unwrap().contains("snapshot_complete") {
+            break;
+        }
+    }
+    bus.publish(Event::ProjectUpdated {
+        project: non_utf8_summary(),
+    });
+    assert!(stream.next().await.unwrap().is_err());
+}
+
+#[derive(Debug)]
+struct GroupFacade {
+    ops: OperationTracker,
+    fail: bool,
+    pending: Mutex<Vec<OpHandle>>,
+}
+#[async_trait]
+impl DaemonFacade for GroupFacade {
+    async fn stop_all(&self, _: lantern_core::api::StopAllRequest) -> FacadeResult<Vec<OperationTicket>> {
+        let first = self.ops.begin(OperationKind::Stop, Some(inst().id));
+        let first_id = first.id().clone();
+        if self.fail {
+            first.finish(OpOutcome::Failed(ApiError {
+                code: "port_unavailable".into(),
+                message: "busy".into(),
+                details: json!({"port":12}),
+            }));
+        } else {
+            self.pending.lock().unwrap().push(first);
+        }
+        let second = self.ops.begin(OperationKind::Stop, Some(inst().id));
+        let second_id = second.id().clone();
+        self.pending.lock().unwrap().push(second);
+        Ok(vec![first_id, second_id]
+            .into_iter()
+            .map(|id| OperationTicket {
+                id,
+                instance: None,
+                created: None,
+                forgotten: None,
+            })
+            .collect())
+    }
+    async fn activate_profile(&self, _: String) -> FacadeResult<Vec<OperationTicket>> {
+        self.stop_all(lantern_core::api::StopAllRequest {
+            include_services: false,
+        })
+        .await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn api_group_wait_uses_one_deadline_and_returns_failures() {
+    for (path, fail) in [
+        ("/api/system/stop-all", false),
+        ("/api/profiles/demo/activate", false),
+        ("/api/system/stop-all", true),
+    ] {
+        let bus = EventBus::new();
+        let ops = OperationTracker::new(bus.clone());
+        let facade = Arc::new(GroupFacade {
+            ops: ops.clone(),
+            fail,
+            pending: Mutex::new(vec![]),
+        });
+        let router = api::router(ApiState::new(
+            facade.clone(),
+            bus,
+            ops,
+            ApiConfig::new(39400, "glow", "test"),
+        ));
+        let before = tokio::time::Instant::now();
+        let response = router
+            .oneshot(request("POST", &format!("{path}?wait=true&timeout=1"), "{}"))
+            .await
+            .unwrap();
+        if fail {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["code"], "port_unavailable");
+            assert_eq!(body["error"]["details"]["port"], 12);
+            assert!(body["error"]["details"]["operation_id"].is_string());
+        } else {
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(
+                json_body(response).await["operations"].as_array().unwrap().len(),
+                2
+            );
+            assert_eq!(
+                tokio::time::Instant::now().duration_since(before),
+                Duration::from_secs(1)
+            );
+        }
+        for handle in facade.pending.lock().unwrap().drain(..) {
+            handle.finish(OpOutcome::Succeeded(None));
+        }
+    }
 }

@@ -12,7 +12,7 @@ use lantern_core::{
     ids::InstanceId,
 };
 use serde::Deserialize;
-use std::{convert::Infallible, pin::Pin};
+use std::{io, pin::Pin};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -53,10 +53,11 @@ fn log_stream(mut rx: broadcast::Receiver<lantern_core::model::LogLine>) -> Live
         }
     })
 }
-fn frame(event: WireEvent) -> SseEvent {
+fn frame(event: WireEvent) -> Result<SseEvent, serde_json::Error> {
     let name = event.event_name();
-    let json = serde_json::to_string(&event).expect("wire events are JSON serializable");
-    SseEvent::default().event(name).data(json)
+    Ok(SseEvent::default()
+        .event(name)
+        .data(serde_json::to_string(&event)?))
 }
 pub(crate) async fn stream(
     state: ApiState,
@@ -111,19 +112,37 @@ pub(crate) async fn stream(
         boot_id: state.config.boot_id.clone(),
         now: Timestamp::now(),
     };
+    // Reject an unserializable initial snapshot before committing HTTP headers.
+    let initial = std::iter::once(hello)
+        .chain(snapshot.into_iter().map(WireEvent::from))
+        .chain(backlogs)
+        .chain(std::iter::once(WireEvent::SnapshotComplete))
+        .map(frame)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| HttpError::new("internal", "could not serialize event snapshot"))?;
     let stream = async_stream::stream! {
         let _permit = permit;
-        yield Ok::<_, Infallible>(frame(hello));
-        for event in snapshot { yield Ok(frame(event.into())); }
-        for event in backlogs { yield Ok(frame(event)); }
-        yield Ok(frame(WireEvent::SnapshotComplete));
+        for frame in initial { yield Ok::<_, io::Error>(frame); }
         loop {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break,
                 item = live.next() => match item {
-                    Some(Ok(event)) => yield Ok(frame(event)),
-                    Some(Err(skipped)) => { yield Ok(frame(WireEvent::Resync { reason: "lagged".into(), skipped: Some(skipped) })); break; },
+                    Some(Ok(event)) => match frame(event) {
+                        Ok(frame) => yield Ok(frame),
+                        Err(_) => {
+                            tracing::warn!("could not serialize live event");
+                            yield Err(io::Error::other("could not serialize live event"));
+                            break;
+                        }
+                    },
+                    Some(Err(skipped)) => {
+                        match frame(WireEvent::Resync { reason: "lagged".into(), skipped: Some(skipped) }) {
+                            Ok(frame) => yield Ok(frame),
+                            Err(_) => yield Err(io::Error::other("could not serialize resync")),
+                        }
+                        break;
+                    },
                     None => break,
                 }
             }

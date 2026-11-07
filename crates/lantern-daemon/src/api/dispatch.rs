@@ -7,7 +7,6 @@ use super::{
     sse,
 };
 use axum::{
-    Json,
     body::{Bytes, to_bytes},
     extract::{Request, State},
     http::{Method, StatusCode, header},
@@ -20,18 +19,22 @@ use lantern_core::{
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    future::Future,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, future::Future, time::Duration};
+use tokio::time::Instant;
 
 pub(crate) async fn within<T>(
     state: &ApiState,
     label: &str,
     future: impl Future<Output = FacadeResult<T>>,
 ) -> Result<T, HttpError> {
-    match tokio::time::timeout(state.config.module_timeout, future).await {
+    within_deadline(label, state.config.module_timeout, future).await
+}
+async fn within_deadline<T>(
+    label: &str,
+    deadline: Duration,
+    future: impl Future<Output = FacadeResult<T>>,
+) -> Result<T, HttpError> {
+    match tokio::time::timeout(deadline, future).await {
         Ok(result) => result.map_err(HttpError::from),
         Err(_) => {
             tracing::warn!(module = label, "daemon API module deadline expired");
@@ -57,7 +60,18 @@ fn instance(s: &str) -> Result<InstanceId, HttpError> {
     InstanceId::parse(s).map_err(|e| HttpError::new("bad_request", e.to_string()))
 }
 fn output<T: Serialize>(data: T) -> Response {
-    Json(data).into_response()
+    output_status(StatusCode::OK, data)
+}
+fn output_status<T: Serialize>(status: StatusCode, data: T) -> Response {
+    match serde_json::to_vec(&data) {
+        Ok(bytes) => (
+            status,
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => HttpError::new("internal", "could not serialize response").into_response(),
+    }
 }
 fn list<T: Serialize>(items: Vec<T>) -> Response {
     output(List { items })
@@ -106,28 +120,27 @@ async fn operation(state: &ApiState, ticket: OperationTicket, w: WaitParams) -> 
         return Err(operation_failure(&op));
     }
     let mut view = ticket.instance;
-    if !active(op.status)
+    if w.wait
+        && op.status == OperationStatus::Succeeded
         && let Some(id) = &op.instance
+        && let Ok(fresh) = within(state, "registry", state.facade.instance(id.clone())).await
     {
-        if let Ok(fresh) = within(state, "registry", state.facade.instance(id.clone())).await {
-            view = Some(fresh);
-        }
+        view = Some(fresh);
     }
-    let status = if active(op.status) {
+    let status = if active(op.status) || (!w.wait && !op.noop && ticket.forgotten != Some(true)) {
         StatusCode::ACCEPTED
     } else {
         StatusCode::OK
     };
-    Ok((
+    Ok(output_status(
         status,
-        Json(OperationResponse {
+        OperationResponse {
             operation: op,
             instance: view,
             created: ticket.created,
             forgotten: ticket.forgotten,
-        }),
-    )
-        .into_response())
+        },
+    ))
 }
 async fn operations(
     state: &ApiState,
@@ -151,12 +164,12 @@ async fn operations(
         }
         all.push(op);
     }
-    let status = if all.iter().any(|op| active(op.status)) {
+    let status = if all.iter().any(|op| active(op.status)) || (!w.wait && all.iter().any(|op| !op.noop)) {
         StatusCode::ACCEPTED
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(OperationsResponse { operations: all })).into_response())
+    Ok(output_status(status, OperationsResponse { operations: all }))
 }
 #[derive(Deserialize, Default)]
 struct ProjectQuery {
@@ -176,6 +189,35 @@ struct IntelQuery {
     offset: Option<u64>,
     max_chars: Option<u64>,
     format: Option<String>,
+}
+#[derive(Deserialize, Default)]
+struct CheckoutQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+fn doc_path(parts: &[&str]) -> Result<String, HttpError> {
+    let path = parts.join("/");
+    if path.is_empty()
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        return Err(HttpError::new("forbidden", "invalid document path"));
+    }
+    Ok(path)
+}
+
+fn valid_percent_encoding(part: &str) -> bool {
+    let mut bytes = part.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%'
+            && !matches!((bytes.next(), bytes.next()), (Some(a), Some(b)) if a.is_ascii_hexdigit() && b.is_ascii_hexdigit())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Route all documented path segments through a single envelope-aware dispatcher.
@@ -212,6 +254,9 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
         .trim_start_matches('/')
         .split('/')
         .map(|part| {
+            if !valid_percent_encoding(part) {
+                return Err(HttpError::new("bad_request", "invalid percent encoding in path"));
+            }
             percent_decode_str(part)
                 .decode_utf8()
                 .map(|s| s.into_owned())
@@ -311,14 +356,13 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
                 filter.enabled.get_or_insert_with(|| "true".to_owned());
                 list(call!("registry", f.projects(filter)))
             }
-            "POST" => (
+            "POST" => output_status(
                 StatusCode::CREATED,
-                Json(call!(
+                call!(
                     "registry",
                     f.register_project(body::<RegisterProjectRequest>(&bytes, false)?)
-                )),
-            )
-                .into_response(),
+                ),
+            ),
             _ => return Err(method_error()),
         },
         ["api", "projects", "scan"] => {
@@ -373,6 +417,12 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
         ["api", "projects", id, "checkouts"] => {
             if method != Method::GET {
                 return Err(method_error());
+            }
+            if query::<CheckoutQuery>(&raw_query)?.refresh {
+                return Err(HttpError::new(
+                    "bad_request",
+                    "use POST /api/projects/{id}/sync to refresh checkouts",
+                ));
             }
             list(call!("instances", f.checkouts(project(id)?)))
         }
@@ -514,7 +564,7 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
             if method != Method::POST {
                 return Err(method_error());
             }
-            output(call!("health", f.check_health(instance(id)?)))
+            output(within_deadline("health", Duration::from_secs(10), f.check_health(instance(id)?)).await?)
         }
         ["api", "instances", id, "manifest"] => {
             if method != Method::GET {
@@ -535,13 +585,13 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
             if method != Method::POST {
                 return Err(method_error());
             }
-            output(call!("intel", f.refresh_intel(instance(id)?)))
+            output(within_deadline("intel", Duration::from_secs(30), f.refresh_intel(instance(id)?)).await?)
         }
         ["api", "intel", "refresh"] => {
             if method != Method::POST {
                 return Err(method_error());
             }
-            output(call!("intel", f.refresh_all_intel()))
+            output(within_deadline("intel", Duration::from_secs(30), f.refresh_all_intel()).await?)
         }
         ["api", "instances", id, "docs"] => {
             if method != Method::GET {
@@ -556,7 +606,7 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
             let q: IntelQuery = query(&raw_query)?;
             let content = call!(
                 "intel",
-                f.doc(instance(id)?, path.join("/"), q.offset, q.max_chars)
+                f.doc(instance(id)?, doc_path(path)?, q.offset, q.max_chars)
             );
             if q.format.as_deref() == Some("json") {
                 output(content)
@@ -701,15 +751,14 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
                     "config",
                     f.put_profile((*name).into(), body::<Value>(&bytes, false)?)
                 );
-                (
+                output_status(
                     if created {
                         StatusCode::CREATED
                     } else {
                         StatusCode::OK
                     },
-                    Json(value),
+                    value,
                 )
-                    .into_response()
             }
             "DELETE" => {
                 call!("config", f.delete_profile((*name).into()));
@@ -727,11 +776,10 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
         }
         ["api", "templates"] => match method.as_str() {
             "GET" => list(call!("config", f.templates())),
-            "POST" => (
+            "POST" => output_status(
                 StatusCode::CREATED,
-                Json(call!("config", f.create_template(body::<Value>(&bytes, false)?))),
-            )
-                .into_response(),
+                call!("config", f.create_template(body::<Value>(&bytes, false)?)),
+            ),
             _ => return Err(method_error()),
         },
         ["api", "templates", name] => match method.as_str() {
@@ -741,15 +789,14 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
                     "config",
                     f.put_template((*name).into(), body::<Value>(&bytes, false)?)
                 );
-                (
+                output_status(
                     if created {
                         StatusCode::CREATED
                     } else {
                         StatusCode::OK
                     },
-                    Json(value),
+                    value,
                 )
-                    .into_response()
             }
             "DELETE" => {
                 call!("config", f.delete_template((*name).into()));
@@ -818,7 +865,7 @@ async fn dispatch(state: ApiState, req: Request) -> Result<Response, HttpError> 
             if method != Method::GET {
                 return Err(method_error());
             }
-            let path = path.join("/");
+            let path = doc_path(path)?;
             let q: IntelQuery = query(&raw_query)?;
             let content = call!("intel", f.doc(instance(id)?, path.clone(), q.offset, q.max_chars));
             let kind = if path.ends_with(".md") {

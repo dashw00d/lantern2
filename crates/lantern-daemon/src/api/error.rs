@@ -2,7 +2,7 @@
 
 use axum::{
     Json,
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use lantern_core::api::{ApiError, ErrorEnvelope};
@@ -70,6 +70,7 @@ impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         (
             self.1.unwrap_or_else(|| Self::status(&self.0.code)),
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
             Json(ErrorEnvelope { error: self.0 }),
         )
             .into_response()
