@@ -316,6 +316,32 @@ would talk to the wrong place.
 - The launcher **unsets every inherited `LANTERN_*`** before exporting its own, so a server
   never sees the daemon's settings.
 
+
+### D22. Corrections found while building wave 1
+The lanes reported places where 10–16 still contradict this file. **This file wins in each
+case**, and the code follows it:
+
+| Doc passage | Correct rule |
+|---|---|
+| 10 §3.13 Start/Restart joining matrix | D18: only identical requests join; only `Stop` preempts; everything else is `409`. |
+| 10 §3.10 one-shots with `--pipe` / `KillMode=process` | D6: one-shot output goes to the journal; cancelling means stopping the unit, which kills its whole cgroup. |
+| 11 §3.3, any remaining "`${PORT}` not available in `setup`" | D1: `${PORT}` is available everywhere. |
+| 14 §3.5 S3 label | S3 **passed** with `serde-saphyr` 2.1.1 (positions confirmed for nested keys, list values and typed errors). |
+| 15/16 SSE event name `log_line` | The SSE event is **`log`**, carrying a `model::LogLine`. |
+| 16/13 doctor status names | D20: `CheckStatus = ok \| warn \| fail \| skipped`. |
+| Service names like `php-fpm` in examples | Wire names are snake_case: `php_fpm`. |
+| 01 glossary "listening socket on localhost" | A Listener is any TCP LISTEN socket, loopback **and** non-loopback (12). |
+| 12 §3.13 Docker pid / container IP fields | v2.0's `DockerInfo` is `{ label, container_port }`. The Docker API comes in v2.1, so foreign Docker sockets keep `pid: None`. |
+| `php.fpm_socket` default | `"auto"`: probe `/run/php/php*-fpm.sock`, newest version first (13 §3.10 decides a user pool later, spike S7). |
+
+**v1's self-registered `lantern` project:** parsing accepts `id: lantern`, so v1 manifests still
+load (C5). Resolution reports `reserved_id` and the project is not usable. `migrate-v1` **skips
+it with a note**, because self-registration was dropped (15 §3.10).
+
+**`manifest_rev`:** the registry computes it as a hash of the serialized `ResolvedManifest`,
+refreshed whenever the manifest is re-resolved. `ResolvedManifest::summary(rev)` takes it as an
+argument.
+
 ---
 
 ## B. Proposals accepted into `01-architecture.md`

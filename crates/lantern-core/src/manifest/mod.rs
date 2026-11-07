@@ -1,6 +1,7 @@
 //! Manifest parsing, diagnostics and layered resolution.
 pub mod raw;
 pub mod schema;
+mod summary;
 
 use crate::{
     ids::ProjectId,

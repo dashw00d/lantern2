@@ -412,7 +412,7 @@ wire_struct! { /// An allocated instance port.
     PortEntry { port: u16, status: InstanceStatus, health_status: String, url: String }
 }
 wire_struct! { /// A conflict between an instance lease and a discovered holder.
-    PortConflict { instance: InstanceId, holder: Value }
+    PortConflict { instance: InstanceId, holder: crate::model::PortHolder }
 }
 wire_struct! { /// Port leases, unmanaged listeners and conflicts.
     PortsView { instances: BTreeMap<InstanceId, PortEntry>, unmanaged: Vec<Listener>, conflicts: Vec<PortConflict> }

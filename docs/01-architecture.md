@@ -56,7 +56,7 @@ A local development control plane for one Linux machine and one user:
 | **Primary instance** | The instance for the primary checkout. `InstanceId == ProjectId`. |
 | **Manifest** | `lantern.yaml` / `lantern.yml`. Resolved *per checkout*: a branch may change its own manifest. |
 | **Service** | Shared infrastructure that is not a project: Mailpit, Redis, Postgres. Managed via systemd units. |
-| **Listener** | An observed TCP listening socket on localhost, with its owning process, cwd, and (if matched) project/instance. Ephemeral. Not persisted. |
+| **Listener** | An observed TCP LISTEN socket (v4/v6, loopback and non-loopback), with its owning process, cwd, and (if matched) project/instance. Ephemeral. Not persisted. |
 | **Unmanaged instance** | A Listener whose cwd maps to a known project checkout but which Lantern did not start. Can be *adopted* (gets a domain/route) without Lantern owning the process. |
 | **Tool** | A project whose manifest declares `kind: tool` or `kind: capability` plus endpoints/docs, surfaced to agents via MCP. (Same as v1.) |
 | **Profile** | A named set of services + auto-start instances + env overrides (v1 concept, kept). |

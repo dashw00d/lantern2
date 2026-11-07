@@ -169,7 +169,10 @@ fn operations_intel_system_and_misc_round_trip() {
     round::<PortEntry>(
         json!({"port":29000,"status":"running","health_status":"healthy","url":"https://myapp.glow"}),
     );
-    round::<PortConflict>(json!({"instance":"myapp","holder":{"port":29000}}));
+    round::<PortConflict>(
+        json!({"instance":"myapp","holder":{"port":29000,"addr":"127.0.0.1:29000","pid":42,"uid":1000,
+        "exe":"/usr/bin/node","cmdline":["node"],"cwd":"/tmp","unit":null,"instance":null,"label":"node","docker":null}}),
+    );
     round::<PortsView>(json!({"instances":{},"unmanaged":[],"conflicts":[]}));
     let doc =
         json!({"path":"README.md","kind":"readme","source":"manual","exists":true,"size":10,"mtime":null});
