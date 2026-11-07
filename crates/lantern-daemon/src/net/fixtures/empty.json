@@ -1,0 +1,170 @@
+{
+  "admin": {
+    "config": {
+      "persist": false
+    },
+    "listen": "unix//run/lantern/caddy.sock|0600"
+  },
+  "apps": {
+    "http": {
+      "http_port": 39702,
+      "https_port": 39703,
+      "servers": {
+        "lantern-http": {
+          "listen": [
+            "127.0.0.1:39702"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "headers": {
+                    "Location": [
+                      "https://{http.request.host}:39703{http.request.uri}"
+                    ]
+                  },
+                  "status_code": 308
+                }
+              ]
+            }
+          ]
+        },
+        "lantern-https": {
+          "automatic_https": {
+            "disable_redirects": true
+          },
+          "errors": {
+            "routes": [
+              {
+                "handle": [
+                  {
+                    "handler": "rewrite",
+                    "uri": "/__lantern/page"
+                  },
+                  {
+                    "handler": "reverse_proxy",
+                    "headers": {
+                      "request": {
+                        "set": {
+                          "Host": [
+                            "127.0.0.1:39701"
+                          ],
+                          "X-Lantern-Error-Status": [
+                            "{http.error.status_code}"
+                          ],
+                          "X-Lantern-Orig-Uri": [
+                            "{http.request.orig_uri}"
+                          ]
+                        }
+                      }
+                    },
+                    "stream_close_delay": "24h",
+                    "upstreams": [
+                      {
+                        "dial": "127.0.0.1:39701"
+                      }
+                    ]
+                  }
+                ],
+                "match": [
+                  {
+                    "expression": "{http.error.status_code} in [502, 503, 504]"
+                  }
+                ]
+              }
+            ]
+          },
+          "listen": [
+            "127.0.0.1:39703"
+          ],
+          "protocols": [
+            "h1",
+            "h2"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "rewrite",
+                  "uri": "/__lantern/page"
+                },
+                {
+                  "handler": "reverse_proxy",
+                  "headers": {
+                    "request": {
+                      "set": {
+                        "Host": [
+                          "127.0.0.1:39701"
+                        ],
+                        "X-Lantern-Error-Status": [
+                          "{http.error.status_code}"
+                        ],
+                        "X-Lantern-Orig-Uri": [
+                          "{http.request.orig_uri}"
+                        ]
+                      }
+                    }
+                  },
+                  "stream_close_delay": "24h",
+                  "upstreams": [
+                    {
+                      "dial": "127.0.0.1:39701"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "pki": {
+      "certificate_authorities": {
+        "local": {
+          "install_trust": false,
+          "intermediate_common_name": "Lantern Local CA Intermediate",
+          "intermediate_lifetime": "720h",
+          "name": "Lantern Local CA",
+          "root": {
+            "certificate": "/data/root.crt",
+            "format": "pem_file",
+            "private_key": "/data/root.key"
+          }
+        }
+      }
+    },
+    "tls": {
+      "automation": {
+        "policies": [
+          {
+            "issuers": [
+              {
+                "ca": "local",
+                "lifetime": "168h",
+                "module": "internal"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "logging": {
+    "logs": {
+      "default": {
+        "encoder": {
+          "format": "console"
+        },
+        "level": "INFO",
+        "writer": {
+          "output": "stderr"
+        }
+      }
+    }
+  },
+  "storage": {
+    "module": "file_system",
+    "root": "/data/caddy"
+  }
+}
