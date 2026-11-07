@@ -2,6 +2,7 @@
 
 mod app;
 mod fonts;
+mod logs;
 mod model;
 
 use lantern_cli::args::GuiArgs;

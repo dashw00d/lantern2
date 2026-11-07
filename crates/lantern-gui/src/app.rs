@@ -1,20 +1,21 @@
 use crate::fonts::Fonts;
+use crate::logs::{LogBuffer, ROW_HEIGHT};
 use crate::model::{Connection, Effect, Mirror};
 use futures_util::StreamExt;
 use iced::{
     Element, Font, Length, Subscription, Task, Theme, theme,
-    widget::{button, column, container, row, scrollable, text, text_input},
+    widget::{button, column, container, row, scrollable, space, text, text_input},
     window,
 };
 use lantern_cli::args::GuiArgs;
 use lantern_client::{Client, EventsOptions, StreamEvent, Wait};
 use lantern_core::{
-    api::{OperationId, OperationResponse, OperationStatus},
+    api::{LogPage, LogParams, OperationId, OperationResponse, OperationStatus, WireEvent},
     ids::InstanceId,
-    model::InstanceStatus,
+    model::{InstanceStatus, LogLine},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -73,6 +74,11 @@ struct App {
     filter: String,
     why: Option<String>,
     stream_generation: u64,
+    log_target: Option<InstanceId>,
+    logs: LogBuffer,
+    log_loading: bool,
+    log_epoch: u64,
+    log_live: VecDeque<LogLine>,
 }
 #[derive(Debug, Clone)]
 enum Message {
@@ -90,6 +96,11 @@ enum Message {
     ShowWhy,
     DaemonDone(Result<String, String>, bool),
     CopyCommand,
+    OpenLogs(InstanceId),
+    Dashboard,
+    LogBacklog(InstanceId, u64, Result<LogPage, String>),
+    LogScrolled(scrollable::Viewport),
+    LogFollow,
 }
 impl App {
     fn boot(args: &GuiArgs, fonts: Fonts, client: Client) -> (Self, Task<Message>) {
@@ -104,6 +115,11 @@ impl App {
             filter: String::new(),
             why: None,
             stream_generation: 0,
+            log_target: None,
+            logs: LogBuffer::default(),
+            log_loading: false,
+            log_epoch: 0,
+            log_live: VecDeque::new(),
         };
         let open = if args.tray { Task::none() } else { app.open() };
         (
@@ -137,6 +153,51 @@ impl App {
                 window::close(id)
             }
             Message::Stream(event) => {
+                if matches!(&*event, StreamEvent::Connected) {
+                    if let Some(id) = self.log_target.clone() {
+                        self.mirror.stream(StreamEvent::Connected);
+                        self.log_epoch = self.log_epoch.wrapping_add(1);
+                        let epoch = self.log_epoch;
+                        self.log_loading = true;
+                        self.log_live.clear();
+                        let client = self.client.clone();
+                        let requested = id.clone();
+                        return Task::perform(
+                            async move {
+                                client
+                                    .logs(
+                                        &requested,
+                                        LogParams {
+                                            tail: Some(5000),
+                                            since: None,
+                                            stream: None,
+                                            grep: None,
+                                            format: None,
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            },
+                            move |result| Message::LogBacklog(id.clone(), epoch, result),
+                        );
+                    }
+                }
+                if let StreamEvent::Event(WireEvent::Log { line }) = &*event {
+                    if self.log_target.as_ref() == Some(&line.instance) {
+                        if self.log_loading {
+                            if self.log_live.len() == 20_000 {
+                                self.log_live.pop_front();
+                            }
+                            self.log_live.push_back(line.clone());
+                        } else {
+                            self.logs.push(line.clone());
+                            if self.logs.follow {
+                                return iced::widget::operation::snap_to_end("lantern-logs");
+                            }
+                        }
+                    }
+                    return Task::none();
+                }
                 for effect in self.mirror.stream(*event) {
                     match effect {
                         Effect::Restarted => self.pending.clear(),
@@ -180,6 +241,11 @@ impl App {
                         }
                         Effect::Removed(id) => {
                             self.pending.remove(&id);
+                            if self.log_target.as_ref() == Some(&id) {
+                                self.log_target = None;
+                                self.stream_generation = self.stream_generation.wrapping_add(1);
+                                self.toasts.push(format!("{id} was removed"));
+                            }
                         }
                     }
                 }
@@ -269,6 +335,53 @@ impl App {
                 Task::none()
             }
             Message::CopyCommand => iced::clipboard::write("systemctl --user start lantern".to_string()),
+            Message::OpenLogs(id) => {
+                self.log_target = Some(id);
+                self.logs = LogBuffer::default();
+                self.log_live.clear();
+                self.log_epoch = self.log_epoch.wrapping_add(1);
+                self.stream_generation = self.stream_generation.wrapping_add(1);
+                Task::none()
+            }
+            Message::Dashboard => {
+                self.log_target = None;
+                self.log_epoch = self.log_epoch.wrapping_add(1);
+                self.stream_generation = self.stream_generation.wrapping_add(1);
+                Task::none()
+            }
+            Message::LogBacklog(id, epoch, result) => {
+                if self.log_target.as_ref() != Some(&id) || self.log_epoch != epoch {
+                    return Task::none();
+                }
+                self.log_loading = false;
+                let incoming = std::mem::take(&mut self.log_live);
+                match result {
+                    Ok(page) => self
+                        .logs
+                        .replace_with_backlog(page.lines, incoming.into_iter().collect()),
+                    Err(error) => {
+                        self.toasts.push(format!("Could not load logs: {error}"));
+                        for line in incoming {
+                            self.logs.push(line);
+                        }
+                    }
+                }
+                if self.logs.follow {
+                    iced::widget::operation::snap_to_end("lantern-logs")
+                } else {
+                    Task::none()
+                }
+            }
+            Message::LogScrolled(viewport) => {
+                self.logs.scroll_y = viewport.absolute_offset().y;
+                self.logs.viewport_h = viewport.bounds().height;
+                self.logs.follow = viewport.absolute_offset_reversed().y < 2.0 * ROW_HEIGHT;
+                Task::none()
+            }
+            Message::LogFollow => {
+                self.logs.follow = true;
+                iced::widget::operation::snap_to_end("lantern-logs")
+            }
             Message::Theme(mode) => {
                 self.mode = mode;
                 Task::none()
@@ -307,7 +420,44 @@ impl App {
         } else if matches!(self.mirror.connection, Connection::Connecting) {
             body = body.push(text("Connecting to Lantern…"));
         }
-        if self.mirror.ever_live {
+        if let Some(target) = &self.log_target {
+            body = body.push(
+                row![
+                    button("‹ Dashboard").on_press(Message::Dashboard),
+                    text(format!("{target}  ›  Logs")).size(22),
+                    button("Jump to latest").on_press(Message::LogFollow)
+                ]
+                .spacing(12),
+            );
+            body = body.push(text(format!(
+                "{} lines buffered · {}",
+                self.logs.len(),
+                if self.logs.follow { "Following" } else { "Paused" }
+            )));
+            let range = self.logs.range();
+            let mut rows = column![space::vertical().height(range.start as f32 * ROW_HEIGHT)].spacing(0);
+            for index in range.clone() {
+                if let Some(line) = self.logs.get(index) {
+                    let value = format!("{}  {}", line.ts, line.line);
+                    rows = rows.push(
+                        container(
+                            text(value)
+                                .font(Font::with_name(self.fonts.mono))
+                                .size(13)
+                                .wrapping(text::Wrapping::None),
+                        )
+                        .height(ROW_HEIGHT),
+                    );
+                }
+            }
+            rows = rows.push(space::vertical().height((self.logs.len() - range.end) as f32 * ROW_HEIGHT));
+            body = body.push(
+                scrollable(rows)
+                    .id("lantern-logs")
+                    .on_scroll(Message::LogScrolled)
+                    .height(Length::Fill),
+            );
+        } else if self.mirror.ever_live {
             let instances = self
                 .mirror
                 .live
@@ -430,6 +580,7 @@ impl App {
                             restart
                         });
                     }
+                    line = line.push(button("Logs").on_press(Message::OpenLogs(instance.id.clone())));
                     list = list.push(line);
                     if matches!(
                         status,
@@ -487,7 +638,14 @@ impl App {
         let mut subscriptions = vec![
             window::close_requests().map(Message::Close),
             iced::system::theme_changes().map(Message::Theme),
-            Subscription::run_with(ClientKey(self.client.clone(), self.stream_generation), stream),
+            Subscription::run_with(
+                ClientKey(
+                    self.client.clone(),
+                    self.stream_generation,
+                    self.log_target.clone(),
+                ),
+                stream,
+            ),
         ];
         if !self.pending.is_empty() {
             subscriptions.push(iced::time::every(Duration::from_millis(500)).map(Message::Tick));
@@ -529,16 +687,21 @@ async fn daemon_action(show: bool) -> Result<String, String> {
     }
 }
 #[derive(Debug, Clone)]
-struct ClientKey(Client, u64);
+struct ClientKey(Client, u64, Option<InstanceId>);
 impl std::hash::Hash for ClientKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         "lantern-state-stream".hash(state);
         self.1.hash(state);
+        self.2.hash(state);
     }
 }
 fn stream(key: &ClientKey) -> impl futures_util::Stream<Item = Message> + use<> {
     key.0
-        .events(EventsOptions::default())
+        .events(EventsOptions {
+            logs: key.2.clone().into_iter().collect(),
+            tail: 1000,
+            ..EventsOptions::default()
+        })
         .map(|event| Message::Stream(Box::new(event)))
 }
 
