@@ -22,6 +22,7 @@ struct Negative {
 pub(super) struct Owners {
     positive: HashMap<u64, Owner>,
     negative: HashMap<u64, Negative>,
+    unreadable_fds: HashMap<ProcKey, Instant>,
 }
 impl Owners {
     fn matches(fd: &PathBuf, inode: u64) -> bool {
@@ -58,6 +59,8 @@ impl Owners {
         reader: &mut ProcReader,
         now: Instant,
     ) -> HashMap<u64, u32> {
+        self.unreadable_fds
+            .retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(60));
         let wanted_all: HashSet<_> = sockets
             .iter()
             .filter(|s| s.uid == reader.root.uid())
@@ -97,8 +100,17 @@ impl Owners {
                 let Ok(key) = reader.key(pid) else {
                     continue;
                 };
-                let Ok(fds) = fs::read_dir(reader.root.pid_path(pid).join("fd")) else {
+                if self.unreadable_fds.contains_key(&key) {
                     continue;
+                }
+                let fds = match fs::read_dir(reader.root.pid_path(pid).join("fd")) {
+                    Ok(fds) => fds,
+                    Err(err) => {
+                        if err.kind() == std::io::ErrorKind::PermissionDenied {
+                            self.unreadable_fds.insert(key, now);
+                        }
+                        continue;
+                    }
                 };
                 for fd in fds.flatten() {
                     let path = fd.path();
@@ -140,6 +152,49 @@ impl Owners {
 mod tests {
     use super::*;
     use crate::discovery::procinfo::{ProcRoot, fixture::Tree};
+    #[test]
+    fn discovery_negative_inode_backoff_and_retry() {
+        let t = Tree::new();
+        t.process(123, 1, 5, "node", "/repo", &["node"], "/app.service");
+        let mut reader = ProcReader::new(ProcRoot::new(&t.0));
+        let now = Instant::now();
+        let socket = RawSocket {
+            addr: "127.0.0.1:39202".parse().unwrap(),
+            uid: reader.root.uid(),
+            inode: 999,
+        };
+        let mut owners = Owners::default();
+        assert!(
+            owners
+                .resolve(std::slice::from_ref(&socket), &mut reader, now)
+                .is_empty()
+        );
+        assert!(
+            owners
+                .resolve(
+                    std::slice::from_ref(&socket),
+                    &mut reader,
+                    now + Duration::from_secs(1)
+                )
+                .is_empty()
+        );
+        t.socket(123, 8, 999);
+        assert!(
+            owners
+                .resolve(
+                    std::slice::from_ref(&socket),
+                    &mut reader,
+                    now + Duration::from_secs(2)
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            owners
+                .resolve(&[socket], &mut reader, now + Duration::from_secs(62))
+                .get(&999),
+            Some(&123)
+        );
+    }
     #[test]
     fn discovery_fixture_owners_pid_reuse_and_ancestors() {
         let t = Tree::new();

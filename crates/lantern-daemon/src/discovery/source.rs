@@ -258,7 +258,13 @@ impl AutoSource {
     }
     /// Return both the sockets and the source that succeeded.
     pub fn scan(&mut self) -> io::Result<(SocketSourceKind, Vec<RawSocket>)> {
-        match SockDiag.listening_tcp() {
+        self.scan_with(&mut SockDiag)
+    }
+    fn scan_with(
+        &mut self,
+        primary: &mut impl SocketSource,
+    ) -> io::Result<(SocketSourceKind, Vec<RawSocket>)> {
+        match primary.listening_tcp() {
             Ok(rows) => Ok((SocketSourceKind::SockDiag, rows)),
             Err(e) => {
                 if !self.warned {
@@ -279,6 +285,62 @@ impl Default for AutoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discovery_proc_fixture_and_automatic_fallback() {
+        use crate::discovery::procinfo::fixture::Tree;
+        #[derive(Debug)]
+        struct Failed;
+        impl SocketSource for Failed {
+            fn listening_tcp(&mut self) -> io::Result<Vec<RawSocket>> {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            }
+        }
+        let t = Tree::new();
+        std::fs::create_dir_all(t.0.join("net")).unwrap();
+        let header = "sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode\n";
+        std::fs::write(
+            t.0.join("net/tcp"),
+            format!("{header}0: 0100007F:9920 00000000:0000 0A 0:0 0:0 0 1000 0 456\n"),
+        )
+        .unwrap();
+        std::fs::write(t.0.join("net/tcp6"), format!("{header}0: 00000000000000000000000001000000:9921 00000000000000000000000000000000:0000 0A 0:0 0:0 0 1000 0 457\n")).unwrap();
+        let mut auto = AutoSource::new(&t.0);
+        let (source, rows) = auto.scan_with(&mut Failed).unwrap();
+        assert_eq!(source, SocketSourceKind::ProcNetTcp);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].addr, "127.0.0.1:39200".parse().unwrap());
+        assert_eq!(rows[1].addr, "[::1]:39201".parse().unwrap());
+        assert_eq!(
+            parse_addr("0000000000000000FFFF00000100007F", true).unwrap(),
+            "::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+    }
+    #[test]
+    fn discovery_diag_error_and_ipv6() {
+        let mut msg = vec![0; 88];
+        msg[..4].copy_from_slice(&88u32.to_ne_bytes());
+        msg[4..6].copy_from_slice(&20u16.to_ne_bytes());
+        msg[8..12].copy_from_slice(&7u32.to_ne_bytes());
+        msg[16] = 10;
+        msg[17] = 10;
+        msg[20..22].copy_from_slice(&39200u16.to_be_bytes());
+        msg[39] = 1;
+        msg[80..84].copy_from_slice(&1000u32.to_ne_bytes());
+        msg[84..88].copy_from_slice(&1234u32.to_ne_bytes());
+        let mut out = Vec::new();
+        assert!(!parse_diag(&msg, 7, &mut out).unwrap());
+        assert_eq!(out[0].addr, "[::1]:39200".parse().unwrap());
+        let mut err = [0u8; 20];
+        err[..4].copy_from_slice(&20u32.to_ne_bytes());
+        err[4..6].copy_from_slice(&2u16.to_ne_bytes());
+        err[8..12].copy_from_slice(&7u32.to_ne_bytes());
+        err[16..20].copy_from_slice(&(-13i32).to_ne_bytes());
+        assert_eq!(
+            parse_diag(&err, 7, &mut Vec::new()).unwrap_err().raw_os_error(),
+            Some(13)
+        );
+        assert!(parse_diag(&msg, 8, &mut Vec::new()).is_err());
+    }
     #[test]
     fn discovery_proc_tcp_parse() {
         let head = "sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode\n";

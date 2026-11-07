@@ -112,14 +112,14 @@ fn fallback(p: Option<&ProcInfo>) -> String {
     let Some(p) = p else {
         return "Unknown process".into();
     };
+    let safe_args = redact(&p.cmdline_raw);
     let exe = p
         .exe
         .as_deref()
         .and_then(Path::file_name)
         .and_then(|s| s.to_str())
-        .or_else(|| p.cmdline_raw.first().map(|s| basename(s)))
+        .or_else(|| safe_args.first().map(|s| basename(s)))
         .unwrap_or("process");
-    let safe_args = redact(&p.cmdline_raw);
     let script = if [
         "node", "bun", "deno", "tsx", "nodemon", "python", "python3", "ruby", "php",
     ]

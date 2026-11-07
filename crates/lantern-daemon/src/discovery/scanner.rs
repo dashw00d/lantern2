@@ -183,6 +183,57 @@ mod tests {
         }
     }
     #[test]
+    fn discovery_user_hide_and_settings_change() {
+        use crate::discovery::hide::{HideRule, PortSpec};
+        let t = Tree::new();
+        t.process(
+            112,
+            1,
+            10,
+            "node",
+            "/dev/app/tmp",
+            &["node", "vite", "--type=renderer", "--token=secret"],
+            "/app.service",
+        );
+        t.socket(112, 3, 888);
+        let root = ProcRoot::new(&t.0);
+        let uid = root.uid();
+        let sockets = vec![RawSocket {
+            addr: "127.0.0.1:39200".parse().unwrap(),
+            inode: 888,
+            uid,
+        }];
+        let settings = HideSettings {
+            hide_defaults: false,
+            rules: vec![HideRule {
+                port: Some(PortSpec::Range(39199, 39201)),
+                cmdline: Some("*--token=secret*".into()),
+                cwd: Some("/dev/app".into()),
+                reason: Some("fixture".into()),
+                ..HideRule::default()
+            }],
+            ..HideSettings::default()
+        };
+        let mut scanner = Scanner::with_source(
+            root,
+            CheckoutIndex::new([], "/home/test"),
+            settings,
+            Box::new(Fixed(sockets)),
+            SocketSourceKind::ProcNetTcp,
+        );
+        let hidden = scanner.scan().unwrap();
+        assert!(hidden.listeners.is_empty());
+        assert_eq!(hidden.hidden[0].hidden.as_ref().unwrap().why, "fixture");
+        assert_eq!(hidden.hidden[0].cmdline[3], "--token=***");
+        scanner.set_settings(HideSettings {
+            hide_defaults: false,
+            ..HideSettings::default()
+        });
+        let visible = scanner.scan().unwrap();
+        assert_eq!(visible.listeners.len(), 1);
+        assert_eq!(visible.seq, hidden.seq + 1);
+    }
+    #[test]
     fn discovery_port_binding_and_conflicts() {
         use crate::discovery::{
             PortBinding,
