@@ -13,7 +13,6 @@ use std::{
     time::Duration,
 };
 
-const MAX_OPENAPI: usize = 5 * 1024 * 1024;
 fn method_risk(method: &str) -> Risk {
     match method {
         "GET" | "HEAD" | "OPTIONS" => Risk::Low,
@@ -137,6 +136,7 @@ async fn fetch(
     policy: &UpstreamPolicy,
     client: &dyn ToolApiClient,
     timeout_ms: u64,
+    max_bytes: usize,
 ) -> Result<Value, String> {
     let request = policy
         .prepare(
@@ -145,7 +145,7 @@ async fn fetch(
             "GET",
             None,
             Duration::from_millis(timeout_ms),
-            MAX_OPENAPI,
+            max_bytes,
             "application/json, application/yaml",
         )
         .await?;
@@ -154,7 +154,7 @@ async fn fetch(
         return Err(format!("HTTP {}", response.status));
     }
     if response.truncated {
-        return Err("OpenAPI exceeds 5 MiB".into());
+        return Err(format!("OpenAPI exceeds {max_bytes} bytes"));
     }
     parse(&response.body)
 }
@@ -167,6 +167,7 @@ pub(super) struct Input<'a> {
     pub previous: &'a [EndpointEntry],
     pub policy: &'a UpstreamPolicy,
     pub client: &'a dyn ToolApiClient,
+    pub max_bytes: usize,
 }
 pub(super) async fn scan(input: Input<'_>) -> (Vec<EndpointEntry>, ApiMeta, bool) {
     let auto = input.manifest.api_auto.as_ref();
@@ -231,12 +232,20 @@ pub(super) async fn scan(input: Input<'_>) -> (Vec<EndpointEntry>, ApiMeta, bool
                         } else {
                             url.path().to_string()
                         };
-                        fetch(base.as_str(), &path, input.policy, input.client, timeout_ms).await
+                        fetch(
+                            base.as_str(),
+                            &path,
+                            input.policy,
+                            input.client,
+                            timeout_ms,
+                            input.max_bytes,
+                        )
+                        .await
                     }
                     _ => Err("OpenAPI URL must use the registered upstream authority".into()),
                 }
             } else {
-                read_bytes(input.root, source, MAX_OPENAPI as u64).and_then(|b| parse(&b))
+                read_bytes(input.root, source, input.max_bytes as u64).and_then(|b| parse(&b))
             };
             match result {
                 Ok(doc) => docs.push(doc),
@@ -252,7 +261,16 @@ pub(super) async fn scan(input: Input<'_>) -> (Vec<EndpointEntry>, ApiMeta, bool
             let mut found = false;
             for candidate in &candidates {
                 tried.push(candidate.clone());
-                if let Ok(doc) = fetch(base, candidate, input.policy, input.client, timeout_ms).await {
+                if let Ok(doc) = fetch(
+                    base,
+                    candidate,
+                    input.policy,
+                    input.client,
+                    timeout_ms,
+                    input.max_bytes,
+                )
+                .await
+                {
                     docs.push(doc);
                     found = true;
                     break;

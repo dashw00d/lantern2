@@ -119,6 +119,7 @@ pub struct AppFacade {
     pub boot_id: String,
     /// Daemon start timestamp.
     pub started_at: Timestamp,
+    pub(super) intel_service: Option<Arc<crate::intel::Intel>>,
     network_health: Option<Arc<super::network::NetworkHealth>>,
     isolated_health: bool,
     active: Arc<Mutex<HashMap<InstanceId, Active>>>,
@@ -153,10 +154,64 @@ impl AppFacade {
             home,
             boot_id,
             started_at: Timestamp::now(),
+            intel_service: None,
             network_health: None,
             isolated_health: false,
             active: Arc::default(),
         }
+    }
+    /// Attach the shared per-instance intelligence service.
+    pub fn with_intel(mut self, intel: Arc<crate::intel::Intel>) -> Self {
+        self.intel_service = Some(intel);
+        self
+    }
+    /// Build a per-checkout refresh input from the authoritative registry.
+    pub fn intel_input(&self, id: &InstanceId) -> FacadeResult<crate::intel::IntelInput> {
+        let instance = self
+            .registry
+            .instance(id)
+            .ok_or_else(|| error("instance_not_found", format!("instance {id} not found")))?;
+        let running = matches!(
+            instance.runtime.status,
+            InstanceStatus::Running | InstanceStatus::Unhealthy | InstanceStatus::External
+        );
+        let base_url = if id.is_primary() {
+            instance.manifest.upstream_url.clone()
+        } else {
+            None
+        }
+        .or_else(|| {
+            instance.runtime.external.as_ref().map(|e| {
+                format!(
+                    "{}://{}",
+                    if e.scheme == lantern_core::model::Scheme::Https {
+                        "https"
+                    } else {
+                        "http"
+                    },
+                    e.upstream
+                )
+            })
+        })
+        .or_else(|| instance.runtime.upstream.map(|addr| format!("http://{addr}")))
+        .or_else(|| {
+            running
+                .then(|| instance.runtime.port.map(|p| format!("http://127.0.0.1:{p}")))
+                .flatten()
+        })
+        .or_else(|| instance.manifest.base_url.clone());
+        Ok(crate::intel::IntelInput {
+            instance: id.clone(),
+            checkout: instance.checkout.path,
+            manifest: instance.manifest,
+            base_url,
+            running,
+        })
+    }
+    fn intel_handle(&self) -> FacadeResult<&Arc<crate::intel::Intel>> {
+        self.intel_service
+            .as_ref()
+            .ok_or_else(|| error("unavailable", "project intelligence is not assembled"))
     }
     /// Include live network errors in health; isolated mode avoids inspecting user services.
     pub fn with_network_health(mut self, health: Arc<super::network::NetworkHealth>, isolated: bool) -> Self {
@@ -751,34 +806,98 @@ impl DaemonFacade for AppFacade {
     async fn delete_template(&self, _: String) -> FacadeResult<()> {
         Err(error("unavailable", "template management is not assembled"))
     }
-    async fn intel(&self, _: InstanceId, _: Option<u32>) -> FacadeResult<IntelSnapshot> {
-        Err(error("unavailable", "project intelligence is not assembled"))
+    async fn intel(&self, id: InstanceId, max_age: Option<u32>) -> FacadeResult<IntelSnapshot> {
+        self.view(&id)?;
+        let snapshot = self
+            .intel_handle()?
+            .snapshot(&id)
+            .await
+            .ok_or_else(|| error("unavailable", "intel has not been refreshed; use POST refresh"))?;
+        let mut snapshot = (*snapshot).clone();
+        if let Some(max_age) = max_age {
+            snapshot.stale |= snapshot.refreshed_at.is_none_or(|at| {
+                Timestamp::now().as_second().saturating_sub(at.as_second()) > i64::from(max_age)
+            });
+        }
+        Ok(snapshot)
     }
-    async fn refresh_intel(&self, _: InstanceId) -> FacadeResult<IntelSnapshot> {
-        Err(error("unavailable", "project intelligence is not assembled"))
+    async fn refresh_intel(&self, id: InstanceId) -> FacadeResult<IntelSnapshot> {
+        let input = self.intel_input(&id)?;
+        let snapshot = self
+            .intel_handle()?
+            .refresh(input)
+            .await
+            .map_err(|e| error("intel_refresh_failed", e))?;
+        Ok((*snapshot).clone())
     }
     async fn refresh_all_intel(&self) -> FacadeResult<IntelRefreshReport> {
-        Err(error("unavailable", "project intelligence is not assembled"))
+        let inputs = self
+            .registry
+            .instances()
+            .into_iter()
+            .filter_map(|v| self.intel_input(&v.id).ok())
+            .collect();
+        Ok(self.intel_handle()?.refresh_all(inputs).await)
     }
-    async fn docs(&self, _: InstanceId) -> FacadeResult<Vec<DocEntry>> {
-        Err(error("unavailable", "document discovery is not assembled"))
+    async fn docs(&self, id: InstanceId) -> FacadeResult<Vec<DocEntry>> {
+        Ok(self.intel(id, None).await?.docs)
     }
     async fn doc(
         &self,
-        _: InstanceId,
-        _: String,
-        _: Option<u64>,
-        _: Option<u64>,
+        id: InstanceId,
+        path: String,
+        offset: Option<u64>,
+        max_chars: Option<u64>,
     ) -> FacadeResult<DocContent> {
-        Err(error("unavailable", "document discovery is not assembled"))
+        self.view(&id)?;
+        self.intel_handle()?
+            .read_doc(
+                &id,
+                &path,
+                offset.unwrap_or(0),
+                max_chars.unwrap_or(40_000).min(40_000) as usize,
+            )
+            .await
+            .map_err(|message| {
+                let code = if message.starts_with("doc_not_found") {
+                    "doc_not_found"
+                } else if message.contains("binary")
+                    || message.contains("invalid checkout-relative")
+                    || message.contains("cannot open checkout")
+                {
+                    "forbidden"
+                } else {
+                    "doc_not_found"
+                };
+                error(code, message)
+            })
     }
     async fn endpoints(
         &self,
-        _: InstanceId,
-        _: Option<String>,
-        _: Option<u32>,
+        id: InstanceId,
+        q: Option<String>,
+        limit: Option<u32>,
     ) -> FacadeResult<Vec<EndpointEntry>> {
-        Err(error("unavailable", "endpoint discovery is not assembled"))
+        let q = q.unwrap_or_default().to_ascii_lowercase();
+        Ok(self
+            .intel(id, None)
+            .await?
+            .endpoints
+            .into_iter()
+            .filter(|e| {
+                q.is_empty()
+                    || format!(
+                        "{} {} {} {}",
+                        e.method,
+                        e.path,
+                        e.description.as_deref().unwrap_or(""),
+                        e.category.as_deref().unwrap_or("")
+                    )
+                    .to_ascii_lowercase()
+                    .contains(&q)
+            })
+            .take(limit.unwrap_or(400).min(10_000) as usize)
+            .collect())
     }
     async fn profiles(&self) -> FacadeResult<Vec<Value>> {
         let profiles = lantern_core::profiles::Profiles::load_dir(&self.dirs.config.join("profiles"))

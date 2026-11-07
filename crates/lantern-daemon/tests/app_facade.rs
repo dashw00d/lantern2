@@ -84,9 +84,10 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("lantern.yaml"),
-        "id: sample\ntype: proxy\nrun: {cmd: 'python3 -m http.server ${PORT}'}\n",
+        "id: sample\ntype: proxy\nrun: {cmd: 'python3 -m http.server ${PORT}'}\ndocs: [README.md]\nendpoints: [{method: GET, path: /hello, description: Hello}]\n",
     )
     .unwrap();
+    fs::write(root.join("README.md"), "Original documentation").unwrap();
     fs::create_dir_all(temp.0.join("cache")).unwrap();
     fs::write(temp.0.join("cache/env.sh"), "export PATH='/usr/bin:/bin'\n").unwrap();
     let dirs = Dirs {
@@ -101,8 +102,14 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
     settings.health.interval_secs = 60;
     let bus = EventBus::new();
     let tracker = OperationTracker::new(bus.clone());
-    let (registry, _) =
-        RegistryHandle::open(&dirs, settings.clone(), Templates::default(), temp.0.clone(), bus).unwrap();
+    let (registry, _) = RegistryHandle::open(
+        &dirs,
+        settings.clone(),
+        Templates::default(),
+        temp.0.clone(),
+        bus.clone(),
+    )
+    .unwrap();
     let probe: Arc<dyn PortProbe> = Arc::new(Ready);
     let adapter = Arc::new(
         RegistryAdapter::new(registry.clone(), probe.clone(), settings.clone())
@@ -196,7 +203,12 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         dirs,
         temp.0.clone(),
         "test".into(),
-    );
+    )
+    .with_intel(Arc::new(lantern_daemon::intel::Intel::new(
+        temp.0.join("state/intel-cache.json"),
+        lantern_daemon::mcp::upstream::UpstreamPolicy::default(),
+        lantern_daemon::mcp::upstream::default_client(),
+    )));
     let project = app
         .register_project(RegisterProjectRequest {
             path: root,
@@ -209,6 +221,75 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         .await
         .unwrap();
     let id: InstanceId = project.primary;
+    assert_eq!(app.intel(id.clone(), None).await.unwrap_err().code, "unavailable");
+    let snapshot = app.refresh_intel(id.clone()).await.unwrap();
+    assert!(snapshot.docs.iter().any(|d| d.path == "README.md"));
+    assert_eq!(
+        app.doc(id.clone(), "README.md".into(), Some(0), Some(8))
+            .await
+            .unwrap()
+            .content,
+        "Original"
+    );
+    assert_eq!(
+        app.doc(id.clone(), "../secret".into(), None, None)
+            .await
+            .unwrap_err()
+            .code,
+        "doc_not_found"
+    );
+    assert_eq!(
+        app.endpoints(id.clone(), Some("hello".into()), Some(1))
+            .await
+            .unwrap()[0]
+            .path,
+        "/hello"
+    );
+    fs::write(temp.0.join("project/README.md"), b"binary\0data").unwrap();
+    assert_eq!(
+        app.doc(id.clone(), "README.md".into(), None, None)
+            .await
+            .unwrap_err()
+            .code,
+        "forbidden"
+    );
+    fs::write(temp.0.join("project/README.md"), "Original documentation").unwrap();
+    // A newly discovered file does not appear on GET until an explicit refresh.
+    fs::write(temp.0.join("project/CHANGELOG.md"), "changes").unwrap();
+    assert!(
+        !app.docs(id.clone())
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.path == "CHANGELOG.md")
+    );
+    assert!(
+        app.refresh_intel(id.clone())
+            .await
+            .unwrap()
+            .docs
+            .iter()
+            .any(|d| d.path == "CHANGELOG.md")
+    );
+    let intel_stop = CancellationToken::new();
+    let worker = lantern_daemon::app::intel_worker::spawn(Arc::new(app.clone()), &bus, intel_stop.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fs::write(temp.0.join("project/lantern.yaml"), "id: sample\ntype: proxy\nrun: {cmd: 'python3 -m http.server ${PORT}'}\ndocs_auto: {enabled: false}\ndocs: [CHANGELOG.md]\nendpoints: [{method: GET, path: /hello, description: Hello}]\n").unwrap();
+    let mut changed = false;
+    for _ in 0..60 {
+        if app
+            .docs(id.clone())
+            .await
+            .is_ok_and(|docs| docs.len() == 1 && docs[0].path == "CHANGELOG.md")
+        {
+            changed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    intel_stop.cancel();
+    worker.await.unwrap();
+    assert!(changed, "manifest change did not refresh the cached docs");
     // The assembled gateway must use its own origin guard, not the REST guard.
     {
         use axum::{

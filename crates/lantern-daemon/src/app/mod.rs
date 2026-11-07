@@ -12,6 +12,9 @@ pub mod facade;
 /// Gateway integration.
 pub mod gateway;
 
+/// Intel refresh worker.
+pub mod intel_worker;
+
 /// Network construction and diagnostics.
 pub mod network;
 
@@ -307,6 +310,29 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         names,
         shutdown.clone(),
     );
+    let policy = crate::mcp::upstream::UpstreamPolicy {
+        tld: settings.domains.tld.clone(),
+        allowed_hosts: settings.mcp.allowed_upstream_hosts.clone(),
+        infra_ports: vec![
+            settings.daemon.port,
+            settings
+                .dns
+                .listen
+                .parse::<std::net::SocketAddrV4>()
+                .map_or(5354, |addr| addr.port()),
+            2019,
+            settings.proxy.http_port,
+            settings.proxy.https_port,
+        ],
+    };
+    let intel = Arc::new(
+        crate::intel::Intel::new(
+            dirs.state.join("intel-cache.json"),
+            policy.clone(),
+            crate::mcp::upstream::default_client(),
+        )
+        .with_options(settings.intel.cache_file, settings.intel.max_openapi_bytes),
+    );
     let boot_id = format!("{}-{}", std::process::id(), Timestamp::now().as_nanosecond());
     let facade = Arc::new(
         AppFacade::new(
@@ -321,6 +347,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             home,
             boot_id.clone(),
         )
+        .with_intel(intel.clone())
         .with_network_health(net_health, isolated_units)
         .with_environment(env.clone())
         .with_system_paths(env.get("XDG_RUNTIME_DIR").map(PathBuf::from), cache.clone()),
@@ -333,6 +360,11 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
     }
+    let valid_ids = registry.instances().into_iter().map(|v| v.id).collect::<Vec<_>>();
+    if let Err(error) = intel.load_cache(&valid_ids).await {
+        tracing::warn!(%error, "intel cache unavailable");
+    }
+    let intel_task = intel_worker::spawn(facade.clone(), &bus, shutdown.clone());
     if let Some(name) = registry.active_profile() {
         use crate::api::facade::DaemonFacade;
         if let Err(error) = facade.activate_profile(name).await {
@@ -394,21 +426,6 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         https_port: settings.proxy.https_port,
         root_cert: net_paths.root_cert,
     });
-    let policy = crate::mcp::upstream::UpstreamPolicy {
-        tld: settings.domains.tld.clone(),
-        allowed_hosts: settings.mcp.allowed_upstream_hosts.clone(),
-        infra_ports: vec![
-            settings.daemon.port,
-            settings
-                .dns
-                .listen
-                .parse::<std::net::SocketAddrV4>()
-                .map_or(5354, |addr| addr.port()),
-            2019,
-            settings.proxy.http_port,
-            settings.proxy.https_port,
-        ],
-    };
     let mcp = crate::mcp::service(
         facade.clone(),
         crate::mcp::McpConfig {
@@ -438,6 +455,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     let _ = error_task.await;
     let _ = network_task.await;
     let _ = dns_task.await;
+    let _ = intel_task.await;
     discovery.join().await;
     loop {
         let running: Vec<_> = tracker

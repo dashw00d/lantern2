@@ -48,6 +48,8 @@ struct Inner {
     per_instance: Mutex<HashMap<InstanceId, Arc<Mutex<()>>>>,
     permits: Semaphore,
     cache_path: PathBuf,
+    cache_enabled: bool,
+    max_openapi_bytes: usize,
     save_lock: Mutex<Option<Instant>>,
     policy: UpstreamPolicy,
     client: Arc<dyn ToolApiClient>,
@@ -73,11 +75,20 @@ impl Intel {
                 per_instance: Mutex::new(HashMap::new()),
                 permits: Semaphore::new(4),
                 cache_path,
+                cache_enabled: true,
+                max_openapi_bytes: 5 * 1024 * 1024,
                 save_lock: Mutex::new(None),
                 policy,
                 client,
             }),
         }
+    }
+    /// Configure cache persistence and the maximum OpenAPI response size before cloning.
+    pub fn with_options(mut self, cache_enabled: bool, max_openapi_bytes: usize) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("configure intel before cloning");
+        inner.cache_enabled = cache_enabled;
+        inner.max_openapi_bytes = max_openapi_bytes.max(1);
+        self
     }
     /// Return a cached snapshot only, with no I/O or refresh.
     pub async fn snapshot(&self, id: &InstanceId) -> Option<Arc<IntelSnapshot>> {
@@ -123,6 +134,7 @@ impl Intel {
             previous: previous.as_ref().map_or(&[], |p| p.endpoints.as_slice()),
             policy: &self.inner.policy,
             client: self.inner.client.as_ref(),
+            max_bytes: self.inner.max_openapi_bytes,
         })
         .await;
         let now = Timestamp::now();
@@ -237,6 +249,9 @@ impl Intel {
     }
     /// Atomically write endpoint-only cache data to the injected path.
     pub async fn write_cache(&self) -> Result<(), String> {
+        if !self.inner.cache_enabled {
+            return Ok(());
+        }
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let records = self.inner.records.read().await;
         let instances:BTreeMap<_,_>=records.iter().map(|(id,r)|(id.to_string(),json!({"refreshed_at":r.snapshot.refreshed_at,"endpoints":r.snapshot.endpoints,"api_meta":r.snapshot.discovery.api}))).collect();
@@ -269,6 +284,9 @@ impl Intel {
     }
     /// Restore only endpoint data for currently registered ids; restored snapshots are stale.
     pub async fn load_cache(&self, valid: &[InstanceId]) -> Result<usize, String> {
+        if !self.inner.cache_enabled {
+            return Ok(0);
+        }
         let bytes = match fs::read(&self.inner.cache_path) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
