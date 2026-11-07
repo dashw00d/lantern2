@@ -8,3 +8,289 @@ pub mod discovery;
 
 /// Concrete daemon API facade.
 pub mod facade;
+
+use self::{
+    adapters::{CheckoutPreparer, RegistryAdapter, RuntimeOneShot},
+    facade::AppFacade,
+};
+use crate::{
+    api::{self, ApiConfig, ApiState},
+    discovery::{Scanner, hide::HideSettings, procinfo::ProcRoot},
+    events::EventBus,
+    git::Git,
+    instances::InstanceService,
+    operations::OperationTracker,
+    registry::{RegistryHandle, state_io::Recovery},
+    runtime::{
+        Runtime, RuntimeConfig,
+        seams::ScannerProbe,
+        systemd::{SystemctlBackend, UnitNames},
+    },
+};
+use lantern_core::{
+    Timestamp,
+    detect::Templates,
+    dirs::Dirs,
+    settings::{self, Settings},
+};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+
+/// Inputs for daemon startup; callers can supply isolated environment, settings, and unit names.
+#[derive(Debug, Clone, Default)]
+pub struct DaemonArgs {
+    /// Use the development port, domain and private directories by default.
+    pub dev: bool,
+    /// Explicit environment, useful for isolated in-process runs; absent uses the process environment.
+    pub environment: Option<BTreeMap<String, String>>,
+    /// Explicit effective settings, bypassing config loading when provided.
+    pub settings: Option<Settings>,
+    /// Optional managed-unit prefixes and slice.
+    pub unit_names: Option<UnitNames>,
+}
+
+/// Run the daemon until SIGINT or SIGTERM without stopping managed dev servers.
+pub async fn run(args: DaemonArgs) -> Result<(), String> {
+    let shutdown = CancellationToken::new();
+    let signals = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        signals.cancel();
+    });
+    run_until(args, shutdown).await
+}
+
+/// Run an in-process daemon until the supplied cancellation token is cancelled.
+pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<(), String> {
+    let _cancel_on_exit = shutdown.clone().drop_guard();
+    let mut env: BTreeMap<String, String> = args.environment.unwrap_or_else(|| std::env::vars().collect());
+    let home = PathBuf::from(env.get("HOME").ok_or("HOME must be set for daemon startup")?);
+    if args.dev {
+        let root = home.join(".local/share/lantern-dev");
+        for (name, path) in [
+            ("LANTERN_CONFIG_DIR", root.join("config")),
+            ("LANTERN_STATE_DIR", root.join("state")),
+            ("LANTERN_DATA_DIR", root.join("data")),
+            ("LANTERN_CACHE_DIR", root.join("cache")),
+        ] {
+            env.entry(name.into())
+                .or_insert_with(|| path.to_string_lossy().into_owned());
+        }
+        env.entry("LANTERN_DAEMON_PORT".into())
+            .or_insert_with(|| "4778".into());
+        env.entry("LANTERN_TLD".into()).or_insert_with(|| "glow2".into());
+    }
+    let dirs = Dirs::from_env(&env)?;
+    let settings = match args.settings {
+        Some(s) => s,
+        None => {
+            settings::load(&dirs.config.join("config.toml"), &env, &home, None)
+                .map_err(|e| e.to_string())?
+                .settings
+        }
+    };
+    let cache = env
+        .get("LANTERN_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            env.get("XDG_CACHE_HOME")
+                .map_or_else(|| home.join(".cache"), PathBuf::from)
+                .join(if args.dev { "lantern-dev" } else { "lantern" })
+        });
+    let runtime_dir = env
+        .get("LANTERN_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env.get("XDG_RUNTIME_DIR")
+                .map(|p| PathBuf::from(p).join(if args.dev { "lantern-dev" } else { "lantern" }))
+        })
+        .ok_or("XDG_RUNTIME_DIR or LANTERN_RUNTIME_DIR is required")?;
+    let names = args.unit_names.unwrap_or_default();
+    let (templates, diagnostics) =
+        Templates::load_dir(&dirs.config.join("templates")).map_err(|e| e.to_string())?;
+    for diagnostic in diagnostics {
+        tracing::warn!(message=%diagnostic.message, "template diagnostic");
+    }
+    let bus = EventBus::new();
+    let tracker = OperationTracker::new(bus.clone());
+    let (registry, recovery) =
+        RegistryHandle::open(&dirs, settings.clone(), templates, home.clone(), bus.clone())
+            .map_err(|e| e.to_string())?;
+    let initial_scan = registry.state_snapshot().projects.is_empty() || recovery != Recovery::None;
+    let scanner = Arc::new(ScannerProbe::new(Scanner::new(
+        ProcRoot::default(),
+        registry.subscribe_checkout_index().borrow().clone(),
+        HideSettings {
+            self_ports: vec![
+                settings.daemon.port,
+                settings.proxy.http_port,
+                settings.proxy.https_port,
+            ],
+            ..HideSettings::default()
+        },
+    )));
+    let adapter = Arc::new(RegistryAdapter::new(
+        registry.clone(),
+        scanner.clone(),
+        settings.clone(),
+    ));
+    let oneshot = Arc::new(RuntimeOneShot::default());
+    let git = Git::detect().await.map_err(|e| e.to_string())?;
+    let worktrees = if settings.worktrees.dir.is_empty() {
+        dirs.data.join("worktrees")
+    } else {
+        PathBuf::from(
+            settings
+                .worktrees
+                .dir
+                .replace("~/", &format!("{}/", home.display())),
+        )
+    };
+    let service = Arc::new(
+        InstanceService::new(
+            git.clone(),
+            adapter.clone(),
+            oneshot.clone(),
+            worktrees,
+            settings.worktrees.max_concurrent_setups as usize,
+            Duration::from_secs(settings.worktrees.setup_timeout_secs),
+        )
+        .with_missing_retention_days(u64::from(settings.worktrees.missing_retention_days)),
+    );
+    let runtime = Arc::new(Runtime::with_preparer(
+        RuntimeConfig {
+            settings: settings.clone(),
+            run_dir: runtime_dir.join("run"),
+            shell_env_file: cache.join("shell-env.sh"),
+            home: home.clone(),
+            names: names.clone(),
+            poll_interval: Duration::from_secs(2),
+            readiness_interval: Duration::from_millis(250),
+            mismatch_after: Duration::from_secs(3),
+        },
+        adapter,
+        scanner.clone(),
+        Arc::new(SystemctlBackend),
+        tracker.clone(),
+        Arc::new(CheckoutPreparer(service.clone())),
+    ));
+    oneshot.bind(&runtime).map_err(str::to_owned)?;
+    // Runtime state starts as stopped; restore port hints only, then let systemd decide status.
+    for (id, lease) in registry.state_snapshot().port_leases {
+        registry
+            .update_runtime(&id, move |r| r.port = Some(lease.port))
+            .map_err(|e| e.to_string())?;
+    }
+    let report = runtime.reconcile().await;
+    for problem in report.errors {
+        tracing::warn!(%problem, "runtime reconciliation");
+    }
+    let discovery = discovery::Discovery::spawn(
+        scanner,
+        registry.clone(),
+        runtime.clone(),
+        names,
+        shutdown.clone(),
+    );
+    let boot_id = format!("{}-{}", std::process::id(), Timestamp::now().as_nanosecond());
+    let facade = Arc::new(AppFacade::new(
+        registry.clone(),
+        runtime.clone(),
+        service.clone(),
+        git,
+        discovery.clone(),
+        tracker.clone(),
+        settings.clone(),
+        dirs.clone(),
+        home,
+        boot_id.clone(),
+    ));
+    if initial_scan {
+        let reg = registry.clone();
+        let dirs = dirs.clone();
+        tokio::task::spawn_blocking(move || reg.scan_workspace(&dirs))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+    }
+    let git_shutdown = shutdown.clone();
+    let git_registry = registry.clone();
+    let git_task = tokio::spawn(async move {
+        loop {
+            let repos: Vec<_> = git_registry.state_snapshot().repos.into_keys().collect();
+            for repo in repos {
+                if let Err(error) = service.tick(&repo, false).await {
+                    tracing::warn!(%error, path=%repo.display(), "git refresh failed");
+                }
+            }
+            let delay = InstanceService::refresh_interval(!git_registry.listeners().1.is_empty());
+            tokio::select! { ()=git_shutdown.cancelled()=>break, ()=tokio::time::sleep(delay)=>{} }
+        }
+    });
+    let mut errors = registry.subscribe_write_errors();
+    let error_shutdown = shutdown.clone();
+    let error_task = tokio::spawn(async move {
+        loop {
+            tokio::select! { ()=error_shutdown.cancelled()=>break, result=errors.changed()=>{ if result.is_err() { break; } if let Some(message)=errors.borrow().as_ref() { tracing::error!(%message, "state persistence failed"); } } }
+        }
+    });
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, settings.daemon.port))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(address) = env.get("NOTIFY_SOCKET") {
+        if let Err(error) = notify_systemd(address, b"READY=1") {
+            tracing::warn!(%error, "systemd readiness notification failed");
+        }
+    }
+    let api_state = ApiState::new(
+        facade,
+        bus,
+        tracker,
+        ApiConfig::new(settings.daemon.port, settings.domains.tld, boot_id),
+    );
+    let result = api::serve(listener, api::router(api_state), shutdown.clone())
+        .await
+        .map_err(|e| e.to_string());
+    if let Some(address) = env.get("NOTIFY_SOCKET") {
+        if let Err(error) = notify_systemd(address, b"STOPPING=1") {
+            tracing::warn!(%error, "systemd stopping notification failed");
+        }
+    }
+    shutdown.cancel();
+    let _ = git_task.await;
+    let _ = error_task.await;
+    discovery.join().await;
+    registry.shutdown().await?;
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn notify_systemd(address: &str, message: &[u8]) -> std::io::Result<()> {
+    use std::os::{
+        linux::net::SocketAddrExt,
+        unix::net::{SocketAddr, UnixDatagram},
+    };
+    let socket = UnixDatagram::unbound()?;
+    if let Some(name) = address.strip_prefix('@') {
+        socket.send_to_addr(message, &SocketAddr::from_abstract_name(name.as_bytes())?)?;
+    } else {
+        socket.send_to(message, address)?;
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+fn notify_systemd(_: &str, _: &[u8]) -> std::io::Result<()> {
+    Ok(())
+}

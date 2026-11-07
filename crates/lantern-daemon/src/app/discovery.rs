@@ -29,6 +29,7 @@ const DISAPPEAR: Duration = Duration::from_secs(5);
 pub struct Discovery {
     requests: mpsc::Sender<oneshot::Sender<Result<Snapshot, String>>>,
     cache: Arc<RwLock<Option<Snapshot>>>,
+    task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 impl Discovery {
     /// Launch the scanner and return its on-demand handle.
@@ -41,7 +42,7 @@ impl Discovery {
     ) -> Self {
         let (requests, rx) = mpsc::channel(32);
         let cache = Arc::new(RwLock::new(None));
-        tokio::spawn(run(
+        let task = tokio::spawn(run(
             scanner,
             registry,
             runtime,
@@ -50,7 +51,17 @@ impl Discovery {
             rx,
             cache.clone(),
         ));
-        Self { requests, cache }
+        Self {
+            requests,
+            cache,
+            task: Arc::new(tokio::sync::Mutex::new(Some(task))),
+        }
+    }
+    /// Wait for the cancelled worker to release its registry and runtime handles.
+    pub async fn join(&self) {
+        if let Some(task) = self.task.lock().await.take() {
+            let _ = task.await;
+        }
     }
     /// Return the latest cached snapshot without initiating a scan.
     pub fn cached(&self) -> Option<Snapshot> {

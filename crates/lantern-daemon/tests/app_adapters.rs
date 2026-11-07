@@ -114,3 +114,34 @@ async fn app_adapters_allocate_before_setup_and_compare_leases_atomically() {
     assert_eq!(RuntimeStore::port_leases(&adapter).unwrap(), changed);
     registry.flush().await.unwrap();
 }
+
+#[tokio::test]
+async fn app_registry_shutdown_flushes_and_releases_lock() {
+    let tmp = Temp(std::env::temp_dir().join(format!("lantern-assembly-shutdown-{}", std::process::id())));
+    fs::create_dir_all(&tmp.0).unwrap();
+    let dirs = Dirs {
+        config: tmp.0.join("config"),
+        state: tmp.0.join("state"),
+        data: tmp.0.join("data"),
+    };
+    let (registry, _) = RegistryHandle::open(
+        &dirs,
+        Settings::default(),
+        Templates::default(),
+        tmp.0.clone(),
+        EventBus::new(),
+    )
+    .unwrap();
+    registry.set_active_profile(Some("light".into())).unwrap();
+    registry.shutdown().await.unwrap();
+    let (next, _) = RegistryHandle::open(
+        &dirs,
+        Settings::default(),
+        Templates::default(),
+        tmp.0.clone(),
+        EventBus::new(),
+    )
+    .unwrap();
+    assert_eq!(next.active_profile().as_deref(), Some("light"));
+    next.shutdown().await.unwrap();
+}

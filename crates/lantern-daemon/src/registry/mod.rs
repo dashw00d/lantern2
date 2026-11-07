@@ -161,6 +161,11 @@ impl RegistryHandle {
         let io = self.lock().io.clone();
         io.flush().await
     }
+    /// Flush and stop the state writer, releasing its exclusive lock.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let io = self.lock().io.clone();
+        io.shutdown().await
+    }
     /// Subscribe to nonfatal persistence failures and their subsequent recovery.
     pub fn subscribe_write_errors(&self) -> watch::Receiver<Option<String>> {
         self.lock().io.subscribe_errors()
