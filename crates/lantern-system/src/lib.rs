@@ -4,6 +4,8 @@ pub mod command;
 pub mod paths;
 pub mod step;
 
+/// Creation and inspection of Lantern's constrained root CA.
+pub mod ca;
 /// Read-only, daemon-independent health checks.
 pub mod doctor;
 mod file;

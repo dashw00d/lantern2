@@ -608,3 +608,49 @@ fn nss_matching_certificate_without_ssl_ca_trust_is_not_done() {
     };
     assert!(matches!(other.check(), StepState::Pending(_)));
 }
+
+#[test]
+fn generated_ca_has_critical_constrained_der_and_private_key() {
+    use lantern_system::ca::{CaState, ensure_root, inspect_der, inspect_root};
+    use lantern_system::steps::nss_trust::certificate_der;
+    use std::os::unix::fs::PermissionsExt;
+    use x509_parser::{extensions::GeneralName, prelude::*};
+    let f = Fixture::new();
+    let created = ensure_root(&f.paths, "glow").unwrap();
+    let info = match created {
+        CaState::Created(info) => info,
+        _ => panic!("expected creation"),
+    };
+    assert_eq!(info.permitted_subtree, ".glow");
+    assert!(info.constraint_critical);
+    assert_eq!(
+        fs::metadata(&f.paths.root_key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&f.paths.ca_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let der = certificate_der(&fs::read(&f.paths.root_cert).unwrap()).unwrap();
+    let (_, cert) = parse_x509_certificate(&der).unwrap();
+    let nc = cert.name_constraints().unwrap().unwrap();
+    assert!(nc.critical);
+    assert!(matches!(
+        nc.value.permitted_subtrees.as_ref().unwrap()[0].base,
+        GeneralName::DNSName(".glow")
+    ));
+    assert!(cert.verify_signature(None).is_ok());
+    assert_eq!(inspect_root(&f.paths, "glow", 30).unwrap(), info);
+    assert!(matches!(
+        ensure_root(&f.paths, "glow").unwrap(),
+        CaState::Existing(_)
+    ));
+    assert!(inspect_der(&der, "other").is_err());
+    let mut tampered = der.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert!(inspect_der(&tampered, "glow").is_err());
+    let original = fs::read(&f.paths.root_cert).unwrap();
+    assert!(ensure_root(&f.paths, "other").is_err());
+    assert_eq!(fs::read(&f.paths.root_cert).unwrap(), original);
+}
