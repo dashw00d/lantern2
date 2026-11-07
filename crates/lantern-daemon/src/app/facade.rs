@@ -119,6 +119,8 @@ pub struct AppFacade {
     pub boot_id: String,
     /// Daemon start timestamp.
     pub started_at: Timestamp,
+    network_health: Option<Arc<super::network::NetworkHealth>>,
+    isolated_health: bool,
     active: Arc<Mutex<HashMap<InstanceId, Active>>>,
 }
 impl AppFacade {
@@ -151,8 +153,16 @@ impl AppFacade {
             home,
             boot_id,
             started_at: Timestamp::now(),
+            network_health: None,
+            isolated_health: false,
             active: Arc::default(),
         }
+    }
+    /// Include live network errors in health; isolated mode avoids inspecting user services.
+    pub fn with_network_health(mut self, health: Arc<super::network::NetworkHealth>, isolated: bool) -> Self {
+        self.network_health = Some(health);
+        self.isolated_health = isolated;
+        self
     }
     /// Supply the actual runtime and cache roots used by doctor.
     pub fn with_system_paths(mut self, runtime: Option<PathBuf>, cache: PathBuf) -> Self {
@@ -1643,6 +1653,9 @@ impl DaemonFacade for AppFacade {
         let dirs = self.dirs.clone();
         let home = self.home.clone();
         let settings = self.settings.clone();
+        let network_health = self.network_health.clone();
+        let isolated = self.isolated_health;
+        let search_path = self.environment.get("PATH").cloned().unwrap_or_default();
         let write_error = self.registry.subscribe_write_errors().borrow().clone();
         let runtime = self.system_runtime.clone();
         let cache = self.system_cache.clone();
@@ -1661,21 +1674,25 @@ impl DaemonFacade for AppFacade {
                 settings: &settings,
                 runner: &runner,
             };
-            let caddy = if settings.caddy.binary.is_empty() {
-                paths.bundled_caddy.clone()
-            } else {
-                PathBuf::from(&settings.caddy.binary)
-            };
+            let caddy = super::network::resolve_caddy(&settings.caddy.binary, &paths.dirs.data, &search_path)
+                .unwrap_or_else(|| paths.dirs.data.join("bin/caddy"));
             let certutil = find_program(&["/usr/bin/certutil", "/usr/local/bin/certutil"]);
-            let mut checks = doctor::run(&DoctorCtx {
-                paths: &paths,
-                settings: &settings,
-                runner: &runner,
-                network: &network,
-                caddy: &caddy,
-                certutil: certutil.as_deref(),
-                search_path: std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect(),
-            });
+            let mut checks = if isolated {
+                Vec::new()
+            } else {
+                doctor::run(&DoctorCtx {
+                    paths: &paths,
+                    settings: &settings,
+                    runner: &runner,
+                    network: &network,
+                    caddy: &caddy,
+                    certutil: certutil.as_deref(),
+                    search_path: std::env::split_paths(&search_path).collect(),
+                })
+            };
+            if let Some(health) = network_health {
+                checks.extend(health.checks());
+            }
             if let Some(message) = write_error {
                 checks.push(Check {
                     id: "state.persistence".into(),

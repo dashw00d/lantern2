@@ -9,6 +9,9 @@ pub mod discovery;
 /// Concrete daemon API facade.
 pub mod facade;
 
+/// Network construction and diagnostics.
+pub mod network;
+
 use self::{
     adapters::{CheckoutPreparer, RegistryAdapter, RuntimeOneShot},
     facade::AppFacade,
@@ -19,11 +22,15 @@ use crate::{
     events::EventBus,
     git::Git,
     instances::InstanceService,
+    net::{
+        dns::{Dns, DnsConfig},
+        sync::NetRouter,
+    },
     operations::OperationTracker,
     registry::{RegistryHandle, state_io::Recovery},
     runtime::{
         Runtime, RuntimeAdapters, RuntimeConfig,
-        seams::{ScannerProbe, UnavailableRouter, UnavailableServices},
+        seams::{ScannerProbe, UnavailableServices},
         systemd::{SystemctlBackend, UnitNames},
     },
 };
@@ -124,6 +131,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
                 .map(|p| PathBuf::from(p).join(if args.dev { "lantern-dev" } else { "lantern" }))
         })
         .ok_or("XDG_RUNTIME_DIR or LANTERN_RUNTIME_DIR is required")?;
+    let isolated_units = args.unit_names.is_some();
     let names = args.unit_names.unwrap_or_else(|| {
         if args.dev {
             UnitNames {
@@ -135,6 +143,9 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             UnitNames::default()
         }
     });
+    if args.dev && settings.dns.listen == "127.0.0.1:5354" {
+        settings.dns.listen = "127.0.0.1:5355".into();
+    }
     let (templates, diagnostics) =
         Templates::load_dir(&dirs.config.join("templates")).map_err(|e| e.to_string())?;
     for diagnostic in diagnostics {
@@ -185,6 +196,74 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         )
         .with_missing_retention_days(u64::from(settings.worktrees.missing_retention_days)),
     );
+    let net_paths = network::paths(dirs.clone(), home.clone(), runtime_dir.clone(), cache.clone())?;
+    let php_socket = network::php_socket(&settings.php.fpm_socket);
+    let net_health = Arc::new(network::NetworkHealth::default());
+    let search_path = env.get("PATH").cloned().unwrap_or_default();
+    if network::resolve_caddy(&settings.caddy.binary, &dirs.data, &search_path).is_none() {
+        net_health.set_caddy_error(Some("caddy_missing".into()));
+    }
+    let caddy_unit = if isolated_units {
+        format!("{}caddy.service", names.operation_prefix)
+    } else if args.dev {
+        "lantern-dev-caddy.service".into()
+    } else {
+        "lantern-caddy.service".into()
+    };
+    let applier = Arc::new(network::CaddyApplier::new(
+        settings.caddy.binary.clone(),
+        search_path,
+        net_paths.clone(),
+        caddy_unit,
+        names.slice.clone(),
+        settings.domains.tld.clone(),
+        network::render(&net_paths, &settings, php_socket.clone()),
+        net_health.clone(),
+    ));
+    let router = Arc::new(NetRouter::new(
+        applier,
+        settings.domains.tld.clone(),
+        false,
+        php_socket,
+        shutdown.clone(),
+    ));
+    router.replace_instances(network::registry_instances(&registry));
+    router.set_mailpit(settings.services.mailpit.enabled, None);
+    let mut network_events = bus.subscribe();
+    let network_router = router.clone();
+    let network_registry = registry.clone();
+    let network_shutdown = shutdown.clone();
+    let network_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                () = network_shutdown.cancelled() => break,
+                _ = interval.tick() => network_router.reconcile(),
+                event = network_events.recv() => match event {
+                    Ok(lantern_core::api::Event::InstanceUpdated { .. } | lantern_core::api::Event::InstanceRemoved { .. } | lantern_core::api::Event::ProjectUpdated { .. } | lantern_core::api::Event::ProjectRemoved { .. } | lantern_core::api::Event::ListenersChanged { .. }) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => network_router.replace_instances(network::registry_instances(&network_registry)),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ => {}
+                }
+            }
+        }
+    });
+    let dns_health = net_health.clone();
+    let dns_shutdown = shutdown.clone();
+    let dns_config = settings.dns.listen.parse().map(|listen| DnsConfig {
+        listen,
+        tld: settings.domains.tld.clone(),
+        ipv6: settings.proxy.ipv6,
+    });
+    let dns_task = tokio::spawn(async move {
+        let result = match dns_config {
+            Ok(config) => Dns::serve(config, dns_shutdown).await.map_err(|e| e.to_string()),
+            Err(e) => Err(format!("invalid DNS listen address: {e}")),
+        };
+        if let Err(error) = result {
+            tracing::error!(%error, "DNS responder unavailable");
+            dns_health.set_dns_error(error);
+        }
+    });
     let runtime = Arc::new(Runtime::with_scoped_journal(
         RuntimeConfig {
             settings: settings.clone(),
@@ -202,7 +281,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         tracker.clone(),
         RuntimeAdapters {
             preparer: Arc::new(CheckoutPreparer(service.clone())),
-            router: Arc::new(UnavailableRouter),
+            router: router.clone(),
             services: Arc::new(UnavailableServices),
         },
         args.restrict_journal_to_units,
@@ -239,6 +318,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             home,
             boot_id.clone(),
         )
+        .with_network_health(net_health, isolated_units)
         .with_environment(env.clone())
         .with_system_paths(env.get("XDG_RUNTIME_DIR").map(PathBuf::from), cache.clone()),
     );
@@ -314,6 +394,8 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     runtime.shutdown_background();
     let _ = git_task.await;
     let _ = error_task.await;
+    let _ = network_task.await;
+    let _ = dns_task.await;
     discovery.join().await;
     loop {
         let running: Vec<_> = tracker

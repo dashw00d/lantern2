@@ -155,6 +155,11 @@ impl NetRouter {
     pub fn current_plan(&self) -> RoutePlan {
         self.inner.plan(&self.inner.desired.lock().unwrap())
     }
+    /// Schedule another full-plan application, including after proxy recovery.
+    pub fn reconcile(&self) {
+        let mut state = self.inner.desired.lock().unwrap();
+        self.inner.dirty(&mut state);
+    }
     /// Wait until the currently desired generation has been attempted by the worker.
     pub async fn flush(&self) -> Result<(), String> {
         let generation = self.inner.desired.lock().unwrap().generation;
