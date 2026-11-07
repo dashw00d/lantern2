@@ -144,11 +144,8 @@ pub(super) fn match_owner<'a>(
         }
     }
     for proc in std::iter::once(p).chain(usable_ancestors(p, uid, daemon_pid)) {
-        for arg in &proc.cmdline_raw {
-            let path = arg.split_once('=').map_or(arg.as_str(), |(_, value)| value);
-            if Path::new(path).is_absolute()
-                && let Some(c) = index.lookup(Path::new(path))
-            {
+        for path in &proc.cmdline_paths {
+            if let Some(c) = index.lookup(path) {
                 return Some((c, MatchSource::CmdlinePath));
             }
         }
@@ -170,6 +167,25 @@ mod tests {
             branch: Some("main".into()),
             path: path.into(),
         }
+    }
+    #[test]
+    fn discovery_match_canonical_command_path() {
+        use std::os::unix::fs::symlink;
+        let tree = Tree::new();
+        let real = tree.0.join("checkout");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("server.js"), "fixture").unwrap();
+        let link = tree.0.join("shortcut");
+        symlink(&real, &link).unwrap();
+        let command = format!("--file={}", link.join("server.js").display());
+        tree.process(200, 1, 1, "node", "/", &["node", &command], "/app.service");
+        let mut reader = ProcReader::new(ProcRoot::new(&tree.0));
+        let proc = reader.read(200, Instant::now()).unwrap();
+        let index = CheckoutIndex::new(vec![checkout(real.to_str().unwrap(), "app")], "/home/test");
+        assert_eq!(
+            match_owner(&proc, &index, reader.root.uid(), 9999).unwrap().1,
+            MatchSource::CmdlinePath
+        );
     }
     #[test]
     fn discovery_match_fixture() {

@@ -79,6 +79,7 @@ pub(super) struct ProcInfo {
     pub exe: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub cmdline_raw: Vec<String>,
+    pub cmdline_paths: Vec<PathBuf>,
     pub unit: Option<String>,
     pub started_at: Option<Timestamp>,
     pub ancestors: Vec<ProcInfo>,
@@ -227,6 +228,16 @@ impl ProcReader {
             return Some(c.info.clone());
         }
         let path = self.root.pid_path(pid);
+        let cmdline_raw = read_cmdline(&path.join("cmdline"));
+        let cmdline_paths = cmdline_raw
+            .iter()
+            .filter_map(|arg| {
+                let value = arg.split_once('=').map_or(arg.as_str(), |(_, value)| value);
+                let path = Path::new(value);
+                path.is_absolute()
+                    .then(|| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+            })
+            .collect();
         let info = ProcInfo {
             key,
             ppid: stat.ppid,
@@ -234,7 +245,8 @@ impl ProcReader {
             comm: stat.comm,
             exe: read_link(&path.join("exe"), false),
             cwd: read_link(&path.join("cwd"), true),
-            cmdline_raw: read_cmdline(&path.join("cmdline")),
+            cmdline_raw,
+            cmdline_paths,
             unit: fs::read_to_string(path.join("cgroup"))
                 .ok()
                 .and_then(|s| unit_of(&s)),
