@@ -290,6 +290,7 @@ impl InstanceService {
     pub(crate) async fn refresh_unlocked(&self, common: &Path) -> Result<(), InstanceError> {
         let repo = self.git.repo(common.to_path_buf());
         let trees = repo.list_worktrees().await?;
+        self.recover_creating(common, &trees)?;
         let mut projects = self
             .store
             .projects_in_repo(common)
@@ -443,6 +444,46 @@ impl InstanceService {
             }
         }
         self.purge_missing_unlocked(common)?;
+        Ok(())
+    }
+    fn recover_creating(&self, common: &Path, trees: &[Worktree]) -> Result<(), InstanceError> {
+        for (id, mut record) in self.store.records().map_err(InstanceError::Adapter)? {
+            if record.checkout.phase != CheckoutPhase::Creating {
+                continue;
+            }
+            let Some(project) = self
+                .store
+                .project(&record.project)
+                .map_err(InstanceError::Adapter)?
+            else {
+                continue;
+            };
+            let Some(repo) = project
+                .project
+                .repo
+                .as_ref()
+                .filter(|repo| repo.common_dir == common)
+            else {
+                continue;
+            };
+            let root = strip_subpath(&record.checkout.path, &repo.subpath)?;
+            if record.checkout.path.is_dir() && trees.iter().any(|tree| !tree.bare && tree.path == root) {
+                // Creating records predate proof that Git made the path. Keep the usable
+                // checkout, but do not grant the right to delete it as managed data.
+                record.checkout.phase = CheckoutPhase::Ready;
+                record.checkout.kind = CheckoutKind::Worktree;
+                record.checkout.missing_since = None;
+                self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+                tracing::warn!(%id, path = %root.display(), "recovered checkout without managed ownership proof");
+            } else {
+                // The path can be absent, half-created, or a raced-in user directory.
+                // Dropping only the intent is safe in all three cases.
+                self.store.remove(&id).map_err(InstanceError::Adapter)?;
+                if root.exists() {
+                    tracing::warn!(%id, path = %root.display(), "preserved ambiguous interrupted checkout directory");
+                }
+            }
+        }
         Ok(())
     }
     fn purge_missing_unlocked(&self, common: &Path) -> Result<(), InstanceError> {
@@ -835,7 +876,18 @@ impl InstanceService {
         if let Err(e) = repo.add_worktree(&root, &mode, &cancel).await {
             // A failed git call does not establish ownership of an on-disk path.
             // Restore a revived record rather than treating a raced-in user worktree as managed.
-            if let Some(previous) = previous {
+            if let Ok(trees) = repo.list_worktrees().await
+                && project_path.is_dir()
+                && trees.iter().any(|tree| !tree.bare && tree.path == root)
+            {
+                record.checkout.phase = CheckoutPhase::Ready;
+                record.checkout.kind = CheckoutKind::Worktree;
+                self.store.upsert(&id, record).map_err(InstanceError::Adapter)?;
+                tracing::warn!(%id, path = %root.display(), "preserved checkout after interrupted git creation without claiming ownership");
+            } else if let Some(mut previous) = previous {
+                if root.exists() && previous.checkout.path == project_path {
+                    previous.checkout.kind = CheckoutKind::Worktree;
+                }
                 self.store.upsert(&id, previous).map_err(InstanceError::Adapter)?;
             } else {
                 self.store.remove(&id).map_err(InstanceError::Adapter)?;

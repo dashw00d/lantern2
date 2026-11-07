@@ -641,6 +641,124 @@ async fn instances_setup_stale_and_copy_guards() {
 }
 
 #[tokio::test]
+async fn instances_recover_interrupted_creation_without_claiming_user_data() {
+    use lantern_core::{model::CheckoutKind, state::CheckoutPhase};
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    git_cmd(&root, &["branch", "interrupted"]);
+    let op = operation();
+    let created = service
+        .run_branch_unprepared(req(BranchTarget::Branch("interrupted".into())), &op)
+        .await
+        .unwrap();
+    let mut record = store
+        .records
+        .lock()
+        .unwrap()
+        .get(&created.instance)
+        .unwrap()
+        .clone();
+    record.checkout.phase = CheckoutPhase::Creating;
+    store.upsert(&created.instance, record.clone()).unwrap();
+
+    let ambiguous_id = InstanceId::parse("myapp@ambiguous").unwrap();
+    let ambiguous_root = t.0.join("managed/mono/ambiguous");
+    fs::create_dir_all(ambiguous_root.join("apps/web")).unwrap();
+    fs::write(ambiguous_root.join("user-data"), "keep").unwrap();
+    record.checkout.path = ambiguous_root.join("apps/web");
+    store.upsert(&ambiguous_id, record).unwrap();
+
+    service.refresh_repo(&root.join(".git")).await.unwrap();
+    let records = store.records.lock().unwrap();
+    let recovered = records.get(&created.instance).unwrap();
+    assert_eq!(recovered.checkout.phase, CheckoutPhase::Ready);
+    assert_eq!(recovered.checkout.kind, CheckoutKind::Worktree);
+    assert!(!records.contains_key(&ambiguous_id));
+    assert_eq!(
+        fs::read_to_string(ambiguous_root.join("user-data")).unwrap(),
+        "keep"
+    );
+    op.finish(OpOutcome::Succeeded(None));
+}
+
+#[tokio::test]
+async fn instances_cancelled_git_creation_retains_completed_checkout_as_user_owned() {
+    use lantern_core::{model::CheckoutKind, state::CheckoutPhase};
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(marker) = std::env::var_os("LANTERN_GIT_CANCEL_MARKER") {
+        let t = Temp::new();
+        let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+        git_cmd(&root, &["branch", "cancel-git"]);
+        let service = Arc::new(service);
+        let tracker = OperationTracker::new(EventBus::new());
+        let op = tracker.begin(OperationKind::Prepare, None);
+        let op_id = op.id().clone();
+        let task = tokio::spawn(async move {
+            let result = service
+                .run_branch_unprepared(req(BranchTarget::Branch("cancel-git".into())), &op)
+                .await;
+            op.finish(OpOutcome::Cancelled);
+            result
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !Path::new(&marker).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(tracker.cancel(&op_id));
+        assert!(task.await.unwrap().is_err());
+        let id = InstanceId::parse("myapp@cancel-git").unwrap();
+        let records = store.records.lock().unwrap();
+        let record = records
+            .get(&id)
+            .expect("completed checkout must remain discoverable");
+        assert_eq!(record.checkout.phase, CheckoutPhase::Ready);
+        assert_eq!(record.checkout.kind, CheckoutKind::Worktree);
+        assert!(record.checkout.path.join("app.txt").exists());
+        return;
+    }
+    let t = Temp::new();
+    let wrapper = t.0.join("git");
+    fs::write(
+        &wrapper,
+        r##"#!/usr/bin/python3
+import os, subprocess, sys, time
+args = sys.argv[1:]
+if 'worktree' in args and 'add' in args:
+    result = subprocess.run(['/usr/bin/git'] + args)
+    if result.returncode: sys.exit(result.returncode)
+    open(os.environ['LANTERN_GIT_CANCEL_MARKER'], 'w').close()
+    time.sleep(60)
+    sys.exit(0)
+os.execv('/usr/bin/git', ['/usr/bin/git'] + args)
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "instances_cancelled_git_creation_retains_completed_checkout_as_user_owned",
+            "--nocapture",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", t.0.display()))
+        .env("LANTERN_GIT_CANCEL_MARKER", t.0.join("created"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn instances_git_guard_copied_directory_and_running_sibling() {
     let t = Temp::new();
     let yaml = "id: myapp\nrun: {cmd: 'echo ok'}\nsetup: []\nworktree: {copy: [fixtures]}\n";
