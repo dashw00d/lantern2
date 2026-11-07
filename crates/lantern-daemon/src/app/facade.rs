@@ -1879,7 +1879,10 @@ impl DaemonFacade for AppFacade {
                 })
             };
             if let Some(health) = network_health {
-                checks.extend(health.checks());
+                for check in health.checks() {
+                    checks.retain(|existing| existing.id != check.id);
+                    checks.push(check);
+                }
             }
             if let Some(message) = write_error {
                 checks.push(Check {

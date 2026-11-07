@@ -496,6 +496,9 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     let _ = network_task.await;
     let _ = dns_task.await;
     let _ = intel_task.await;
+    if let Err(error) = intel.write_cache().await {
+        tracing::warn!(%error, "intel cache flush failed");
+    }
     let _ = services_task.await;
     discovery.join().await;
     loop {
