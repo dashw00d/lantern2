@@ -27,6 +27,41 @@ pub struct Snapshot {
     /// Time spent scanning in milliseconds.
     pub scan_ms: f32,
 }
+// Keep project and recognised servers ahead of unrelated sockets when the host is very busy.
+fn cap_listeners(visible: &mut Vec<Listener>, hidden: &mut Vec<Listener>) {
+    const LIMIT: usize = 1000;
+    let count = visible.len() + hidden.len();
+    if count <= LIMIT {
+        return;
+    }
+    let mut rows: Vec<_> = visible
+        .drain(..)
+        .map(|l| (false, l))
+        .chain(hidden.drain(..).map(|l| (true, l)))
+        .collect();
+    rows.sort_by_key(|(is_hidden, row)| {
+        let noise = matches!(
+            row.class,
+            lantern_core::model::ListenerClass::Other | lantern_core::model::ListenerClass::Foreign
+        );
+        (noise, *is_hidden, row.port, row.addr, row.pid)
+    });
+    rows.truncate(LIMIT);
+    for (is_hidden, row) in rows {
+        if is_hidden {
+            hidden.push(row);
+        } else {
+            visible.push(row);
+        }
+    }
+    visible.sort_by_key(|l| (l.port, l.addr, l.pid));
+    hidden.sort_by_key(|l| (l.port, l.addr, l.pid));
+    tracing::warn!(
+        observed = count,
+        limit = LIMIT,
+        "discovery listener limit reached"
+    );
+}
 enum Source {
     Auto(AutoSource),
     Fixed(Box<dyn SocketSource>, SocketSourceKind),
@@ -157,13 +192,14 @@ impl Scanner {
         let observations = self.observe(sockets, start);
         let observe_ms = observe_start.elapsed().as_secs_f32() * 1000.0;
         let build_start = Instant::now();
-        let (listeners, hidden) = build(
+        let (mut listeners, mut hidden) = build(
             observations,
             &self.index,
             &self.settings,
             self.reader.root.uid(),
             std::process::id(),
         );
+        cap_listeners(&mut listeners, &mut hidden);
         if listeners != self.listeners {
             self.seq = self.seq.saturating_add(1);
             self.listeners.clone_from(&listeners);
@@ -455,6 +491,19 @@ mod tests {
         assert_eq!(row.matched_by, Some(MatchSource::Cwd));
         assert_eq!(row.branch.as_deref(), Some("main"));
         assert_eq!(row.cmdline[2], "--token=***");
+        let mut capped = vec![row.clone(); 1001];
+        for item in &mut capped {
+            item.class = lantern_core::model::ListenerClass::Other;
+        }
+        capped.push(row.clone());
+        let mut capped_hidden = Vec::new();
+        cap_listeners(&mut capped, &mut capped_hidden);
+        assert_eq!(capped.len(), 1000);
+        assert!(
+            capped
+                .iter()
+                .any(|item| item.class == lantern_core::model::ListenerClass::Project)
+        );
         let b = scanner.scan().unwrap();
         assert_eq!(b.seq, a.seq);
         assert_eq!(b.listeners, a.listeners);
