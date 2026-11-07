@@ -189,6 +189,7 @@ struct ActorState {
     retry_streak: u32,
     ready_at: Option<Instant>,
     deploy_started: bool,
+    worktree_env: BTreeMap<String, String>,
 }
 #[derive(Debug)]
 struct Actor {
@@ -212,6 +213,7 @@ impl Actor {
                 retry_streak: 0,
                 ready_at: None,
                 deploy_started: false,
+                worktree_env: BTreeMap::new(),
             }),
             io_lock: tokio::sync::Mutex::new(()),
             idle: tokio::sync::Notify::new(),
@@ -628,8 +630,14 @@ impl Runtime {
         let deploy_started = actor.state.lock().unwrap().deploy_started;
         if deploy && deploy_started {
             if let Some(command) = &instance.manifest.deploy.stop {
-                let (_, unit) =
-                    self.launch(&instance, state.port.unwrap_or(0), command.render_shell(), true)?;
+                let (_, unit) = self.launch(
+                    &instance,
+                    state.port.unwrap_or(0),
+                    command.render_shell(),
+                    true,
+                    &actor.state.lock().unwrap().worktree_env,
+                    false,
+                )?;
                 let spec = OneShotSpec {
                     unit,
                     timeout: Duration::from_secs(self.inner.config.settings.runtime.deploy_timeout_secs),
@@ -875,10 +883,13 @@ impl Runtime {
             return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
         }
         handle.step("prepare");
-        {
+        let prepared_result = {
             // A preparer must observe cancellation and clean up child one-shots before Stop proceeds.
             let _guard = actor.io_lock.lock().await;
-            let prepare = self.inner.preparer.ensure_ready(&prepared, port, token.clone());
+            let prepare = self
+                .inner
+                .preparer
+                .ensure_ready(&prepared, port, token.clone(), handle);
             tokio::pin!(prepare);
             tokio::select! {
                 () = token.cancelled() => {
@@ -890,11 +901,45 @@ impl Runtime {
                 }
                 result = &mut prepare => result.map_err(|e| Fault::new("setup_failed", IssueCode::SetupFailed, e))?,
             }
-        }
+        };
         if token.is_cancelled() {
             return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
         }
+        let updated = &prepared_result.manifest;
+        if !updated.usable
+            || !updated.enabled
+            || updated.depends_on != m.depends_on
+            || updated.serve != m.serve
+            || updated.upstream_url != m.upstream_url
+            || updated.run.cmd != m.run.cmd
+            || updated.deploy.start != m.deploy.start
+            || updated.deploy.restart != m.deploy.restart
+            || updated.setup != m.setup
+        {
+            return Err(Fault::new(
+                "manifest_changed",
+                IssueCode::ManifestInvalid,
+                "launch plan changed during preparation; start again",
+            ));
+        }
+        let mut instance = instance;
+        instance.manifest = prepared_result.manifest;
+        let worktree_env = prepared_result.worktree_env;
+        let m = &instance.manifest;
+        let command = if deploy_restart {
+            m.deploy.restart.as_ref()
+        } else {
+            m.deploy.start.as_ref().or(m.run.cmd.as_ref())
+        };
+        {
+            let mut state = actor.state.lock().unwrap();
+            if state.generation != generation {
+                return Err(Fault::new("cancelled", IssueCode::Other, "cancelled"));
+            }
+            state.worktree_env = worktree_env.clone();
+        }
         // Recheck the lease immediately before spawn in case setup took a long time.
+        let prepare_port = port;
         let port = if lease.is_some() && !deploy_restart {
             Some(self.allocate(id).await?)
         } else {
@@ -925,7 +970,14 @@ impl Runtime {
         }
         let command = command.expect("checked above");
         let is_deploy = m.deploy.start.is_some();
-        let (launch, unit) = self.launch(&instance, port.unwrap_or(0), command.render_shell(), is_deploy)?;
+        let (launch, unit) = self.launch(
+            &instance,
+            port.unwrap_or(0),
+            command.render_shell(),
+            is_deploy,
+            &worktree_env,
+            port != prepare_port,
+        )?;
         // A retry must not consume an exit observation from the previous invocation.
         self.update(id, actor, generation, |r| {
             r.unit = None;
@@ -1196,47 +1248,60 @@ impl Runtime {
     }
     async fn allocate(&self, id: &InstanceId) -> Result<u16, Fault> {
         let _guard = self.inner.lease_lock.lock().await;
-        let table = self.inner.store.port_leases().map_err(store_fault)?;
-        let mut leases = PortLeases::from_table(table);
-        let probe = self.inner.probe.clone();
-        let id_owned = id.clone();
-        let range = PortRange {
-            start: self.inner.config.settings.ports.range_start,
-            end: self.inner.config.settings.ports.range_end,
-        };
-        let reserved = vec![
-            self.inner.config.settings.daemon.port,
-            self.inner.config.settings.proxy.http_port,
-            self.inner.config.settings.proxy.https_port,
-            5354,
-            2019,
-        ];
-        let (port, table) = tokio::task::spawn_blocking(move || {
-            let outcome = leases
-                .try_allocate(
-                    &id_owned,
-                    range,
-                    &reserved,
-                    |port| -> io::Result<PortAvailability<lantern_core::model::PortHolder>> {
-                        match probe.port_binding(port, None)? {
-                            PortBinding::HeldByOther(holder) => Ok(PortAvailability::Busy(Some(holder))),
-                            PortBinding::BoundByUnit { .. } => Ok(PortAvailability::Busy(None)),
-                            PortBinding::Free => match bindable(port) {
-                                Ok(true) => Ok(PortAvailability::Free),
-                                Ok(false) => Ok(PortAvailability::Busy(None)),
-                                Err(e) => Err(e),
-                            },
-                        }
-                    },
-                )
-                .map_err(|e| format!("port allocation failed: {e:?}"))?;
-            Ok::<_, String>((outcome.port, leases.table().clone()))
-        })
-        .await
-        .map_err(|e| Fault::new("ports", IssueCode::PortsExhausted, e.to_string()))?
-        .map_err(|e| Fault::new("ports", IssueCode::PortsExhausted, e))?;
-        self.inner.store.set_port_leases(table).map_err(store_fault)?;
-        Ok(port)
+        for _ in 0..32 {
+            let expected = self.inner.store.port_leases().map_err(store_fault)?;
+            let mut leases = PortLeases::from_table(expected.clone());
+            let probe = self.inner.probe.clone();
+            let id = id.clone();
+            let range = PortRange {
+                start: self.inner.config.settings.ports.range_start,
+                end: self.inner.config.settings.ports.range_end,
+            };
+            let reserved = vec![
+                self.inner.config.settings.daemon.port,
+                self.inner.config.settings.proxy.http_port,
+                self.inner.config.settings.proxy.https_port,
+                5354,
+                2019,
+            ];
+            let (port, table) = tokio::task::spawn_blocking(move || {
+                let outcome = leases
+                    .try_allocate(
+                        &id,
+                        range,
+                        &reserved,
+                        |port| -> io::Result<PortAvailability<lantern_core::model::PortHolder>> {
+                            match probe.port_binding(port, None)? {
+                                PortBinding::HeldByOther(holder) => Ok(PortAvailability::Busy(Some(holder))),
+                                PortBinding::BoundByUnit { .. } => Ok(PortAvailability::Busy(None)),
+                                PortBinding::Free => match bindable(port) {
+                                    Ok(true) => Ok(PortAvailability::Free),
+                                    Ok(false) => Ok(PortAvailability::Busy(None)),
+                                    Err(e) => Err(e),
+                                },
+                            }
+                        },
+                    )
+                    .map_err(|e| format!("port allocation failed: {e:?}"))?;
+                Ok::<_, String>((outcome.port, leases.table().clone()))
+            })
+            .await
+            .map_err(|e| Fault::new("ports", IssueCode::PortsExhausted, e.to_string()))?
+            .map_err(|e| Fault::new("ports", IssueCode::PortsExhausted, e))?;
+            if self
+                .inner
+                .store
+                .compare_port_leases(&expected, table)
+                .map_err(store_fault)?
+            {
+                return Ok(port);
+            }
+        }
+        Err(Fault::new(
+            "ports",
+            IssueCode::Other,
+            "port lease table changed repeatedly",
+        ))
     }
     fn launch(
         &self,
@@ -1244,6 +1309,8 @@ impl Runtime {
         port: u16,
         command: String,
         oneshot: bool,
+        worktree_env: &BTreeMap<String, String>,
+        port_changed: bool,
     ) -> Result<(LaunchSpec, UnitStart), Fault> {
         let project = self
             .inner
@@ -1315,6 +1382,35 @@ impl Runtime {
             ("CHECKOUT".into(), context.checkout.to_string_lossy().into_owned()),
             ("PRIMARY".into(), context.primary.to_string_lossy().into_owned()),
         ]);
+        let mut run_env: BTreeMap<String, String> = instance
+            .manifest
+            .run
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.render_data(&context)))
+            .collect();
+        if !instance.id.is_primary() {
+            run_env.extend(
+                instance
+                    .manifest
+                    .worktree
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.render_data(&context))),
+            );
+            run_env.extend(worktree_env.clone());
+            if port_changed {
+                // Values returned by preparation used the original lease; rebuild manifest worktree variables.
+                run_env.extend(
+                    instance
+                        .manifest
+                        .worktree
+                        .env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.render_data(&context))),
+                );
+            }
+        }
         let spec = LaunchSpec {
             instance: instance.id.clone(),
             cwd: cwd.clone(),
@@ -1324,13 +1420,7 @@ impl Runtime {
             runtime_env: self.inner.config.settings.runtime.env.clone(),
             variables: vars,
             env_file: BTreeMap::new(),
-            run_env: instance
-                .manifest
-                .run
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.render_data(&context)))
-                .collect(),
+            run_env,
             pre_start: None,
             post_stop: None,
             command,
@@ -1681,10 +1771,7 @@ impl Runtime {
                             .upstream_url
                             .clone()
                             .or_else(|| inst.runtime.upstream.map(|addr| format!("http://{addr}")));
-                        match base
-                            .and_then(|b| reqwest::Url::parse(&b).ok())
-                            .and_then(|base| base.join(endpoint).ok())
-                        {
+                        match base.and_then(|b| health_url(&b, endpoint)) {
                             Some(url) => match client.get(url).send().await {
                                 Ok(resp) if resp.status().as_u16() < 400 => Ok(Some(resp.status().as_u16())),
                                 Ok(resp) => Err(format!("HTTP {}", resp.status())),
@@ -1995,16 +2082,24 @@ impl Runtime {
         }
         self.inner.logs.remove(id);
         let _guard = self.inner.lease_lock.lock().await;
-        let mut leases = self
-            .inner
-            .store
-            .port_leases()
-            .map_err(|e| RuntimeError::Other(e.to_string()))?;
-        leases.remove(id);
-        self.inner
-            .store
-            .set_port_leases(leases)
-            .map_err(|e| RuntimeError::Other(e.to_string()))
+        for _ in 0..32 {
+            let expected = self
+                .inner
+                .store
+                .port_leases()
+                .map_err(|e| RuntimeError::Other(e.to_string()))?;
+            let mut replacement = expected.clone();
+            replacement.remove(id);
+            if self
+                .inner
+                .store
+                .compare_port_leases(&expected, replacement)
+                .map_err(|e| RuntimeError::Other(e.to_string()))?
+            {
+                return Ok(());
+            }
+        }
+        Err(RuntimeError::Other("port lease table changed repeatedly".into()))
     }
     /// Mark running instances as needing a restart after a manifest change.
     pub fn on_manifest_changed(&self, id: &InstanceId) {
@@ -2228,14 +2323,38 @@ impl Runtime {
         }
         let valid: HashSet<_> = known.values().map(|i| i.id.clone()).collect();
         let _guard = self.inner.lease_lock.lock().await;
-        if let Ok(mut table) = self.inner.store.port_leases() {
-            table.retain(|id, _| valid.contains(id));
-            if let Err(e) = self.inner.store.set_port_leases(table) {
-                report.errors.push(e.to_string());
+        for attempt in 0..32 {
+            match self.inner.store.port_leases() {
+                Ok(expected) => {
+                    let mut replacement = expected.clone();
+                    replacement.retain(|id, _| valid.contains(id));
+                    match self.inner.store.compare_port_leases(&expected, replacement) {
+                        Ok(true) => break,
+                        Ok(false) if attempt < 31 => {}
+                        Ok(false) => report.errors.push("port lease table changed repeatedly".into()),
+                        Err(e) => {
+                            report.errors.push(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    report.errors.push(e.to_string());
+                    break;
+                }
             }
         }
         report
     }
+}
+
+fn health_url(base: &str, endpoint: &str) -> Option<reqwest::Url> {
+    let base = reqwest::Url::parse(base).ok()?;
+    let url = base.join(endpoint).ok()?;
+    (url.scheme() == base.scheme()
+        && url.host() == base.host()
+        && url.port_or_known_default() == base.port_or_known_default())
+    .then_some(url)
 }
 
 fn store_fault(e: super::seams::StoreError) -> Fault {
@@ -2420,5 +2539,20 @@ async fn journal_loop(names: UnitNames, hub: Arc<LogHub>, shutdown: Cancellation
             let _ = child.kill().await;
         }
         tokio::select! {()=shutdown.cancelled()=>return,()=tokio::time::sleep(Duration::from_secs(1))=>{}}
+    }
+}
+
+#[cfg(test)]
+mod health_url_tests {
+    use super::health_url;
+    #[test]
+    fn health_endpoint_cannot_change_the_named_origin() {
+        assert_eq!(
+            health_url("http://127.0.0.1:39100", "/health").unwrap().as_str(),
+            "http://127.0.0.1:39100/health"
+        );
+        assert!(health_url("http://127.0.0.1:39100", "http://127.0.0.1:39101/").is_none());
+        assert!(health_url("http://127.0.0.1:39100", "//example.invalid/").is_none());
+        assert!(health_url("http://127.0.0.1:39100", "https://127.0.0.1:39100/").is_none());
     }
 }

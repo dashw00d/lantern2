@@ -138,9 +138,17 @@ impl RuntimeStore for Store {
     fn port_leases(&self) -> Result<BTreeMap<InstanceId, u16>, StoreError> {
         Ok(self.leases.lock().unwrap().clone())
     }
-    fn set_port_leases(&self, l: BTreeMap<InstanceId, u16>) -> Result<(), StoreError> {
-        *self.leases.lock().unwrap() = l;
-        Ok(())
+    fn compare_port_leases(
+        &self,
+        expected: &BTreeMap<InstanceId, u16>,
+        replacement: BTreeMap<InstanceId, u16>,
+    ) -> Result<bool, StoreError> {
+        let mut leases = self.leases.lock().unwrap();
+        if &*leases != expected {
+            return Ok(false);
+        }
+        *leases = replacement;
+        Ok(true)
     }
     fn update_runtime(
         &self,
@@ -205,6 +213,7 @@ impl InstancePreparer for HungPrepare {
         _: &'a Instance,
         _: Option<u16>,
         cancel: CancellationToken,
+        _: &'a lantern_daemon::operations::OpHandle,
     ) -> PrepareFuture<'a> {
         Box::pin(async move {
             cancel.cancelled().await;
@@ -518,6 +527,14 @@ async fn runtime_real_systemd_discovery_logs_and_stop() {
     .await
     .expect("journal follower did not deliver HTTP access log");
     assert_eq!(line.instance, id);
+    let history = rt
+        .log_history(&id, lantern_daemon::runtime::HistoryQuery { limit: 100 })
+        .await
+        .unwrap();
+    assert!(
+        history.iter().any(|entry| entry.line.contains("GET /")),
+        "journal history omitted request: {history:?}"
+    );
     let stop = rt.stop(&id, StopOpts::default()).await.unwrap();
     assert_eq!(completed(&stop).await, OperationStatus::Succeeded);
     let rows = SystemctlBackend.poll(&[unit]).await.unwrap();
@@ -767,7 +784,12 @@ impl lantern_daemon::runtime::seams::ServiceControl for TestServices {
     fn has(&self, name: &str) -> bool {
         name == "redis"
     }
-    fn ensure_running<'a>(&'a self, name: &'a str, _: Duration, _: CancellationToken) -> PrepareFuture<'a> {
+    fn ensure_running<'a>(
+        &'a self,
+        name: &'a str,
+        _: Duration,
+        _: CancellationToken,
+    ) -> lantern_daemon::runtime::seams::ServiceFuture<'a> {
         Box::pin(async move {
             if self.backend.calls().iter().any(|s| s.starts_with("start ")) {
                 return Err("instance started before service".into());

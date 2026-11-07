@@ -5,9 +5,11 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::operations::OpHandle;
 use lantern_core::ids::{InstanceId, ProjectId};
+use lantern_core::manifest::ResolvedManifest;
 use lantern_core::model::{Instance, Project, RuntimeState};
 use tokio_util::sync::CancellationToken;
 
@@ -28,8 +30,12 @@ pub trait RuntimeStore: Send + Sync {
     fn project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError>;
     /// Read the persisted sticky port table.
     fn port_leases(&self) -> Result<BTreeMap<InstanceId, u16>, StoreError>;
-    /// Persist the replacement sticky port table.
-    fn set_port_leases(&self, leases: BTreeMap<InstanceId, u16>) -> Result<(), StoreError>;
+    /// Atomically replace the table only if it still equals `expected`.
+    fn compare_port_leases(
+        &self,
+        expected: &BTreeMap<InstanceId, u16>,
+        replacement: BTreeMap<InstanceId, u16>,
+    ) -> Result<bool, StoreError>;
     /// Mutate runtime state and publish an instance update when relevant fields change.
     fn update_runtime(
         &self,
@@ -88,8 +94,19 @@ impl PortProbe for ScannerProbe {
     }
 }
 
+/// Resolved post-setup manifest and already-expanded worktree environment.
+#[derive(Debug, Clone)]
+pub struct PreparedInstance {
+    /// Manifest resolved after preparation.
+    pub manifest: Arc<ResolvedManifest>,
+    /// Non-primary checkout environment, overriding run.env.
+    pub worktree_env: BTreeMap<String, String>,
+}
+
 /// Asynchronous checkout-preparation result.
-pub type PrepareFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+pub type PrepareFuture<'a> = Pin<Box<dyn Future<Output = Result<PreparedInstance, String>> + Send + 'a>>;
+/// Asynchronous shared-service result.
+pub type ServiceFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 /// Hook implemented by the instances subsystem; cancellation must stop any child one-shot.
 pub trait InstancePreparer: Send + Sync {
@@ -99,6 +116,7 @@ pub trait InstancePreparer: Send + Sync {
         instance: &'a Instance,
         port: Option<u16>,
         cancel: CancellationToken,
+        progress: &'a OpHandle,
     ) -> PrepareFuture<'a>;
 }
 
@@ -108,11 +126,17 @@ pub struct NoopPreparer;
 impl InstancePreparer for NoopPreparer {
     fn ensure_ready<'a>(
         &'a self,
-        _: &'a Instance,
+        instance: &'a Instance,
         _: Option<u16>,
         _: CancellationToken,
+        _: &'a OpHandle,
     ) -> PrepareFuture<'a> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            Ok(PreparedInstance {
+                manifest: instance.manifest.clone(),
+                worktree_env: BTreeMap::new(),
+            })
+        })
     }
 }
 
@@ -167,7 +191,7 @@ pub trait ServiceControl: Send + Sync {
         name: &'a str,
         timeout: std::time::Duration,
         cancel: CancellationToken,
-    ) -> PrepareFuture<'a>;
+    ) -> ServiceFuture<'a>;
 }
 
 /// Default shared-service adapter that recognizes no services.
@@ -182,7 +206,7 @@ impl ServiceControl for UnavailableServices {
         _: &'a str,
         _: std::time::Duration,
         _: CancellationToken,
-    ) -> PrepareFuture<'a> {
+    ) -> ServiceFuture<'a> {
         Box::pin(async { Err("service adapter unavailable".into()) })
     }
 }
