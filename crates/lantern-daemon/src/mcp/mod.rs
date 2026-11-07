@@ -1,10 +1,24 @@
 //! Stateless MCP transport over the daemon facade.
 
+mod args;
+mod descriptions;
+mod dispatch;
+mod resources;
+mod tools;
+
 use std::{sync::Arc, time::Duration};
 
 use rmcp::{
-    ServerHandler,
+    ErrorData, RoleServer, ServerHandler,
+    handler::server::router::{prompt::PromptRouter, tool::ToolRouter},
     model::{Implementation, ServerCapabilities, ServerConfig},
+    model::{
+        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams,
+        ReadResourceResponse,
+    },
+    prompt_handler,
+    service::RequestContext,
+    tool_handler,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
     },
@@ -23,7 +37,9 @@ pub struct McpConfig {
 /// Cheap per-request MCP handler.
 #[derive(Clone)]
 pub struct LanternMcp {
-    _facade: Arc<dyn DaemonFacade>,
+    facade: Arc<dyn DaemonFacade>,
+    tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
 }
 
 impl std::fmt::Debug for LanternMcp {
@@ -32,10 +48,34 @@ impl std::fmt::Debug for LanternMcp {
     }
 }
 
+#[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for LanternMcp {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_prompts().enable_resources().build())
             .with_server_info(Implementation::new("lantern", env!("CARGO_PKG_VERSION")))
+            .with_instructions("Lantern manages local dev servers. Use list_projects or list_instances, start_project, get_project_logs, get_project_docs and get_project_endpoints. Branches are instances; use start_branch for new worktrees. Long actions return an operation_id. Call only registered project APIs, and ask the user before confirming risky calls.")
+    }
+    async fn list_resources(
+        &self,
+        r: Option<PaginatedRequestParams>,
+        c: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        self.resource_list(r, c).await
+    }
+    async fn list_resource_templates(
+        &self,
+        r: Option<PaginatedRequestParams>,
+        c: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        self.resource_templates(r, c).await
+    }
+    async fn read_resource(
+        &self,
+        r: ReadResourceRequestParams,
+        c: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        self.resource_read(r, c).await
     }
 }
 
@@ -44,7 +84,11 @@ pub type McpService = StreamableHttpService<LanternMcp, NeverSessionManager>;
 
 /// Create a stateless streamable HTTP service; Host and Origin are checked by the API guard.
 pub fn service(facade: Arc<dyn DaemonFacade>, config: McpConfig) -> McpService {
-    let handler = LanternMcp { _facade: facade };
+    let handler = LanternMcp {
+        facade,
+        tool_router: LanternMcp::tool_router(),
+        prompt_router: LanternMcp::prompt_router(),
+    };
     let transport = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
