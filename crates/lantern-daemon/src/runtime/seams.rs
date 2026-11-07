@@ -156,3 +156,33 @@ impl RuntimeRouter for UnavailableRouter {
         Box::pin(async { Err("php-fpm adapter unavailable".into()) })
     }
 }
+
+/// Boundary for shared services named in a project's dependencies.
+pub trait ServiceControl: Send + Sync {
+    /// Whether a service name is available in this integration.
+    fn has(&self, name: &str) -> bool;
+    /// Ensure the service is running without taking ownership of its lifecycle.
+    fn ensure_running<'a>(
+        &'a self,
+        name: &'a str,
+        timeout: std::time::Duration,
+        cancel: CancellationToken,
+    ) -> PrepareFuture<'a>;
+}
+
+/// Default shared-service adapter that recognizes no services.
+#[derive(Debug, Default)]
+pub struct UnavailableServices;
+impl ServiceControl for UnavailableServices {
+    fn has(&self, _: &str) -> bool {
+        false
+    }
+    fn ensure_running<'a>(
+        &'a self,
+        _: &'a str,
+        _: std::time::Duration,
+        _: CancellationToken,
+    ) -> PrepareFuture<'a> {
+        Box::pin(async { Err("service adapter unavailable".into()) })
+    }
+}

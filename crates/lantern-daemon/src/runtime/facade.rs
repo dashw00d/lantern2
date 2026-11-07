@@ -26,7 +26,8 @@ use super::journal::{self, LogHub};
 use super::launcher::{self, LaunchSpec};
 use super::ports::{PortAvailability, PortLeases, PortRange};
 use super::seams::{
-    InstancePreparer, NoopPreparer, PortProbe, RouteTarget, RuntimeRouter, RuntimeStore, UnavailableRouter,
+    InstancePreparer, NoopPreparer, PortProbe, RouteTarget, RuntimeRouter, RuntimeStore, ServiceControl,
+    UnavailableRouter, UnavailableServices,
 };
 use super::shell_env;
 use super::state_machine::{
@@ -57,6 +58,21 @@ pub struct RuntimeConfig {
     pub readiness_interval: Duration,
     /// Time an incorrect port must be observed before diagnosing a mismatch.
     pub mismatch_after: Duration,
+}
+
+/// Optional cross-subsystem adapters required for complete site and service handling.
+pub struct RuntimeAdapters {
+    /// Checkout preparation implementation.
+    pub preparer: Arc<dyn InstancePreparer>,
+    /// Route and php-fpm implementation.
+    pub router: Arc<dyn RuntimeRouter>,
+    /// Shared-service implementation.
+    pub services: Arc<dyn ServiceControl>,
+}
+impl std::fmt::Debug for RuntimeAdapters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeAdapters").finish_non_exhaustive()
+    }
 }
 
 /// Error returned before an operation is accepted or when runtime I/O fails.
@@ -207,6 +223,7 @@ struct Inner {
     probe: Arc<dyn PortProbe>,
     preparer: Arc<dyn InstancePreparer>,
     router: Arc<dyn RuntimeRouter>,
+    services: Arc<dyn ServiceControl>,
     backend: Arc<dyn UserSystemd>,
     tracker: OperationTracker,
     logs: Arc<LogHub>,
@@ -272,6 +289,33 @@ impl Runtime {
         preparer: Arc<dyn InstancePreparer>,
         router: Arc<dyn RuntimeRouter>,
     ) -> Self {
+        Self::with_all_adapters(
+            config,
+            store,
+            probe,
+            backend,
+            tracker,
+            RuntimeAdapters {
+                preparer,
+                router,
+                services: Arc::new(UnavailableServices),
+            },
+        )
+    }
+    /// Construct with checkout, networking and shared-service adapters.
+    pub fn with_all_adapters(
+        config: RuntimeConfig,
+        store: Arc<dyn RuntimeStore>,
+        probe: Arc<dyn PortProbe>,
+        backend: Arc<dyn UserSystemd>,
+        tracker: OperationTracker,
+        adapters: RuntimeAdapters,
+    ) -> Self {
+        let RuntimeAdapters {
+            preparer,
+            router,
+            services,
+        } = adapters;
         let logs = Arc::new(LogHub::new(
             config.settings.logs.ring_lines,
             config.settings.logs.ring_bytes,
@@ -283,6 +327,7 @@ impl Runtime {
             probe,
             preparer,
             router,
+            services,
             backend,
             tracker,
             logs,
@@ -724,6 +769,21 @@ impl Runtime {
                 ));
             }
         }
+        for name in &instance.manifest.depends_on {
+            let project = if name.starts_with("service:") {
+                None
+            } else {
+                self.inner.store.resolve_dependency(name).map_err(store_fault)?
+            };
+            if project.is_none() {
+                let service = name.strip_prefix("service:").unwrap_or(name);
+                let timeout = Duration::from_secs(self.inner.config.settings.runtime.startup_timeout_secs);
+                tokio::select! {
+                    () = token.cancelled() => return Err(Fault::new("cancelled", IssueCode::Other, "cancelled")),
+                    result = self.inner.services.ensure_running(service, timeout, token.clone()) => result.map_err(|e| Fault::new("dependency_failed",IssueCode::DependencyFailed,format!("service {service}: {e}")))?,
+                }
+            }
+        }
         let m = &instance.manifest;
         let upstream = m
             .upstream_url
@@ -1074,19 +1134,23 @@ impl Runtime {
             }
             stack.push(id.clone());
             for name in &instance.manifest.depends_on {
-                let dep = rt
-                    .inner
-                    .store
-                    .resolve_dependency(name)
-                    .map_err(store_fault)?
-                    .ok_or_else(|| {
-                        Fault::new(
+                let project = if name.starts_with("service:") {
+                    None
+                } else {
+                    rt.inner.store.resolve_dependency(name).map_err(store_fault)?
+                };
+                if let Some(dep) = project {
+                    visit(rt, &dep, stack, done, out)?;
+                } else {
+                    let service = name.strip_prefix("service:").unwrap_or(name);
+                    if !rt.inner.services.has(service) {
+                        return Err(Fault::new(
                             "dependency_missing",
                             IssueCode::DependencyFailed,
-                            format!("unresolved dependency {name}; service adapter may be required"),
-                        )
-                    })?;
-                visit(rt, &dep, stack, done, out)?;
+                            format!("unresolved dependency {name}"),
+                        ));
+                    }
+                }
             }
             stack.pop();
             done.insert(id.clone());
