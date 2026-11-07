@@ -319,6 +319,7 @@ pub fn rotate_root(
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut written_key = false;
     let mut written_cert = false;
+    let mut attempted_start = false;
     let mut archive: Option<PathBuf> = None;
     let attempt = (|| -> Result<(), CaError> {
         use std::os::unix::fs::DirBuilderExt;
@@ -349,6 +350,7 @@ pub fn rotate_root(
         atomic_write(&paths.root_cert, &cert, 0o644)?;
         written_cert = true;
         if was_active {
+            attempted_start = true;
             run_checked(
                 runner,
                 &command(&["--user", "start", "lantern-caddy.service"], true),
@@ -359,6 +361,17 @@ pub fn rotate_root(
         Ok(())
     })();
     if let Err(error) = attempt {
+        if attempted_start
+            && let Err(stop_error) = run_checked(
+                runner,
+                &command(&["--user", "stop", "lantern-caddy.service"], true),
+                paths.fake_root.is_some(),
+            )
+        {
+            return Err(CaError::RotationRequired(format!(
+                "{error}; could not stop Caddy before recovery: {stop_error}; new CA and archive were retained"
+            )));
+        }
         let mut recovery_errors = Vec::new();
         if written_cert && let Err(e) = fs::remove_file(&paths.root_cert) {
             recovery_errors.push(e.to_string());

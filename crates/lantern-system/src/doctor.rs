@@ -195,7 +195,7 @@ impl NetworkProbe for LocalNetworkProbe<'_> {
                 let mut addrs = (format!("lantern-probe.{tld}"), 0)
                     .to_socket_addrs()
                     .map_err(|e| e.to_string())?;
-                if addrs.any(|a| a.ip().is_ipv4() && a.ip().is_loopback()) {
+                if addrs.any(|a| a.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)) {
                     Ok("system resolver returned loopback".into())
                 } else {
                     Err("system resolver did not return IPv4 loopback".into())
@@ -407,6 +407,108 @@ fn free_ports(ctx: &DoctorCtx<'_>) -> Result<String, String> {
         ))
     }
 }
+fn api_port_conflict(ctx: &DoctorCtx<'_>) -> Result<Option<String>, String> {
+    let mut available = false;
+    let mut inodes = std::collections::BTreeSet::new();
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = fs::read_to_string(ctx.paths.system(Path::new(file))) else {
+            continue;
+        };
+        available = true;
+        for line in text.lines().skip(1) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[3] != "0A" {
+                continue;
+            }
+            let port = fields[1]
+                .rsplit_once(':')
+                .and_then(|(_, p)| u16::from_str_radix(p, 16).ok());
+            if port == Some(ctx.settings.daemon.port) {
+                inodes.insert(fields[9].to_owned());
+            }
+        }
+    }
+    if !available {
+        return Err("cannot inspect API port listeners".into());
+    }
+    if inodes.is_empty() {
+        return Ok(None);
+    }
+    let proc_root = ctx.paths.system(Path::new("/proc"));
+    let entries = fs::read_dir(proc_root).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_str().and_then(|s| s.parse::<u32>().ok()).is_none() {
+            continue;
+        }
+        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let matches = fds
+            .flatten()
+            .filter_map(|fd| fs::read_link(fd.path()).ok())
+            .any(|target| {
+                target
+                    .to_str()
+                    .and_then(|s| s.strip_prefix("socket:["))
+                    .and_then(|s| s.strip_suffix(']'))
+                    .is_some_and(|inode| inodes.contains(inode))
+            });
+        if !matches {
+            continue;
+        }
+        let exe = fs::read_link(entry.path().join("exe")).ok();
+        if exe
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "lantern")
+        {
+            continue;
+        }
+        return Ok(Some(format!(
+            "API port {} is held by pid {} ({})",
+            ctx.settings.daemon.port,
+            name.to_string_lossy(),
+            exe.map_or_else(|| "unknown executable".into(), |p| p.display().to_string())
+        )));
+    }
+    // An inaccessible fd is not evidence that the listener is ours.
+    let lantern_owns_all = {
+        let mut owned = std::collections::BTreeSet::new();
+        if let Ok(entries) = fs::read_dir(ctx.paths.system(Path::new("/proc"))) {
+            for entry in entries.flatten() {
+                let exe = fs::read_link(entry.path().join("exe")).ok();
+                if !exe
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .is_some_and(|n| n == "lantern")
+                {
+                    continue;
+                }
+                if let Ok(fds) = fs::read_dir(entry.path().join("fd")) {
+                    for link in fds.flatten().filter_map(|fd| fs::read_link(fd.path()).ok()) {
+                        if let Some(inode) = link
+                            .to_str()
+                            .and_then(|s| s.strip_prefix("socket:["))
+                            .and_then(|s| s.strip_suffix(']'))
+                        {
+                            owned.insert(inode.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        inodes.is_subset(&owned)
+    };
+    if lantern_owns_all {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "API port {} has an unidentified listener",
+            ctx.settings.daemon.port
+        )))
+    }
+}
 /// Run all checks without mutating the machine or depending on the daemon.
 pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
     let mut checks = Vec::new();
@@ -580,8 +682,9 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
         "sudo apt install libnss3-tools",
         true,
     ));
-    let root = fs::read(&ctx.paths.root_cert)
+    let root = crate::ca::inspect_root(ctx.paths, tld, 0)
         .ok()
+        .and_then(|_| crate::ca::read_bounded_nofollow(&ctx.paths.root_cert, 16 * 1024).ok())
         .and_then(|v| nss_trust::certificate_der(&v).ok());
     for db in nss_trust::discover(ctx.paths) {
         let id = if db.browser == Browser::Chrome {
@@ -624,8 +727,12 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
         .filter(|d| d.browser == Browser::Firefox)
     {
         if fs::read_to_string(db.path.join("prefs.js")).is_ok_and(|s| {
-            s.lines()
-                .any(|l| l.contains("network.trr.mode") && l.contains(", 3"))
+            s.lines().any(|l| {
+                l.contains("network.trr.mode")
+                    && l.split(',')
+                        .nth(1)
+                        .is_some_and(|v| v.trim_start().starts_with("3)"))
+            })
         }) {
             strict.push(db.path);
         }
@@ -680,15 +787,28 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
         false,
     ));
     let artifacts = v1_migrate::detect(ctx.paths);
+    let port_conflict = api_port_conflict(ctx);
+    let (v1_status, v1_detail) = match port_conflict {
+        Ok(conflict) if !artifacts.is_empty() || conflict.is_some() => (
+            CheckStatus::Warn,
+            format!(
+                "{} v1 artifact(s); {}",
+                artifacts.len(),
+                conflict.unwrap_or_else(|| "no foreign API listener".into())
+            ),
+        ),
+        Ok(_) => (CheckStatus::Ok, "no v1 artifacts or foreign API listener".into()),
+        Err(e) if !artifacts.is_empty() => (
+            CheckStatus::Warn,
+            format!("{} v1 artifact(s); {e}", artifacts.len()),
+        ),
+        Err(e) => (CheckStatus::Skipped, e),
+    };
     checks.push(item(
         "conflict.v1",
         "v1 artifacts",
-        if artifacts.is_empty() {
-            CheckStatus::Ok
-        } else {
-            CheckStatus::Warn
-        },
-        format!("{} v1 artifact(s) detected", artifacts.len()),
+        v1_status,
+        v1_detail,
         "sudo lantern init --system-steps --migrate-v1",
         true,
     ));

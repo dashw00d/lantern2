@@ -46,7 +46,7 @@ pub struct SystemInitCtx<'a> {
     pub settings: &'a Settings,
     /// Command execution boundary.
     pub runner: &'a dyn CommandRunner,
-    /// Numeric non-root target user.
+    /// Numeric non-root target user; zero denotes package setup without user context.
     pub uid: u32,
     /// Selected privileged-port strategy.
     pub port_strategy: PortStrategy,
@@ -106,8 +106,18 @@ impl ResolvedUser {
     }
 }
 fn validate_settings(ctx: &SystemInitCtx<'_>) -> Result<SocketAddr, String> {
-    if ctx.uid == 0 {
+    if ctx.uid == 0 && !ctx.from_package {
         return Err("target uid must not be root".into());
+    }
+    if ctx.uid == 0 && ctx.from_package {
+        let defaults = Settings::default();
+        if ctx.settings.domains.tld != defaults.domains.tld
+            || ctx.settings.dns.listen != defaults.dns.listen
+            || ctx.settings.proxy.http_port != defaults.proxy.http_port
+            || ctx.settings.proxy.https_port != defaults.proxy.https_port
+        {
+            return Err("package setup without a user requires default settings".into());
+        }
     }
     if !crate::steps::valid_tld(&ctx.settings.domains.tld) {
         return Err("invalid TLD".into());
@@ -131,6 +141,9 @@ fn validate_system(ctx: &SystemInitCtx<'_>) -> Result<SocketAddr, String> {
     if ctx.paths.fake_root.is_none() {
         if effective_uid() != 0 {
             return Err("system steps require root".into());
+        }
+        if ctx.from_package && ctx.uid == 0 {
+            return Ok(listen);
         }
         let resolved = ResolvedUser::from_uid(ctx.uid)?;
         if resolved.paths.home != ctx.paths.home
@@ -188,7 +201,7 @@ pub fn run_user_steps(ctx: &InitCtx<'_>) -> Vec<StepOutcome> {
         },
         "user directories exist",
     ));
-    outcomes.push(match ctx.ca_step {
+    let ca_outcome = match ctx.ca_step {
         Some(step) if !step.needs_root() => step.apply(),
         Some(_) => StepOutcome::new("ca", OutcomeState::Failed, "CA step must not require root"),
         None => crate::ca::CaStep {
@@ -197,11 +210,27 @@ pub fn run_user_steps(ctx: &InitCtx<'_>) -> Vec<StepOutcome> {
             runner: Some(ctx.runner),
         }
         .apply(),
-    });
+    };
+    let ca_failed = ca_outcome.state == OutcomeState::Failed;
+    outcomes.push(ca_outcome);
+    if ca_failed {
+        outcomes.push(StepOutcome::new(
+            "nss_trust",
+            OutcomeState::Skipped,
+            "CA step failed",
+        ));
+        outcomes.push(StepOutcome::new(
+            "user_units",
+            OutcomeState::Skipped,
+            "CA step failed",
+        ));
+        return outcomes;
+    }
     outcomes.push(
         NssTrustStep {
             paths: ctx.paths,
             runner: ctx.runner,
+            tld: ctx.tld,
             certutil: ctx.certutil,
         }
         .apply(),
@@ -407,4 +436,86 @@ pub fn run_init(user: &InitCtx<'_>, system: &SystemInitCtx<'_>) -> Result<InitPl
         system_steps,
         pkexec,
     })
+}
+
+/// Undo installed root files, optionally removing the system trust anchor.
+pub fn undo_system_steps(ctx: &SystemInitCtx<'_>, untrust_ca: bool) -> Vec<StepOutcome> {
+    if let Err(e) = validate_system(ctx) {
+        return vec![StepOutcome::new("system_steps", OutcomeState::Failed, e)];
+    }
+    fn remove_step(
+        ctx: &SystemInitCtx<'_>,
+        id: &'static str,
+        path: &Path,
+        reload: Option<CommandSpec>,
+    ) -> StepOutcome {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_file() => meta,
+            Ok(_) => {
+                return StepOutcome::new(
+                    id,
+                    OutcomeState::Failed,
+                    "refusing to remove a non-regular system file",
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return StepOutcome::new(id, OutcomeState::AlreadyDone, "file already absent");
+            }
+            Err(e) => return StepOutcome::new(id, OutcomeState::Failed, e.to_string()),
+        };
+        let bytes = match crate::ca::read_bounded_nofollow(path, 16 * 1024) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::new(id, OutcomeState::Failed, e.to_string()),
+        };
+        if let Err(e) = fs::remove_file(path) {
+            return StepOutcome::new(id, OutcomeState::Failed, e.to_string());
+        }
+        if let Some(command) = reload
+            && let Err(e) = crate::steps::run_checked(ctx.runner, &command, ctx.paths.fake_root.is_some())
+        {
+            let restore = crate::file::atomic_write(path, &bytes, metadata.permissions().mode() & 0o777);
+            return StepOutcome::new(
+                id,
+                OutcomeState::Failed,
+                match restore {
+                    Ok(_) => e,
+                    Err(r) => format!("{e}; restore failed: {r}"),
+                },
+            );
+        }
+        StepOutcome::new(id, OutcomeState::Changed, "removed system file")
+    }
+    let mut results = vec![
+        remove_step(ctx, "ports", &ctx.paths.sysctl_conf, None),
+        remove_step(
+            ctx,
+            "dns",
+            &ctx.paths.dns_delegate,
+            Some(CommandSpec::new(
+                "/usr/bin/systemctl",
+                ["reload", "systemd-resolved"],
+                true,
+            )),
+        ),
+    ];
+    if untrust_ca {
+        results.push(remove_step(
+            ctx,
+            "system_trust",
+            &ctx.paths.system_cert,
+            Some(CommandSpec::new(
+                "/usr/sbin/update-ca-certificates",
+                std::iter::empty::<&str>(),
+                true,
+            )),
+        ));
+    } else {
+        results.push(StepOutcome::new(
+            "system_trust",
+            OutcomeState::Skipped,
+            "system CA retained without --untrust-ca",
+        ));
+    }
+    results
 }

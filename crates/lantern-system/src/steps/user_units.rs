@@ -27,6 +27,24 @@ fn quote_exec(path: &Path) -> Result<String, String> {
             .replace('$', "$$")
     ))
 }
+fn quote_desktop_exec(path: &Path) -> Result<String, String> {
+    // Desktop entries have an additional string-unescaping layer before Exec parsing.
+    let _ = quote_exec(path)?;
+    let text = std::str::from_utf8(path.as_os_str().as_bytes()).map_err(|_| "binary path must be UTF-8")?;
+    let mut quoted = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '%' => quoted.push_str("%%"),
+            '\\' => quoted.push_str("\\\\\\\\"),
+            '"' => quoted.push_str("\\\\\""),
+            '$' => quoted.push_str("\\\\$"),
+            '`' => quoted.push_str("\\\\`"),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
+}
 /// Render a systemd unit using a literal absolute executable.
 pub fn unit_contents(executable: &Path) -> Result<String, String> {
     Ok(format!(
@@ -36,7 +54,7 @@ pub fn unit_contents(executable: &Path) -> Result<String, String> {
 }
 /// Render a desktop entry for tray autostart.
 pub fn autostart_contents(executable: &Path) -> Result<String, String> {
-    let exec = quote_exec(executable)?;
+    let exec = quote_desktop_exec(executable)?;
     Ok(format!(
         "[Desktop Entry]\nType=Application\nName=Lantern\nExec={exec} gui --tray\nIcon=lantern\nTerminal=false\nStartupNotify=false\nX-GNOME-Autostart-enabled=true\n"
     ))
@@ -111,7 +129,11 @@ impl Step for UserUnitsStep<'_> {
             .runner
             .run(&self.cmd(&["--user", "is-enabled", "lantern.service"], false))
             .is_ok_and(|o| o.success);
-        if unit_matches && tray_matches && enabled {
+        let active = self
+            .runner
+            .run(&self.cmd(&["--user", "is-active", "lantern.service"], false))
+            .is_ok_and(|o| o.success);
+        if unit_matches && tray_matches && enabled && active {
             StepState::Done("user service and requested autostart are configured".into())
         } else {
             StepState::Pending("user service or tray entry needs setup".into())
@@ -124,15 +146,12 @@ impl Step for UserUnitsStep<'_> {
         let result = (|| -> Result<(), String> {
             if self.executable != Path::new("/usr/bin/lantern") {
                 let contents = unit_contents(self.executable)?;
-                if atomic_write(&self.paths.user_unit, contents.as_bytes(), 0o644)
-                    .map_err(|e| e.to_string())?
-                {
-                    run_checked(
-                        self.runner,
-                        &self.cmd(&["--user", "daemon-reload"], true),
-                        self.paths.fake_root.is_some(),
-                    )?;
-                }
+                atomic_write(&self.paths.user_unit, contents.as_bytes(), 0o644).map_err(|e| e.to_string())?;
+                run_checked(
+                    self.runner,
+                    &self.cmd(&["--user", "daemon-reload"], true),
+                    self.paths.fake_root.is_some(),
+                )?;
             }
             if self.tray_autostart {
                 atomic_write(

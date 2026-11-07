@@ -54,6 +54,7 @@ struct State {
     commands: Vec<CommandSpec>,
     cap: bool,
     enabled: bool,
+    active: bool,
     nss: HashMap<PathBuf, Vec<u8>>,
 }
 struct RecordingRunner {
@@ -98,7 +99,9 @@ impl CommandRunner for RecordingRunner {
                 if fs::symlink_metadata(&self.system_cert_link).is_ok() {
                     fs::remove_file(&self.system_cert_link)?;
                 }
-                std::os::unix::fs::symlink(&self.system_cert, &self.system_cert_link)?;
+                if self.system_cert.exists() {
+                    std::os::unix::fs::symlink(&self.system_cert, &self.system_cert_link)?;
+                }
             }
             "/usr/sbin/setcap" => state.cap = true,
             "/usr/sbin/sysctl" => {
@@ -107,7 +110,15 @@ impl CommandRunner for RecordingRunner {
                 fs::write(&self.live, value)?;
             }
             "/usr/bin/systemctl" if args.iter().any(|a| a == "is-enabled") => out.success = state.enabled,
-            "/usr/bin/systemctl" if args.iter().any(|a| a == "enable") => state.enabled = true,
+            "/usr/bin/systemctl"
+                if args.iter().any(|a| a == "is-active") && args.iter().any(|a| a == "lantern.service") =>
+            {
+                out.success = state.active
+            }
+            "/usr/bin/systemctl" if args.iter().any(|a| a == "enable") => {
+                state.enabled = true;
+                state.active = true;
+            }
             "/usr/bin/certutil" => {
                 let db = PathBuf::from(args[1].strip_prefix("sql:").unwrap());
                 if args.iter().any(|a| a == "-L") {
@@ -223,10 +234,7 @@ fn setcap_refuses_arbitrary_target() {
 fn nss_finds_snap_and_flatpak_and_rechecks_der() {
     let f = Fixture::new();
     let runner = RecordingRunner::new(&f);
-    f.write(
-        &f.paths.root_cert,
-        b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
-    );
+    lantern_system::ca::ensure_root(&f.paths, "glow").unwrap();
     fs::create_dir_all(f.paths.home.join("snap/chromium/current")).unwrap();
     for path in [
         ".mozilla/firefox/normal/cert9.db",
@@ -241,6 +249,7 @@ fn nss_finds_snap_and_flatpak_and_rechecks_der() {
     let step = NssTrustStep {
         paths: &f.paths,
         runner: &runner,
+        tld: "glow",
         certutil: Some(Path::new("/usr/bin/certutil")),
     };
     assert_eq!(step.apply().state, OutcomeState::Changed);
@@ -269,6 +278,9 @@ fn user_service_enable_and_tray_are_idempotent() {
     assert!(unit_contents(Path::new("/tmp/x\nInject=yes")).is_err());
     assert_eq!(step.apply().state, OutcomeState::Changed);
     assert_eq!(step.apply().state, OutcomeState::AlreadyDone);
+    runner.state.borrow_mut().active = false;
+    assert!(matches!(step.check(), StepState::Pending(_)));
+    assert_eq!(step.apply().state, OutcomeState::Changed);
     assert!(
         fs::read_to_string(&f.paths.user_unit)
             .unwrap()
@@ -427,10 +439,7 @@ fn init_composes_steps_with_uid_and_settings_validation() {
     let f = Fixture::new();
     let runner = RecordingRunner::new(&f);
     f.write(&f.paths.sysctl_live, b"1024");
-    f.write(
-        &f.paths.root_cert,
-        b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
-    );
+    lantern_system::ca::ensure_root(&f.paths, "glow").unwrap();
     let exe = f.paths.home.join("build/lantern");
     f.write(&exe, b"binary");
     let ca = FakeStep {
@@ -596,20 +605,18 @@ fn nss_matching_certificate_without_ssl_ca_trust_is_not_done() {
                 && !command.args.iter().any(|a| a == "-n")
                 && out.success
             {
-                out.stdout = b"Lantern Local CA   ,,\n".to_vec();
+                out.stdout = b"Lantern Local CA   ,,\nLantern Local CA Copied    C,,\n".to_vec();
             }
             Ok(out)
         }
     }
     let f = Fixture::new();
     let runner = RecordingRunner::new(&f);
-    f.write(
-        &f.paths.root_cert,
-        b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
-    );
+    lantern_system::ca::ensure_root(&f.paths, "glow").unwrap();
     let step = NssTrustStep {
         paths: &f.paths,
         runner: &runner,
+        tld: "glow",
         certutil: Some(Path::new("/usr/bin/certutil")),
     };
     assert_eq!(step.apply().state, OutcomeState::Changed);
@@ -931,4 +938,177 @@ fn high_ports_still_check_the_actual_kernel_threshold() {
     assert!(matches!(step.check(), StepState::Pending(_)));
     assert_eq!(step.apply().state, OutcomeState::Changed);
     assert!(matches!(step.check(), StepState::Done(_)));
+}
+
+#[test]
+fn browser_and_system_trust_reject_an_unconstrained_root() {
+    use lantern_system::steps::system_trust::SystemTrustStep;
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    let mut params = rcgen::CertificateParams::default();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    f.write(&f.paths.root_cert, cert.pem().as_bytes());
+    f.write(&f.paths.root_key, key.serialize_pem().as_bytes());
+    fs::set_permissions(&f.paths.root_key, fs::Permissions::from_mode(0o600)).unwrap();
+    let browser = NssTrustStep {
+        paths: &f.paths,
+        runner: &runner,
+        tld: "glow",
+        certutil: Some(Path::new("/usr/bin/certutil")),
+    };
+    let system = SystemTrustStep {
+        paths: &f.paths,
+        runner: &runner,
+        tld: "glow",
+    };
+    assert_eq!(browser.apply().state, OutcomeState::Failed);
+    assert_eq!(system.apply().state, OutcomeState::Failed);
+    assert!(runner.state.borrow().commands.is_empty());
+}
+#[test]
+fn failed_ca_prevents_browser_and_unit_changes() {
+    use lantern_system::init::{InitCtx, run_user_steps};
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    let exe = f.paths.home.join("lantern");
+    f.write(&exe, b"binary");
+    let ctx = InitCtx {
+        paths: &f.paths,
+        runner: &runner,
+        tld: "bad\ntld",
+        executable: &exe,
+        certutil: Some(Path::new("/usr/bin/certutil")),
+        tray_autostart: true,
+        ca_step: None,
+    };
+    let outcomes = run_user_steps(&ctx);
+    assert_eq!(outcomes[1].state, OutcomeState::Failed);
+    assert_eq!(outcomes[2].state, OutcomeState::Skipped);
+    assert_eq!(outcomes[3].state, OutcomeState::Skipped);
+    assert!(runner.state.borrow().commands.is_empty());
+    assert!(!f.paths.user_unit.exists());
+}
+#[test]
+fn doctor_detects_foreign_api_listener_without_a_socket() {
+    use lantern_core::api::CheckStatus;
+    use lantern_system::doctor::{DoctorCtx, run};
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    let tcp = f.paths.system(Path::new("/proc/net/tcp"));
+    f.write(
+        &tcp,
+        b"header\n 0: 0100007F:12A9 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 999\n",
+    );
+    let process = f.paths.system(Path::new("/proc/42"));
+    fs::create_dir_all(process.join("fd")).unwrap();
+    std::os::unix::fs::symlink("socket:[999]", process.join("fd/4")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/old-daemon", process.join("exe")).unwrap();
+    let settings = lantern_core::settings::Settings::default();
+    let ctx = DoctorCtx {
+        paths: &f.paths,
+        settings: &settings,
+        runner: &runner,
+        network: &OfflineNetwork,
+        caddy: &f.paths.bundled_caddy,
+        certutil: None,
+        search_path: vec![],
+    };
+    let check = run(&ctx).into_iter().find(|c| c.id == "conflict.v1").unwrap();
+    assert_eq!(check.status, CheckStatus::Warn);
+    assert!(check.detail.contains("pid 42"));
+    fs::remove_file(process.join("exe")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/lantern", process.join("exe")).unwrap();
+    let check = run(&ctx).into_iter().find(|c| c.id == "conflict.v1").unwrap();
+    assert_eq!(check.status, CheckStatus::Ok);
+}
+
+#[test]
+fn package_setup_without_user_preserves_custom_files_and_skips_ca() {
+    use lantern_system::init::{SystemInitCtx, run_system_steps};
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(&f.paths.sysctl_live, b"1024");
+    f.write(&f.paths.sysctl_conf, b"custom sysctl\n");
+    f.write(&f.paths.dns_delegate, b"custom delegate\n");
+    let settings = lantern_core::settings::Settings::default();
+    let ctx = SystemInitCtx {
+        paths: &f.paths,
+        settings: &settings,
+        runner: &runner,
+        uid: 0,
+        port_strategy: PortStrategy::Sysctl,
+        from_package: true,
+        migrate_v1: false,
+        allow_fake_cleanup: false,
+        system_trust_step: None,
+    };
+    let outcomes = run_system_steps(&ctx);
+    assert!(outcomes.iter().all(|o| o.state == OutcomeState::Skipped));
+    assert_eq!(fs::read(&f.paths.sysctl_conf).unwrap(), b"custom sysctl\n");
+    assert_eq!(fs::read(&f.paths.dns_delegate).unwrap(), b"custom delegate\n");
+    assert!(!runner.state.borrow().commands.iter().any(|c| c.mutating));
+}
+
+#[test]
+fn undo_is_idempotent_and_retains_trust_unless_requested() {
+    use lantern_system::init::{SystemInitCtx, run_system_steps, undo_system_steps};
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(&f.paths.sysctl_live, b"1024");
+    lantern_system::ca::ensure_root(&f.paths, "glow").unwrap();
+    let settings = lantern_core::settings::Settings::default();
+    let ctx = SystemInitCtx {
+        paths: &f.paths,
+        settings: &settings,
+        runner: &runner,
+        uid: 1000,
+        port_strategy: PortStrategy::Sysctl,
+        from_package: false,
+        migrate_v1: false,
+        allow_fake_cleanup: false,
+        system_trust_step: None,
+    };
+    assert!(
+        run_system_steps(&ctx)
+            .iter()
+            .all(|s| s.state == OutcomeState::Changed)
+    );
+    let undo = undo_system_steps(&ctx, false);
+    assert_eq!(
+        undo.iter().map(|s| s.state).collect::<Vec<_>>(),
+        vec![
+            OutcomeState::Changed,
+            OutcomeState::Changed,
+            OutcomeState::Skipped
+        ]
+    );
+    assert!(f.paths.system_cert.exists());
+    let again = undo_system_steps(&ctx, true);
+    assert_eq!(
+        again.iter().map(|s| s.state).collect::<Vec<_>>(),
+        vec![
+            OutcomeState::AlreadyDone,
+            OutcomeState::AlreadyDone,
+            OutcomeState::Changed
+        ]
+    );
+    assert!(!f.paths.system_cert.exists());
+    assert!(
+        undo_system_steps(&ctx, true)
+            .iter()
+            .all(|s| s.state == OutcomeState::AlreadyDone)
+    );
+    assert!(
+        runner
+            .state
+            .borrow()
+            .commands
+            .iter()
+            .filter(|c| c.mutating)
+            .all(|c| c.fake_root)
+    );
 }

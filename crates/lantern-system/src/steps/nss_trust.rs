@@ -112,8 +112,12 @@ pub fn trusted(runner: &dyn CommandRunner, certutil: &Path, db: &NssDatabase, ro
                 && String::from_utf8_lossy(&o.stdout).lines().any(|line| {
                     line.trim_start()
                         .strip_prefix("Lantern Local CA")
+                        .filter(|s| s.starts_with(char::is_whitespace))
                         .and_then(|s| s.split_whitespace().next())
-                        .is_some_and(|flags| flags.split(',').next().is_some_and(|ssl| ssl.contains('C')))
+                        .is_some_and(|flags| {
+                            flags.split(',').count() == 3
+                                && flags.split(',').next().is_some_and(|ssl| ssl.contains('C'))
+                        })
                 })
         })
 }
@@ -123,6 +127,8 @@ pub struct NssTrustStep<'a> {
     pub paths: &'a LanternPaths,
     /// Command execution boundary.
     pub runner: &'a dyn CommandRunner,
+    /// Configured DNS TLD.
+    pub tld: &'a str,
     /// Absolute path to certutil, if installed.
     pub certutil: Option<&'a Path>,
 }
@@ -147,11 +153,15 @@ impl Step for NssTrustStep<'_> {
         "lantern init --user-steps"
     }
     fn check(&self) -> StepState {
-        let cert = match fs::read(&self.paths.root_cert) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        match crate::ca::inspect_root(self.paths, self.tld, 0) {
+            Ok(_) => {}
+            Err(crate::ca::CaError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 return StepState::Skipped("CA not created yet".into());
             }
+            Err(e) => return StepState::Failed(e.to_string()),
+        }
+        let cert = match crate::ca::read_bounded_nofollow(&self.paths.root_cert, 16 * 1024) {
+            Ok(c) => c,
             Err(e) => return StepState::Failed(e.to_string()),
         };
         let der = match certificate_der(&cert) {
@@ -177,7 +187,9 @@ impl Step for NssTrustStep<'_> {
             return out;
         }
         let result = (|| -> Result<(), String> {
-            let root = fs::read(&self.paths.root_cert).map_err(|e| e.to_string())?;
+            crate::ca::inspect_root(self.paths, self.tld, 0).map_err(|e| e.to_string())?;
+            let root = crate::ca::read_bounded_nofollow(&self.paths.root_cert, 16 * 1024)
+                .map_err(|e| e.to_string())?;
             let der = certificate_der(&root)?;
             let certutil = self.certutil.ok_or("certutil is not installed")?;
             for db in discover(self.paths) {
