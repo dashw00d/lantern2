@@ -82,7 +82,7 @@ fn unavailable() -> ApiError {
     }
 }
 
-/// HTTP's adapter seam. Implementations start work independently of request cancellation.
+/// HTTP's adapter seam. Read methods never initiate state changes or refreshes; work outlives requests.
 /// Optional/default methods report unavailable until the controller wires that subsystem.
 #[async_trait]
 pub trait DaemonFacade: Send + Sync + 'static {
@@ -334,7 +334,7 @@ pub trait DaemonFacade: Send + Sync + 'static {
     async fn manifest(&self, _id: InstanceId) -> FacadeResult<Value> {
         Err(unavailable())
     }
-    /// Read an intel snapshot.
+    /// Read cached intel only; `max_age` may affect staleness but must not trigger refresh.
     async fn intel(&self, _id: InstanceId, _max_age: Option<u32>) -> FacadeResult<IntelSnapshot> {
         Err(unavailable())
     }
@@ -350,7 +350,7 @@ pub trait DaemonFacade: Send + Sync + 'static {
     async fn docs(&self, _id: InstanceId) -> FacadeResult<Vec<DocEntry>> {
         Err(unavailable())
     }
-    /// Read a document page.
+    /// Read a listed document, rejecting binary files and paths or symlinks outside the checkout.
     async fn doc(
         &self,
         _id: InstanceId,
