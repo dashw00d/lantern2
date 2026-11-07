@@ -1,0 +1,4 @@
+name: django
+type: proxy
+run:
+  cmd: "python manage.py runserver ${HOST}:${PORT}"

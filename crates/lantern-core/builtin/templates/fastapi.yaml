@@ -1,0 +1,4 @@
+name: fastapi
+type: proxy
+run:
+  cmd: "uvicorn app.main:app --host ${HOST} --port ${PORT}"

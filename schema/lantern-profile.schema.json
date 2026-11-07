@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProfileScalar": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "format": "double",
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    }
+  },
+  "description": "Profile services, start targets and environment overlay.",
+  "properties": {
+    "auto_start": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "auto_start_projects": {
+      "default": [],
+      "deprecated": true,
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "description": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "env": {
+      "additionalProperties": {
+        "$ref": "#/definitions/ProfileScalar"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "port_range": {
+      "default": null,
+      "items": {
+        "format": "uint16",
+        "maximum": 65535,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "services": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "stop_others": {
+      "default": false,
+      "type": "boolean"
+    }
+  },
+  "title": "Profile",
+  "type": "object"
+}

@@ -1,0 +1,4 @@
+name: laravel-serve
+type: proxy
+run:
+  cmd: "php artisan serve --host ${HOST} --port ${PORT}"

@@ -1,0 +1,716 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "CaddySettings": {
+      "description": "Caddy binary selection.",
+      "properties": {
+        "binary": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ClientSettings": {
+      "description": "Editor and terminal command templates used by clients.",
+      "properties": {
+        "editor": {
+          "default": "auto",
+          "type": "string"
+        },
+        "terminal": {
+          "default": "auto",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DaemonSettings": {
+      "description": "Daemon HTTP listener settings.",
+      "properties": {
+        "port": {
+          "default": 4777,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "DnsSettings": {
+      "description": "DNS listener settings.",
+      "properties": {
+        "listen": {
+          "default": "127.0.0.1:5354",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DomainSettings": {
+      "description": "Local domain settings.",
+      "properties": {
+        "tld": {
+          "default": "glow",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "HealthSettings": {
+      "description": "Health-check policy.",
+      "properties": {
+        "fail_threshold": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grace_secs": {
+          "default": 15,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "interval_secs": {
+          "default": 10,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_secs": {
+          "default": 3,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "IntelSettings": {
+      "description": "Intel refresh and cache policy.",
+      "properties": {
+        "cache_file": {
+          "default": true,
+          "type": "boolean"
+        },
+        "max_openapi_bytes": {
+          "default": 5242880,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refresh_interval_minutes": {
+          "default": 10,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "LogSettings": {
+      "description": "Log settings.",
+      "properties": {
+        "level": {
+          "default": "info",
+          "type": "string"
+        },
+        "ring_bytes": {
+          "default": 2097152,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ring_lines": {
+          "default": 2000,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "McpSettings": {
+      "description": "MCP upstream call policy.",
+      "properties": {
+        "allow_critical_calls": {
+          "default": false,
+          "type": "boolean"
+        },
+        "allowed_upstream_hosts": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "PhpSettings": {
+      "description": "PHP-FPM socket selection.",
+      "properties": {
+        "fpm_socket": {
+          "default": "auto",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "PortSettings": {
+      "description": "Sticky port lease range.",
+      "properties": {
+        "range_end": {
+          "default": 29999,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "range_start": {
+          "default": 29000,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ProfileSettings": {
+      "description": "Initial profile selection.",
+      "properties": {
+        "default": {
+          "default": "light",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ProxySettings": {
+      "description": "Proxy listener settings.",
+      "properties": {
+        "bind": {
+          "default": "loopback",
+          "type": "string"
+        },
+        "http_port": {
+          "default": 80,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "https_port": {
+          "default": 443,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ipv6": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RuntimeSettings": {
+      "description": "Runtime settings, including legacy v1 keys retained for compatibility.",
+      "properties": {
+        "backoff_base_secs": {
+          "default": 1,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "backoff_cap_secs": {
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deploy_timeout_secs": {
+          "default": 120,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "env_capture_timeout_secs": {
+          "default": 10,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "log_buffer_lines": {
+          "default": 1000,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_restarts": {
+          "default": 5,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_retries": {
+          "default": 5,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "restart_backoff_ms": {
+          "default": 1000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settle_secs": {
+          "default": 2,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shell": {
+          "default": "",
+          "type": "string"
+        },
+        "stable_after_secs": {
+          "default": 60,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_timeout_secs": {
+          "default": 15,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "startup_timeout_secs": {
+          "default": 60,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stop_timeout_secs": {
+          "default": 10,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ServiceSettings": {
+      "description": "Shared service settings.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "mode": {
+          "default": "auto",
+          "type": "string"
+        },
+        "port": {
+          "default": null,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ServicesSettings": {
+      "description": "Shared services settings.",
+      "properties": {
+        "mailpit": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ServiceSettings"
+            }
+          ],
+          "default": {
+            "enabled": true,
+            "mode": "auto",
+            "port": 8025
+          }
+        },
+        "postgres": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ServiceSettings"
+            }
+          ],
+          "default": {
+            "enabled": true,
+            "mode": "auto",
+            "port": 5432
+          }
+        },
+        "redis": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ServiceSettings"
+            }
+          ],
+          "default": {
+            "enabled": true,
+            "mode": "auto",
+            "port": 6379
+          }
+        }
+      },
+      "type": "object"
+    },
+    "TemplateSettings": {
+      "description": "Template selection.",
+      "properties": {
+        "default": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "WorkspaceSettings": {
+      "description": "Workspace scan behavior.",
+      "properties": {
+        "depth": {
+          "default": 2,
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ignore": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "include_hidden": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "roots": {
+          "default": [
+            "~/sites",
+            "~/tools"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "scan_interval_secs": {
+          "default": 60,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "suggest": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "WorktreeSettings": {
+      "description": "Worktree setup behavior.",
+      "properties": {
+        "clone_deps": {
+          "default": "never",
+          "type": "string"
+        },
+        "dir": {
+          "default": "",
+          "type": "string"
+        },
+        "gc_hint_days": {
+          "default": 30,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_concurrent_setups": {
+          "default": 2,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "missing_retention_days": {
+          "default": 30,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "setup_timeout_secs": {
+          "default": 900,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "description": "Effective configuration, after file and environment overrides.",
+  "properties": {
+    "caddy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CaddySettings"
+        }
+      ],
+      "default": {
+        "binary": ""
+      }
+    },
+    "clients": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ClientSettings"
+        }
+      ],
+      "default": {
+        "editor": "auto",
+        "terminal": "auto"
+      }
+    },
+    "daemon": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DaemonSettings"
+        }
+      ],
+      "default": {
+        "port": 4777
+      }
+    },
+    "dns": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DnsSettings"
+        }
+      ],
+      "default": {
+        "listen": "127.0.0.1:5354"
+      }
+    },
+    "domains": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DomainSettings"
+        }
+      ],
+      "default": {
+        "tld": "glow"
+      }
+    },
+    "health": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/HealthSettings"
+        }
+      ],
+      "default": {
+        "fail_threshold": 3,
+        "grace_secs": 15,
+        "interval_secs": 10,
+        "timeout_secs": 3
+      }
+    },
+    "intel": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/IntelSettings"
+        }
+      ],
+      "default": {
+        "cache_file": true,
+        "max_openapi_bytes": 5242880,
+        "refresh_interval_minutes": 10
+      }
+    },
+    "logs": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LogSettings"
+        }
+      ],
+      "default": {
+        "level": "info",
+        "ring_bytes": 2097152,
+        "ring_lines": 2000
+      }
+    },
+    "mcp": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/McpSettings"
+        }
+      ],
+      "default": {
+        "allow_critical_calls": false,
+        "allowed_upstream_hosts": []
+      }
+    },
+    "php": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PhpSettings"
+        }
+      ],
+      "default": {
+        "fpm_socket": "auto"
+      }
+    },
+    "ports": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PortSettings"
+        }
+      ],
+      "default": {
+        "range_end": 29999,
+        "range_start": 29000
+      }
+    },
+    "profiles": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProfileSettings"
+        }
+      ],
+      "default": {
+        "default": "light"
+      }
+    },
+    "proxy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProxySettings"
+        }
+      ],
+      "default": {
+        "bind": "loopback",
+        "http_port": 80,
+        "https_port": 443,
+        "ipv6": false
+      }
+    },
+    "runtime": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RuntimeSettings"
+        }
+      ],
+      "default": {
+        "backoff_base_secs": 1,
+        "backoff_cap_secs": 30,
+        "deploy_timeout_secs": 120,
+        "env": {},
+        "env_capture_timeout_secs": 10,
+        "log_buffer_lines": 1000,
+        "max_restarts": 5,
+        "max_retries": 5,
+        "restart_backoff_ms": 1000,
+        "settle_secs": 2,
+        "shell": "",
+        "stable_after_secs": 60,
+        "start_timeout_secs": 15,
+        "startup_timeout_secs": 60,
+        "stop_timeout_secs": 10
+      }
+    },
+    "services": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ServicesSettings"
+        }
+      ],
+      "default": {
+        "mailpit": {
+          "enabled": true,
+          "mode": "auto",
+          "port": 8025
+        },
+        "postgres": {
+          "enabled": true,
+          "mode": "auto",
+          "port": 5432
+        },
+        "redis": {
+          "enabled": true,
+          "mode": "auto",
+          "port": 6379
+        }
+      }
+    },
+    "templates": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/TemplateSettings"
+        }
+      ],
+      "default": {
+        "default": ""
+      }
+    },
+    "workspaces": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/WorkspaceSettings"
+        }
+      ],
+      "default": {
+        "depth": 2,
+        "ignore": [],
+        "include_hidden": [],
+        "roots": [
+          "~/sites",
+          "~/tools"
+        ],
+        "scan_interval_secs": 60,
+        "suggest": true
+      }
+    },
+    "worktrees": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/WorktreeSettings"
+        }
+      ],
+      "default": {
+        "clone_deps": "never",
+        "dir": "",
+        "gc_hint_days": 30,
+        "max_concurrent_setups": 2,
+        "missing_retention_days": 30,
+        "setup_timeout_secs": 900
+      }
+    }
+  },
+  "title": "Settings",
+  "type": "object"
+}

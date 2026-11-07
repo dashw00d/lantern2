@@ -1,0 +1,4 @@
+name: react-router
+type: proxy
+run:
+  cmd: "npx react-router dev --host ${HOST} --port ${PORT}"

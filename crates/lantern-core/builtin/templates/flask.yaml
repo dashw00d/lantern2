@@ -1,0 +1,4 @@
+name: flask
+type: proxy
+run:
+  cmd: "flask run --host ${HOST} --port ${PORT}"

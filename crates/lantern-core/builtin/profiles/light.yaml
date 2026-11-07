@@ -1,0 +1,5 @@
+description: Minimal services
+services: []
+auto_start: []
+env: {}
+stop_others: false

@@ -1,0 +1,5 @@
+name: laravel
+type: php
+root: "public"
+features:
+  mailpit: true

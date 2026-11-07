@@ -1,0 +1,4 @@
+name: nuxt
+type: proxy
+run:
+  cmd: "npx nuxi dev --host ${HOST} --port ${PORT}"

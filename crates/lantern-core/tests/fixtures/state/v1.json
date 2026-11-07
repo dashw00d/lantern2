@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "saved_at": "2026-11-06T12:00:00Z",
+  "active_profile": "light",
+  "repos": { "/home/u/sites/mono/.git": { "slug": "mono" } },
+  "projects": {
+    "myapp": { "id": "myapp", "aliases": ["MyApp"], "root": "/home/u/sites/myapp", "repo": { "common_dir": "/home/u/sites/myapp/.git", "subpath": "" }, "source": "manifest", "registered_at": "2026-10-01T09:00:00Z", "last_seen_at": "2026-11-06T11:59:00Z", "missing": false, "overrides": {} }
+  },
+  "instances": {
+    "myapp@feature-x": { "project": "myapp", "checkout": { "path": "/home/u/wt/feature-x", "kind": "managed", "phase": "ready", "created_at": "2026-11-05T10:00:00Z", "created_branch": true, "materialized": [".env"], "setup": { "lock_hash": "abc", "commands_hash": "def", "finished_at": "2026-11-05T11:00:00Z" }, "missing_since": null }, "pinned": true, "adopt": false, "activated": false, "first_started": "2026-11-05T11:00:00Z", "last_started": "2026-11-06T11:00:00Z", "last_runtime": { "status": "running", "port": 29003, "unit": "lantern-inst-myapp_feature-x", "main_pid": 4242, "started_at": "2026-11-06T11:00:00Z", "last_exit": null, "restarts": 0, "message": null } }
+  },
+  "port_leases": { "myapp@feature-x": { "port": 29003, "leased_at": "2026-11-05T10:00:00Z" } },
+  "dismissed_suggestions": ["/home/u/dev/scratch"],
+  "imports": { "v1": { "at": "2026-11-06T12:00:00Z", "from": "/home/u/.config/lantern", "projects": 7 } }
+}

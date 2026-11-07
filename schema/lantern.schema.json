@@ -1,0 +1,772 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": true,
+  "definitions": {
+    "ApiAuto": {
+      "description": "OpenAPI discovery settings.",
+      "properties": {
+        "candidates": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrList"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "enabled": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LenientBool"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_endpoints": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sources": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrList"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "timeout_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DeploySection": {
+      "description": "Shell overrides for project operations.",
+      "properties": {
+        "env_file": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "install": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logs": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "restart": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "start": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stop": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DocEntry": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "properties": {
+            "kind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "An explicitly listed document."
+    },
+    "DocOrList": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DocEntry"
+        },
+        {
+          "items": {
+            "$ref": "#/definitions/DocEntry"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "DocsAuto": {
+      "description": "Documentation discovery settings.",
+      "properties": {
+        "enabled": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LenientBool"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "ignore": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrList"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_bytes": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_files": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "patterns": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrList"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "EndpointEntry": {
+      "description": "An explicit endpoint.",
+      "properties": {
+        "body_hint": true,
+        "category": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": true,
+        "path": {
+          "type": "string"
+        },
+        "risk": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "FeaturesSection": {
+      "description": "Feature switches.",
+      "properties": {
+        "auto_open_browser": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LenientBool"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "auto_start": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LenientBool"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "mailpit": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LenientBool"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "LenientBool": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      ]
+    },
+    "RoutingSection": {
+      "description": "Routing and agent metadata.",
+      "properties": {
+        "agents": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrList"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "aliases": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrList"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_concurrent": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "paths": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "requires_confirmation": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LenientBool"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "risk": {
+          "default": null,
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "triggers": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrList"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "websocket": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LenientBool"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "RunSection": {
+      "description": "Project run command and environment.",
+      "properties": {
+        "cmd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "$ref": "#/definitions/Scalar"
+          },
+          "default": null,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "post_stop": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pre_start": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Scalar": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "format": "double",
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "StringOrList": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "WorktreeSection": {
+      "description": "Worktree copying, linking and environment overlay.",
+      "properties": {
+        "copy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrList"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "env": {
+          "additionalProperties": {
+            "$ref": "#/definitions/Scalar"
+          },
+          "default": null,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "link": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StringOrList"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    }
+  },
+  "description": "A sparse layer of manifest values; absent and explicitly empty lists differ.",
+  "patternProperties": {
+    "^x-": {}
+  },
+  "properties": {
+    "api_auto": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ApiAuto"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "base_url": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "depends_on": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/StringOrList"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "deploy": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DeploySection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "description": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "docs": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DocOrList"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "docs_auto": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DocsAuto"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "domain": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "enabled": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/LenientBool"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "endpoints": {
+      "default": null,
+      "items": {
+        "$ref": "#/definitions/EndpointEntry"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "features": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FeaturesSection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "health_endpoint": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "default": null,
+      "enum": [
+        "project",
+        "service",
+        "capability",
+        "website",
+        "tool",
+        null
+      ],
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "repo_url": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "root": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "routing": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RoutingSection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "run": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RunSection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "setup": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/StringOrList"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "tags": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/StringOrList"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "template": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "type": {
+      "default": null,
+      "enum": [
+        "proxy",
+        "php",
+        "static",
+        "unknown",
+        null
+      ],
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "upstream_url": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "default": null,
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "worktree": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WorktreeSection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "title": "RawManifest",
+  "type": "object"
+}

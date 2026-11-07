@@ -1,0 +1,4 @@
+name: nextjs
+type: proxy
+run:
+  cmd: "npx next dev -H ${HOST} -p ${PORT}"
