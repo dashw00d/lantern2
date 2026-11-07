@@ -528,6 +528,84 @@ impl Drop for RecordingReal {
 struct RealGuard {
     unit: String,
 }
+
+#[tokio::test]
+#[ignore = "real system: creates and reads only its own transient test unit"]
+async fn runtime_real_reconcile_backfills_adopted_unit_logs() {
+    let temp = Temp::new();
+    let store = Arc::new(Store::default());
+    let name = format!("backfill{}", std::process::id());
+    let id = store.insert(
+        &name,
+        &temp.0,
+        "printf 'history-before-restart\\n'; sleep 2; printf 'live-after-restart\\n'; sleep 60",
+        &[],
+    );
+    let cfg = config(&temp);
+    let unit = cfg.names.instance(&id);
+    let _guard = RealGuard { unit: unit.clone() };
+    let backend = Arc::new(RecordingReal::default());
+    let make_runtime = || {
+        Runtime::with_scoped_journal(
+            cfg.clone(),
+            store.clone(),
+            Arc::new(FakeProbe(Mutex::new(ProbeMode::Ready))),
+            backend.clone(),
+            OperationTracker::new(EventBus::new()),
+            lantern_daemon::runtime::RuntimeAdapters {
+                preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+                router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+                services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+            },
+            true,
+        )
+    };
+    let first = make_runtime();
+    assert_eq!(
+        completed(&first.start(&id, StartOpts).await.unwrap()).await,
+        OperationStatus::Succeeded
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if first
+                .log_history(&id, lantern_daemon::runtime::HistoryQuery { limit: 100 })
+                .await
+                .unwrap()
+                .iter()
+                .any(|l| l.line == "history-before-restart")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("test unit did not write journal line");
+    first.shutdown_background();
+    drop(first);
+    let restarted = make_runtime();
+    let report = restarted.reconcile().await;
+    assert_eq!(report.adopted, vec![id.clone()]);
+    let (backlog, mut live) = restarted.subscribe_logs(&id, 100);
+    assert_eq!(
+        backlog
+            .iter()
+            .filter(|l| l.line == "history-before-restart")
+            .count(),
+        1,
+        "backlog: {backlog:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if live.recv().await.unwrap().line == "live-after-restart" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("follower missed a line after reconciliation");
+    restarted.shutdown_background();
+}
 impl Drop for RealGuard {
     fn drop(&mut self) {
         for action in ["stop", "reset-failed"] {

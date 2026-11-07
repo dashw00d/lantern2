@@ -264,6 +264,7 @@ struct Inner {
     env_sources: Mutex<Option<shell_env::SourceMtimes>>,
     shutdown: CancellationToken,
     restrict_journal_to_units: bool,
+    journal_since: i64,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -387,6 +388,8 @@ impl Runtime {
             env_sources: Mutex::new(initial_sources),
             shutdown: CancellationToken::new(),
             restrict_journal_to_units,
+            // Include the preceding second to cover journal timestamp granularity.
+            journal_since: Timestamp::now().as_second().saturating_sub(1),
         });
         tokio::spawn(poll_loop(Arc::downgrade(&inner)));
         tokio::spawn(journal_loop(Arc::downgrade(&inner)));
@@ -2440,6 +2443,32 @@ impl Runtime {
             .filter(|l| &l.instance == id)
             .collect())
     }
+    async fn backfill_unit_logs(&self, id: &InstanceId, unit: &str) -> Result<(), RuntimeError> {
+        let limit = self.inner.config.settings.logs.ring_lines.min(10000);
+        if limit == 0 {
+            return Ok(());
+        }
+        let output = tokio::process::Command::new("journalctl")
+            .args(["--user", "--output=json", "--all", "--no-pager"])
+            .arg(format!("--lines={limit}"))
+            .arg(format!("_SYSTEMD_USER_SLICE={}", self.inner.config.names.slice))
+            .arg(format!("_SYSTEMD_USER_UNIT={unit}"))
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        if !output.status.success() {
+            return Err(RuntimeError::Other(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        let entries = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| journal::parse_line(line, &self.inner.config.names).ok().flatten())
+            .collect();
+        self.inner.logs.backfill(id, entries);
+        Ok(())
+    }
     /// Capture and persist the shell environment, falling back to manager environment on failure.
     pub async fn refresh_shell_env(&self) -> Result<EnvReport, RuntimeError> {
         let _guard = self.inner.env_lock.lock().await;
@@ -2672,6 +2701,9 @@ impl Runtime {
                 });
                 actor.snapshot.send_replace(Some(row.clone()));
                 report.adopted.push(id.clone());
+                if let Err(error) = self.backfill_unit_logs(id, &name).await {
+                    report.errors.push(format!("{id}: journal backfill: {error}"));
+                }
                 if ready {
                     let upstream = binding.map(|(_, addr)| addr);
                     if let Err(error) = self.publish_route(&instance, upstream).await {
@@ -3081,8 +3113,9 @@ async fn journal_loop(weak: Weak<Inner>) {
         let names = inner.config.names.clone();
         let hub = inner.logs.clone();
         let shutdown = inner.shutdown.clone();
+        let since = inner.journal_since;
         drop(inner);
-        journal_loop_slice(names, hub, shutdown).await;
+        journal_loop_slice(names, hub, shutdown, since).await;
         return;
     }
     drop(inner);
@@ -3098,6 +3131,7 @@ async fn journal_loop(weak: Weak<Inner>) {
         }
         let names = inner.config.names.clone();
         let hub = inner.logs.clone();
+        let since = inner.journal_since;
         let mut units: Vec<_> = inner
             .store
             .instances()
@@ -3125,7 +3159,8 @@ async fn journal_loop(weak: Weak<Inner>) {
         if let Some(cursor) = cursor.as_ref() {
             args.push(format!("--after-cursor={cursor}"));
         } else {
-            args.push("--lines=0".into());
+            args.push("--lines=all".into());
+            args.push(format!("--since=@{since}"));
         }
         for (index, unit) in units.iter().enumerate() {
             if index > 0 {
@@ -3150,8 +3185,8 @@ async fn journal_loop(weak: Weak<Inner>) {
                     match line {
                         Ok(Some(line)) => {
                             if let Ok(Some(entry)) = journal::parse_line(&line, &names) {
-                                cursor = entry.cursor;
-                                hub.push(entry.line);
+                                cursor.clone_from(&entry.cursor);
+                                hub.push_journal(entry);
                             }
                         }
                         _ => break,
@@ -3163,7 +3198,7 @@ async fn journal_loop(weak: Weak<Inner>) {
         tokio::select! { ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(Duration::from_millis(250))=>{} }
     }
 }
-async fn journal_loop_slice(names: UnitNames, hub: Arc<LogHub>, shutdown: CancellationToken) {
+async fn journal_loop_slice(names: UnitNames, hub: Arc<LogHub>, shutdown: CancellationToken, since: i64) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut cursor: Option<String> = None;
     loop {
@@ -3178,7 +3213,8 @@ async fn journal_loop_slice(names: UnitNames, hub: Arc<LogHub>, shutdown: Cancel
             }
         };
         if cursor.is_none() {
-            args.push("--lines=0".into());
+            args.push("--lines=all".into());
+            args.push(format!("--since=@{since}"));
         }
         let child = tokio::process::Command::new("journalctl")
             .args(args)
@@ -3194,8 +3230,8 @@ async fn journal_loop_slice(names: UnitNames, hub: Arc<LogHub>, shutdown: Cancel
                     match line {
                         Ok(Some(line)) => {
                             if let Ok(Some(entry)) = journal::parse_line(&line, &names) {
-                                cursor = entry.cursor;
-                                hub.push(entry.line);
+                                cursor.clone_from(&entry.cursor);
+                                hub.push_journal(entry);
                             }
                         }
                         _ => break,
