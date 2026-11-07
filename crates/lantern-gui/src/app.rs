@@ -5,7 +5,7 @@ use crate::platform::{UiEvent, UiReceiver, tray::TraySnapshot};
 use crate::prefs::{GuiPrefs, PrefsStore, ThemePreference};
 use futures_util::StreamExt;
 use iced::{
-    Element, Font, Length, Subscription, Task, Theme, theme,
+    Element, Font, Length, Subscription, Task, Theme, keyboard, theme,
     widget::{button, column, container, row, scrollable, space, text, text_input},
     window,
 };
@@ -125,6 +125,9 @@ struct App {
     prefs: GuiPrefs,
     prefs_store: Option<PrefsStore>,
     prefs_saving: bool,
+    quick_open: bool,
+    quick_query: String,
+    quick_index: usize,
 }
 #[derive(Debug, Clone)]
 enum Message {
@@ -153,6 +156,12 @@ enum Message {
     Ui(UiEvent),
     CycleTheme,
     PrefsSaved(Result<(), String>),
+    Key(keyboard::Key, keyboard::Modifiers),
+    OpenQuick,
+    QuickQuery(String),
+    QuickActivate(bool),
+    QuickChoose(InstanceId, bool),
+    OpenUrlDone(Result<(), String>),
 }
 impl App {
     fn boot(
@@ -188,6 +197,9 @@ impl App {
             prefs,
             prefs_store,
             prefs_saving: false,
+            quick_open: false,
+            quick_query: String::new(),
+            quick_index: 0,
         };
         let open = if args.tray { Task::none() } else { app.open() };
         (
@@ -217,6 +229,32 @@ impl App {
         } else {
             self.open()
         }
+    }
+    fn quick_results(&self) -> Vec<&lantern_core::api::InstanceView> {
+        let query = self
+            .quick_query
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        let mut matches: Vec<_> = self
+            .mirror
+            .live
+            .instances
+            .values()
+            .filter(|i| i.visible)
+            .filter_map(|instance| {
+                let haystack = format!(
+                    "{} {}",
+                    instance.id,
+                    instance.checkout.branch.as_deref().unwrap_or("")
+                )
+                .to_lowercase();
+                fuzzy_score(&haystack, &query).map(|score| (score, instance))
+            })
+            .collect();
+        matches.sort_by(|(a, left), (b, right)| a.cmp(b).then_with(|| left.id.cmp(&right.id)));
+        matches.into_iter().map(|(_, instance)| instance).collect()
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
@@ -541,6 +579,93 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Key(key, modifiers) => {
+                use keyboard::{Key, key::Named};
+                match key {
+                    Key::Character(value) if modifiers.control() && value.eq_ignore_ascii_case("k") => {
+                        self.update(Message::OpenQuick)
+                    }
+                    Key::Named(Named::Escape) if self.quick_open => {
+                        self.quick_open = false;
+                        Task::none()
+                    }
+                    Key::Named(Named::ArrowDown) if self.quick_open => {
+                        self.quick_index =
+                            (self.quick_index + 1).min(self.quick_results().len().min(10).saturating_sub(1));
+                        Task::none()
+                    }
+                    Key::Named(Named::ArrowUp) if self.quick_open => {
+                        self.quick_index = self.quick_index.saturating_sub(1);
+                        Task::none()
+                    }
+                    Key::Named(Named::Enter) if self.quick_open => {
+                        self.update(Message::QuickActivate(modifiers.control()))
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Message::OpenQuick => {
+                self.quick_open = true;
+                self.quick_query.clear();
+                self.quick_index = 0;
+                iced::widget::operation::focus("lantern-quick")
+            }
+            Message::QuickQuery(query) => {
+                self.quick_query = query;
+                self.quick_index = 0;
+                Task::none()
+            }
+            Message::QuickActivate(logs) => {
+                if let Some(id) = self
+                    .quick_results()
+                    .get(self.quick_index)
+                    .map(|instance| instance.id.clone())
+                {
+                    self.update(Message::QuickChoose(id, logs))
+                } else {
+                    Task::none()
+                }
+            }
+            Message::QuickChoose(id, logs) => {
+                self.quick_open = false;
+                if logs {
+                    return self.update(Message::OpenLogs(id));
+                }
+                let Some(instance) = self.mirror.live.instances.get(&id) else {
+                    return Task::none();
+                };
+                if !matches!(self.mirror.connection, Connection::Live) {
+                    self.toasts
+                        .push("Reconnect to the daemon before starting or opening an instance.".into());
+                    return Task::none();
+                }
+                if matches!(
+                    instance.runtime.status,
+                    InstanceStatus::Running | InstanceStatus::Unhealthy
+                ) {
+                    let url = instance.url.clone();
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || open::that(url))
+                                .await
+                                .map_err(|e| e.to_string())?
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::OpenUrlDone,
+                    )
+                } else {
+                    self.update(Message::Command(Command {
+                        id,
+                        kind: CommandKind::Start,
+                    }))
+                }
+            }
+            Message::OpenUrlDone(result) => {
+                if let Err(error) = result {
+                    self.toasts.push(format!("Could not open URL: {error}"));
+                }
+                Task::none()
+            }
             Message::Theme(mode) => {
                 self.mode = mode;
                 Task::none()
@@ -554,9 +679,37 @@ impl App {
         } else {
             theme_button.on_press(Message::CycleTheme)
         };
-        let mut body = column![row![text("Lantern").size(28).width(Length::Fill), theme_button].spacing(12)]
+        let mut body = column![
+            row![
+                text("Lantern").size(28).width(Length::Fill),
+                button("Quick switch  Ctrl+K").on_press(Message::OpenQuick),
+                theme_button
+            ]
             .spacing(12)
-            .padding(20);
+        ]
+        .spacing(12)
+        .padding(20);
+        if self.quick_open {
+            body = body.push(text(
+                "Quick switch  ·  Enter: open or start  ·  Ctrl+Enter: logs  ·  Esc: close",
+            ));
+            body = body.push(
+                text_input("Project or branch", &self.quick_query)
+                    .id("lantern-quick")
+                    .on_input(Message::QuickQuery),
+            );
+            for (index, instance) in self.quick_results().iter().take(10).enumerate() {
+                let marker = if index == self.quick_index { "›" } else { " " };
+                let label = format!(
+                    "{marker}  {}   {:?}   {}",
+                    instance.id,
+                    instance.runtime.status,
+                    instance.checkout.branch.as_deref().unwrap_or("detached")
+                );
+                body =
+                    body.push(button(text(label)).on_press(Message::QuickChoose(instance.id.clone(), false)));
+            }
+        }
         if let Connection::Down { error, retry_in } = &self.mirror.connection {
             let message = if self.mirror.ever_live {
                 format!(
@@ -904,6 +1057,12 @@ impl App {
                 stream,
             ),
             Subscription::run_with(self.ui_key.clone(), ui_stream),
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    Some(Message::Key(key, modifiers))
+                }
+                _ => None,
+            }),
         ];
         if !self.pending.is_empty() {
             subscriptions.push(iced::time::every(Duration::from_millis(500)).map(Message::Tick));
@@ -919,6 +1078,20 @@ fn settled(kind: CommandKind, status: InstanceStatus) -> bool {
             }
             CommandKind::Stop => status == InstanceStatus::Stopped,
         }
+}
+fn fuzzy_score(haystack: &str, query: &str) -> Option<usize> {
+    let mut wanted = query.chars();
+    let mut next = wanted.next();
+    let mut last = 0;
+    let mut score = 0;
+    for (index, c) in haystack.chars().enumerate() {
+        if Some(c) == next {
+            score += index.saturating_sub(last);
+            last = index + 1;
+            next = wanted.next();
+        }
+    }
+    if next.is_none() { Some(score) } else { None }
 }
 async fn daemon_action(show: bool) -> Result<String, String> {
     let args: &[&str] = if show {
@@ -1070,5 +1243,26 @@ mod tests {
         drop(app.update(messages.into_iter().next().unwrap()));
         let mut ui = iced_test::simulator(app.view(window::Id::unique()));
         assert!(ui.find("Jump to latest").is_ok());
+    }
+    #[test]
+    fn quick_switch_filters_and_starts_without_optimistic_state() {
+        let mut app = app();
+        complete(&mut app);
+        drop(app.update(Message::Key(
+            keyboard::Key::Character("k".into()),
+            keyboard::Modifiers::CTRL,
+        )));
+        drop(app.update(Message::QuickQuery("exmpl".into())));
+        let mut ui = iced_test::simulator(app.view(window::Id::unique()));
+        assert!(ui.find("›  example   Stopped   main").is_ok());
+        drop(ui);
+        drop(app.update(Message::QuickActivate(false)));
+        assert!(app.pending.contains_key(&InstanceId::parse("example").unwrap()));
+        assert_eq!(
+            app.mirror.live.instances[&InstanceId::parse("example").unwrap()]
+                .runtime
+                .status,
+            InstanceStatus::Stopped
+        );
     }
 }
