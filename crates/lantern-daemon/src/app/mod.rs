@@ -22,8 +22,8 @@ use crate::{
     operations::OperationTracker,
     registry::{RegistryHandle, state_io::Recovery},
     runtime::{
-        Runtime, RuntimeConfig,
-        seams::ScannerProbe,
+        Runtime, RuntimeAdapters, RuntimeConfig,
+        seams::{ScannerProbe, UnavailableRouter, UnavailableServices},
         systemd::{SystemctlBackend, UnitNames},
     },
 };
@@ -48,6 +48,8 @@ pub struct DaemonArgs {
     pub settings: Option<Settings>,
     /// Optional managed-unit prefixes and slice.
     pub unit_names: Option<UnitNames>,
+    /// Restrict journal reads to these named units for isolated shared-slice tests.
+    pub restrict_journal_to_units: bool,
 }
 
 /// Run the daemon until SIGINT or SIGTERM without stopping managed dev servers.
@@ -93,7 +95,8 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         env.entry("LANTERN_TLD".into()).or_insert_with(|| "glow2".into());
     }
     let dirs = Dirs::from_env(&env)?;
-    let settings = match args.settings {
+    let settings_override = args.settings.is_some();
+    let mut settings = match args.settings {
         Some(s) => s,
         None => {
             settings::load(&dirs.config.join("config.toml"), &env, &home, None)
@@ -101,6 +104,10 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
                 .settings
         }
     };
+    if args.dev && !settings_override {
+        settings.proxy.http_port = 8080;
+        settings.proxy.https_port = 8443;
+    }
     let cache = env
         .get("LANTERN_CACHE_DIR")
         .map(PathBuf::from)
@@ -117,7 +124,17 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
                 .map(|p| PathBuf::from(p).join(if args.dev { "lantern-dev" } else { "lantern" }))
         })
         .ok_or("XDG_RUNTIME_DIR or LANTERN_RUNTIME_DIR is required")?;
-    let names = args.unit_names.unwrap_or_default();
+    let names = args.unit_names.unwrap_or_else(|| {
+        if args.dev {
+            UnitNames {
+                instance_prefix: "lantern-dev-inst-".into(),
+                operation_prefix: "lantern-dev-op-".into(),
+                slice: "app-lantern-dev.slice".into(),
+            }
+        } else {
+            UnitNames::default()
+        }
+    });
     let (templates, diagnostics) =
         Templates::load_dir(&dirs.config.join("templates")).map_err(|e| e.to_string())?;
     for diagnostic in diagnostics {
@@ -141,11 +158,10 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             ..HideSettings::default()
         },
     )));
-    let adapter = Arc::new(RegistryAdapter::new(
-        registry.clone(),
-        scanner.clone(),
-        settings.clone(),
-    ));
+    let adapter = Arc::new(
+        RegistryAdapter::new(registry.clone(), scanner.clone(), settings.clone())
+            .with_profile_dir(dirs.config.join("profiles")),
+    );
     let oneshot = Arc::new(RuntimeOneShot::default());
     let git = Git::detect().await.map_err(|e| e.to_string())?;
     let worktrees = if settings.worktrees.dir.is_empty() {
@@ -169,7 +185,7 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         )
         .with_missing_retention_days(u64::from(settings.worktrees.missing_retention_days)),
     );
-    let runtime = Arc::new(Runtime::with_preparer(
+    let runtime = Arc::new(Runtime::with_scoped_journal(
         RuntimeConfig {
             settings: settings.clone(),
             run_dir: runtime_dir.join("run"),
@@ -184,7 +200,12 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         scanner.clone(),
         Arc::new(SystemctlBackend),
         tracker.clone(),
-        Arc::new(CheckoutPreparer(service.clone())),
+        RuntimeAdapters {
+            preparer: Arc::new(CheckoutPreparer(service.clone())),
+            router: Arc::new(UnavailableRouter),
+            services: Arc::new(UnavailableServices),
+        },
+        args.restrict_journal_to_units,
     ));
     oneshot.bind(&runtime).map_err(str::to_owned)?;
     // Runtime state starts as stopped; restore port hints only, then let systemd decide status.
@@ -205,18 +226,22 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
         shutdown.clone(),
     );
     let boot_id = format!("{}-{}", std::process::id(), Timestamp::now().as_nanosecond());
-    let facade = Arc::new(AppFacade::new(
-        registry.clone(),
-        runtime.clone(),
-        service.clone(),
-        git,
-        discovery.clone(),
-        tracker.clone(),
-        settings.clone(),
-        dirs.clone(),
-        home,
-        boot_id.clone(),
-    ));
+    let facade = Arc::new(
+        AppFacade::new(
+            registry.clone(),
+            runtime.clone(),
+            service.clone(),
+            git,
+            discovery.clone(),
+            tracker.clone(),
+            settings.clone(),
+            dirs.clone(),
+            home,
+            boot_id.clone(),
+        )
+        .with_environment(env.clone())
+        .with_system_paths(env.get("XDG_RUNTIME_DIR").map(PathBuf::from), cache.clone()),
+    );
     if initial_scan {
         let reg = registry.clone();
         let dirs = dirs.clone();
@@ -224,6 +249,12 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
+    }
+    if let Some(name) = registry.active_profile() {
+        use crate::api::facade::DaemonFacade;
+        if let Err(error) = facade.activate_profile(name).await {
+            tracing::warn!(message=%error.message, "active profile startup failed");
+        }
     }
     let git_shutdown = shutdown.clone();
     let git_registry = registry.clone();
@@ -241,37 +272,68 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     });
     let mut errors = registry.subscribe_write_errors();
     let error_shutdown = shutdown.clone();
+    let health_facade = facade.clone();
+    let health_bus = bus.clone();
     let error_task = tokio::spawn(async move {
+        use crate::api::facade::DaemonFacade;
         loop {
-            tokio::select! { ()=error_shutdown.cancelled()=>break, result=errors.changed()=>{ if result.is_err() { break; } if let Some(message)=errors.borrow().as_ref() { tracing::error!(%message, "state persistence failed"); } } }
+            tokio::select! {
+                () = error_shutdown.cancelled() => break,
+                result = errors.changed() => {
+                    if result.is_err() { break; }
+                    let message = errors.borrow().clone();
+                    if let Some(message) = message { tracing::error!(%message, "state persistence failed"); }
+                    if let Ok(health) = health_facade.system_health().await { health_bus.publish(lantern_core::api::Event::SystemHealth { health }); }
+                }
+            }
         }
     });
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, settings.daemon.port))
         .await
         .map_err(|e| e.to_string())?;
-    if let Some(address) = env.get("NOTIFY_SOCKET") {
-        if let Err(error) = notify_systemd(address, b"READY=1") {
-            tracing::warn!(%error, "systemd readiness notification failed");
-        }
+    if let Some(address) = env.get("NOTIFY_SOCKET")
+        && let Err(error) = notify_systemd(address, b"READY=1")
+    {
+        tracing::warn!(%error, "systemd readiness notification failed");
     }
     let api_state = ApiState::new(
         facade,
         bus,
-        tracker,
+        tracker.clone(),
         ApiConfig::new(settings.daemon.port, settings.domains.tld, boot_id),
     );
     let result = api::serve(listener, api::router(api_state), shutdown.clone())
         .await
         .map_err(|e| e.to_string());
-    if let Some(address) = env.get("NOTIFY_SOCKET") {
-        if let Err(error) = notify_systemd(address, b"STOPPING=1") {
-            tracing::warn!(%error, "systemd stopping notification failed");
-        }
+    if let Some(address) = env.get("NOTIFY_SOCKET")
+        && let Err(error) = notify_systemd(address, b"STOPPING=1")
+    {
+        tracing::warn!(%error, "systemd stopping notification failed");
     }
     shutdown.cancel();
+    runtime.shutdown_background();
     let _ = git_task.await;
     let _ = error_task.await;
     discovery.join().await;
+    loop {
+        let running: Vec<_> = tracker
+            .list()
+            .into_iter()
+            .filter(|op| {
+                matches!(
+                    op.status,
+                    lantern_core::api::OperationStatus::Queued | lantern_core::api::OperationStatus::Running
+                )
+            })
+            .map(|op| op.id)
+            .collect();
+        if running.is_empty() {
+            break;
+        }
+        for id in running {
+            let _ = tracker.wait(&id, Duration::from_secs(5)).await;
+        }
+    }
     registry.shutdown().await?;
     result
 }

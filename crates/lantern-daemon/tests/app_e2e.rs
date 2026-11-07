@@ -119,6 +119,7 @@ async fn app_real_system_cli_start_restart_logs_and_stop() {
         environment: Some(env),
         settings: Some(settings),
         unit_names: Some(names),
+        restrict_journal_to_units: true,
     };
     let host = format!("http://127.0.0.1:{port}");
     let client = Client::new(ClientConfig {

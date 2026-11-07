@@ -48,6 +48,14 @@ pub trait RuntimeStore: Send + Sync {
     fn set_activated(&self, id: &InstanceId, activated: bool) -> Result<(), StoreError>;
     /// Record the first and most recent successful start.
     fn record_started(&self, id: &InstanceId) -> Result<(), StoreError>;
+    /// Current profile environment overlay for future launches.
+    fn profile_environment(&self) -> Result<BTreeMap<String, String>, StoreError> {
+        Ok(BTreeMap::new())
+    }
+    /// Current profile-specific port range, if configured.
+    fn profile_port_range(&self) -> Result<Option<[u16; 2]>, StoreError> {
+        Ok(None)
+    }
     /// Resolve a dependency name to its primary instance, if it is a project.
     fn resolve_dependency(&self, name: &str) -> Result<Option<InstanceId>, StoreError>;
 }

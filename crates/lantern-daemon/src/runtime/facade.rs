@@ -263,6 +263,7 @@ struct Inner {
     env_lock: tokio::sync::Mutex<()>,
     env_sources: Mutex<Option<shell_env::SourceMtimes>>,
     shutdown: CancellationToken,
+    restrict_journal_to_units: bool,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -343,6 +344,18 @@ impl Runtime {
         tracker: OperationTracker,
         adapters: RuntimeAdapters,
     ) -> Self {
+        Self::with_scoped_journal(config, store, probe, backend, tracker, adapters, false)
+    }
+    /// Construct with optional exact-unit journal filtering for isolated shared-slice tests.
+    pub fn with_scoped_journal(
+        config: RuntimeConfig,
+        store: Arc<dyn RuntimeStore>,
+        probe: Arc<dyn PortProbe>,
+        backend: Arc<dyn UserSystemd>,
+        tracker: OperationTracker,
+        adapters: RuntimeAdapters,
+        restrict_journal_to_units: bool,
+    ) -> Self {
         let RuntimeAdapters {
             preparer,
             router,
@@ -373,13 +386,10 @@ impl Runtime {
             env_lock: tokio::sync::Mutex::new(()),
             env_sources: Mutex::new(initial_sources),
             shutdown: CancellationToken::new(),
+            restrict_journal_to_units,
         });
         tokio::spawn(poll_loop(Arc::downgrade(&inner)));
-        tokio::spawn(journal_loop(
-            inner.config.names.clone(),
-            inner.logs.clone(),
-            inner.shutdown.clone(),
-        ));
+        tokio::spawn(journal_loop(Arc::downgrade(&inner)));
         Self { inner }
     }
     fn actor(&self, instance: &Instance) -> Arc<Actor> {
@@ -390,6 +400,14 @@ impl Runtime {
             .entry(instance.id.clone())
             .or_insert_with(|| Arc::new(Actor::new(&instance.runtime)))
             .clone()
+    }
+    /// Stop runtime background observers without stopping managed dev servers.
+    pub fn shutdown_background(&self) {
+        self.inner.shutdown.cancel();
+    }
+    /// Expected managed unit name for an instance under this runtime's naming policy.
+    pub fn unit_name(&self, id: &InstanceId) -> String {
+        self.inner.config.names.instance(id)
     }
     /// Return the current registry-owned runtime state.
     pub fn state(&self, id: &InstanceId) -> Option<RuntimeState> {
@@ -1310,10 +1328,16 @@ impl Runtime {
             let mut leases = PortLeases::from_table(expected.clone());
             let probe = self.inner.probe.clone();
             let id = id.clone();
-            let range = PortRange {
-                start: self.inner.config.settings.ports.range_start,
-                end: self.inner.config.settings.ports.range_end,
-            };
+            let [start, end] = self
+                .inner
+                .store
+                .profile_port_range()
+                .map_err(store_fault)?
+                .unwrap_or([
+                    self.inner.config.settings.ports.range_start,
+                    self.inner.config.settings.ports.range_end,
+                ]);
+            let range = PortRange { start, end };
             let reserved = vec![
                 self.inner.config.settings.daemon.port,
                 self.inner.config.settings.proxy.http_port,
@@ -1468,6 +1492,14 @@ impl Runtime {
                         .map(|(k, v)| (k.clone(), v.render_data(&context))),
                 );
             }
+        }
+        for (key, value) in self.inner.store.profile_environment().map_err(store_fault)? {
+            run_env.insert(
+                key,
+                lantern_core::template::TemplateString::parse(&value)
+                    .0
+                    .render_data(&context),
+            );
         }
         let env_file = match &instance.manifest.deploy.env_file {
             Some(path) => read_dotenv(&instance.checkout.path, path)?,
@@ -1840,77 +1872,13 @@ impl Runtime {
                     break;
                 };
                 let started = Instant::now();
-                let result: Result<Option<u16>, String> =
-                    if let Some(endpoint) = &inst.manifest.health_endpoint {
-                        let base = inst
-                            .manifest
-                            .upstream_url
-                            .clone()
-                            .or_else(|| inst.runtime.upstream.map(|addr| format!("http://{addr}")));
-                        match base.and_then(|b| health_url(&b, endpoint)) {
-                            Some(url) => match client.get(url).send().await {
-                                Ok(resp) if resp.status().as_u16() < 400 => Ok(Some(resp.status().as_u16())),
-                                Ok(resp) => Err(format!("HTTP {}", resp.status())),
-                                Err(e) => Err(e.to_string()),
-                            },
-                            None => Err("health URL unavailable".into()),
-                        }
-                    } else if let (Some(port), Some(unit)) = (inst.runtime.port, inst.runtime.unit.clone()) {
-                        match rt.probe(port, Some(unit)).await {
-                            Ok(PortBinding::BoundByUnit { .. }) => Ok(None),
-                            Ok(_) => Err("unit is not listening".into()),
-                            Err(e) => Err(e.message),
-                        }
-                    } else if let Some(url) = &inst.manifest.upstream_url {
-                        match reqwest::Url::parse(url) {
-                            Ok(url) => match (url.host_str(), url.port_or_known_default()) {
-                                (Some(host), Some(port)) => match tokio::time::timeout(
-                                    Duration::from_secs(health.timeout_secs),
-                                    tokio::net::TcpStream::connect((host, port)),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(_)) => Ok(None),
-                                    Ok(Err(e)) => Err(e.to_string()),
-                                    Err(_) => Err("upstream timed out".into()),
-                                },
-                                _ => Err("upstream has no host or port".into()),
-                            },
-                            Err(e) => Err(e.to_string()),
-                        }
-                    } else if inst.manifest.deploy.start.is_some() && inst.manifest.deploy.status.is_some() {
-                        match rt.deploy_status(&id).await {
-                            Ok(status) if status.alive => Ok(None),
-                            Ok(status) => Err(format!("deploy.status exited {:?}", status.exit_code)),
-                            Err(e) => Err(e.to_string()),
-                        }
-                    } else if inst.manifest.deploy.start.is_some() {
-                        match inst.runtime.port {
-                            Some(port) => match rt.probe(port, None).await {
-                                Ok(PortBinding::Free) => Err("deploy listener is absent".into()),
-                                Ok(_) => Ok(None),
-                                Err(e) => Err(e.message),
-                            },
-                            None => Err("deploy listener has no port".into()),
-                        }
-                    } else if inst.manifest.serve == ServeMode::Php {
-                        rt.inner.router.php_ready().await.map(|()| None)
-                    } else if inst.manifest.serve == ServeMode::Static {
-                        if inst
-                            .checkout
-                            .path
-                            .join(inst.manifest.root.as_deref().unwrap_or("."))
-                            .is_dir()
-                        {
-                            Ok(None)
-                        } else {
-                            Err("static site root is missing".into())
-                        }
-                    } else {
-                        Ok(None)
-                    };
+                let result = rt.health_probe(&inst, &client).await;
                 let ok = result.is_ok();
-                failures = if ok { 0 } else { failures.saturating_add(1) };
+                failures = if ok {
+                    0
+                } else {
+                    inst.runtime.health.consecutive_failures.saturating_add(1)
+                };
                 let latency = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 let status = result.as_ref().ok().copied().flatten();
                 let error = result.err();
@@ -1949,6 +1917,155 @@ impl Runtime {
                 }
             }
         });
+    }
+    async fn health_probe(&self, inst: &Instance, client: &reqwest::Client) -> Result<Option<u16>, String> {
+        let health = &self.inner.config.settings.health;
+        if let Some(endpoint) = &inst.manifest.health_endpoint {
+            let base = inst
+                .manifest
+                .upstream_url
+                .clone()
+                .or_else(|| inst.runtime.upstream.map(|addr| format!("http://{addr}")));
+            match base.and_then(|b| health_url(&b, endpoint)) {
+                Some(url) => match client.get(url).send().await {
+                    Ok(resp) if resp.status().as_u16() < 400 => Ok(Some(resp.status().as_u16())),
+                    Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                    Err(e) => Err(e.to_string()),
+                },
+                None => Err("health URL unavailable".into()),
+            }
+        } else if let (Some(port), Some(unit)) = (inst.runtime.port, inst.runtime.unit.clone()) {
+            match self.probe(port, Some(unit)).await {
+                Ok(PortBinding::BoundByUnit { .. }) => Ok(None),
+                Ok(_) => Err("unit is not listening".into()),
+                Err(e) => Err(e.message),
+            }
+        } else if let Some(url) = &inst.manifest.upstream_url {
+            match reqwest::Url::parse(url) {
+                Ok(url) => match (url.host_str(), url.port_or_known_default()) {
+                    (Some(host), Some(port)) => match tokio::time::timeout(
+                        Duration::from_secs(health.timeout_secs),
+                        tokio::net::TcpStream::connect((host, port)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => Ok(None),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(_) => Err("upstream timed out".into()),
+                    },
+                    _ => Err("upstream has no host or port".into()),
+                },
+                Err(e) => Err(e.to_string()),
+            }
+        } else if inst.manifest.deploy.start.is_some() && inst.manifest.deploy.status.is_some() {
+            match self.deploy_status(&inst.id).await {
+                Ok(status) if status.alive => Ok(None),
+                Ok(status) => Err(format!("deploy.status exited {:?}", status.exit_code)),
+                Err(e) => Err(e.to_string()),
+            }
+        } else if inst.manifest.deploy.start.is_some() {
+            match inst.runtime.port {
+                Some(port) => match self.probe(port, None).await {
+                    Ok(PortBinding::Free) => Err("deploy listener is absent".into()),
+                    Ok(_) => Ok(None),
+                    Err(e) => Err(e.message),
+                },
+                None => Err("deploy listener has no port".into()),
+            }
+        } else if inst.manifest.serve == ServeMode::Php {
+            self.inner.router.php_ready().await.map(|()| None)
+        } else if inst.manifest.serve == ServeMode::Static {
+            if inst
+                .checkout
+                .path
+                .join(inst.manifest.root.as_deref().unwrap_or("."))
+                .is_dir()
+            {
+                Ok(None)
+            } else {
+                Err("static site root is missing".into())
+            }
+        } else {
+            Ok(None)
+        }
+    }
+    /// Run an immediate health probe for a running instance and publish its sample.
+    pub async fn check_health_now(
+        &self,
+        id: &InstanceId,
+    ) -> Result<lantern_core::model::HealthSummary, RuntimeError> {
+        let inst = self
+            .inner
+            .store
+            .instance(id)
+            .map_err(|e| RuntimeError::Other(e.to_string()))?
+            .ok_or_else(|| RuntimeError::NotFound(id.clone()))?;
+        if !matches!(
+            inst.runtime.status,
+            InstanceStatus::Running | InstanceStatus::Unhealthy
+        ) {
+            return Err(RuntimeError::Other("instance is not running".into()));
+        }
+        let actor = self.actor(&inst);
+        let generation = actor.state.lock().unwrap().generation;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(
+                self.inner.config.settings.health.timeout_secs,
+            ))
+            .build()
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        let started = Instant::now();
+        let result = self.health_probe(&inst, &client).await;
+        let latency = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        let ok = result.is_ok();
+        let status = result.as_ref().ok().copied().flatten();
+        let error = result.err();
+        let failures = if ok {
+            0
+        } else {
+            inst.runtime.health.consecutive_failures.saturating_add(1)
+        };
+        let beyond_grace = inst.runtime.started_at.is_some_and(|at| {
+            Timestamp::now().as_second().saturating_sub(at.as_second())
+                >= self.inner.config.settings.health.grace_secs as i64
+        });
+        let state = if ok {
+            HealthState::Healthy
+        } else if failures >= self.inner.config.settings.health.fail_threshold && beyond_grace {
+            HealthState::Failing
+        } else {
+            HealthState::Unknown
+        };
+        if !self.update(id, &actor, generation, move |r| {
+            let h = &mut r.health;
+            h.state = state;
+            h.checked_at = Some(Timestamp::now());
+            h.latency_ms = Some(latency);
+            h.consecutive_failures = failures;
+            h.last_error = error.clone();
+            h.recent.insert(
+                0,
+                HealthSample {
+                    at: Timestamp::now(),
+                    ok,
+                    status,
+                    latency_ms: Some(latency),
+                    error,
+                },
+            );
+            h.recent.truncate(10);
+        }) {
+            return Err(RuntimeError::Other("instance changed during health check".into()));
+        }
+        if state == HealthState::Failing {
+            self.event(id, &actor, generation, Event::HealthFailed);
+        } else if ok {
+            self.event(id, &actor, generation, Event::HealthRecovered);
+        }
+        self.state(id)
+            .map(|s| s.health)
+            .ok_or_else(|| RuntimeError::NotFound(id.clone()))
     }
     /// Build a launcher-backed setup or deploy one-shot from shell-rendered code and data.
     pub async fn prepare_oneshot(
@@ -1989,7 +2106,17 @@ impl Runtime {
             .launch(&instance, port, request.shell_command, true, &worktree_env, false)
             .map_err(|e| RuntimeError::Other(e.message))?;
         launch.cwd = cwd.clone();
-        launch.run_env.extend(request.env);
+        let profile = self
+            .inner
+            .store
+            .profile_environment()
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
+        launch.run_env.extend(
+            request
+                .env
+                .into_iter()
+                .filter(|(key, _)| !profile.contains_key(key)),
+        );
         let text = launcher::try_render(&launch).map_err(|e| RuntimeError::Other(e.to_string()))?;
         let name = self.inner.config.names.operation(
             id,
@@ -2263,16 +2390,32 @@ impl Runtime {
     /// Read recent journal history for an instance from the configured slice.
     pub async fn log_history(&self, id: &InstanceId, q: HistoryQuery) -> Result<Vec<LogLine>, RuntimeError> {
         let count = q.limit.min(10000).to_string();
+        let mut args = vec![
+            "--user".to_owned(),
+            "--output=json".into(),
+            "--all".into(),
+            "--no-pager".into(),
+            "--lines".into(),
+            count,
+        ];
+        if self.inner.restrict_journal_to_units {
+            let mut units = vec![self.inner.config.names.instance(id)];
+            let prefix = format!("{}{}-", self.inner.config.names.operation_prefix, id.safe_name());
+            if let Ok(operations) = self.inner.backend.list_prefix(&prefix).await {
+                units.extend(operations);
+            }
+            for (index, unit) in units.iter().enumerate() {
+                if index > 0 {
+                    args.push("+".into());
+                }
+                args.push(format!("_SYSTEMD_USER_SLICE={}", self.inner.config.names.slice));
+                args.push(format!("_SYSTEMD_USER_UNIT={unit}"));
+            }
+        } else {
+            args.push(format!("_SYSTEMD_USER_SLICE={}", self.inner.config.names.slice));
+        }
         let output = tokio::process::Command::new("journalctl")
-            .args([
-                "--user",
-                "--output=json",
-                "--all",
-                "--no-pager",
-                "--lines",
-                &count,
-                &format!("_SYSTEMD_USER_SLICE={}", self.inner.config.names.slice),
-            ])
+            .args(args)
             .kill_on_drop(true)
             .output()
             .await
@@ -2922,7 +3065,97 @@ async fn poll_loop(weak: Weak<Inner>) {
         tokio::select! { ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(delay)=>{} }
     }
 }
-async fn journal_loop(names: UnitNames, hub: Arc<LogHub>, shutdown: CancellationToken) {
+async fn journal_loop(weak: Weak<Inner>) {
+    let Some(inner) = weak.upgrade() else {
+        return;
+    };
+    if !inner.restrict_journal_to_units {
+        let names = inner.config.names.clone();
+        let hub = inner.logs.clone();
+        let shutdown = inner.shutdown.clone();
+        drop(inner);
+        journal_loop_slice(names, hub, shutdown).await;
+        return;
+    }
+    drop(inner);
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut cursor: Option<String> = None;
+    loop {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let shutdown = inner.shutdown.clone();
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let names = inner.config.names.clone();
+        let hub = inner.logs.clone();
+        let mut units: Vec<_> = inner
+            .store
+            .instances()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|instance| names.instance(&instance.id))
+            .collect();
+        if let Ok(operation_units) = inner.backend.list_prefix(&names.operation_prefix).await {
+            units.extend(operation_units);
+        }
+        units.sort();
+        units.dedup();
+        drop(inner);
+        if units.is_empty() {
+            tokio::select! { ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(Duration::from_secs(1))=>{} }
+            continue;
+        }
+        let mut args = vec![
+            "--user".to_owned(),
+            "--follow".into(),
+            "--output=json".into(),
+            "--all".into(),
+            "--no-pager".into(),
+        ];
+        if let Some(cursor) = cursor.as_ref() {
+            args.push(format!("--after-cursor={cursor}"));
+        } else {
+            args.push("--lines=0".into());
+        }
+        for (index, unit) in units.iter().enumerate() {
+            if index > 0 {
+                args.push("+".into());
+            }
+            args.push(format!("_SYSTEMD_USER_SLICE={}", names.slice));
+            args.push(format!("_SYSTEMD_USER_UNIT={unit}"));
+        }
+        let child = tokio::process::Command::new("journalctl")
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn();
+        if let Ok(mut child) = child {
+            if let Some(stdout) = child.stdout.take() {
+                let mut lines = BufReader::new(stdout).lines();
+                let deadline = tokio::time::sleep(Duration::from_secs(2));
+                tokio::pin!(deadline);
+                loop {
+                    let line = tokio::select! { ()=shutdown.cancelled()=>return, ()=&mut deadline=>break, v=lines.next_line()=>v };
+                    match line {
+                        Ok(Some(line)) => {
+                            if let Ok(Some(entry)) = journal::parse_line(&line, &names) {
+                                cursor = entry.cursor;
+                                hub.push(entry.line);
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            let _ = child.kill().await;
+        }
+        tokio::select! { ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(Duration::from_millis(250))=>{} }
+    }
+}
+async fn journal_loop_slice(names: UnitNames, hub: Arc<LogHub>, shutdown: CancellationToken) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut cursor: Option<String> = None;
     loop {
@@ -2949,7 +3182,7 @@ async fn journal_loop(names: UnitNames, hub: Arc<LogHub>, shutdown: Cancellation
             if let Some(stdout) = child.stdout.take() {
                 let mut lines = BufReader::new(stdout).lines();
                 loop {
-                    let line = tokio::select! {()=shutdown.cancelled()=>return, v=lines.next_line()=>v};
+                    let line = tokio::select! { ()=shutdown.cancelled()=>return, v=lines.next_line()=>v };
                     match line {
                         Ok(Some(line)) => {
                             if let Ok(Some(entry)) = journal::parse_line(&line, &names) {
@@ -2963,7 +3196,7 @@ async fn journal_loop(names: UnitNames, hub: Arc<LogHub>, shutdown: Cancellation
             }
             let _ = child.kill().await;
         }
-        tokio::select! {()=shutdown.cancelled()=>return,()=tokio::time::sleep(Duration::from_secs(1))=>{}}
+        tokio::select! { ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(Duration::from_secs(1))=>{} }
     }
 }
 

@@ -36,6 +36,7 @@ pub struct RegistryAdapter {
     registry: RegistryHandle,
     probe: Arc<dyn PortProbe>,
     settings: Settings,
+    profiles_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for RegistryAdapter {
@@ -50,11 +51,44 @@ impl RegistryAdapter {
             registry,
             probe,
             settings,
+            profiles_dir: None,
         }
     }
 
+    /// Use an explicit profile directory to supply active launch overlays.
+    pub fn with_profile_dir(mut self, path: std::path::PathBuf) -> Self {
+        self.profiles_dir = Some(path);
+        self
+    }
+    fn active_profile(&self) -> Result<Option<lantern_core::profiles::Profile>, String> {
+        let Some(name) = self.registry.active_profile() else {
+            return Ok(None);
+        };
+        let profiles = if let Some(path) = &self.profiles_dir {
+            lantern_core::profiles::Profiles::load_dir(path)
+                .map_err(|e| e.to_string())?
+                .0
+        } else {
+            lantern_core::profiles::Profiles::default()
+        };
+        let profile = profiles
+            .get(&name)
+            .ok_or_else(|| format!("active profile {name} was not found or is invalid"))?;
+        if profile
+            .env
+            .keys()
+            .any(|key| key == "PORT" || key == "HOST" || key.starts_with("LANTERN_"))
+        {
+            return Err("profile environment overrides a reserved Lantern variable".into());
+        }
+        Ok(Some(profile))
+    }
     fn ensure_port(&self, id: &InstanceId) -> Result<u16, String> {
         let settings = &self.settings;
+        let range = self
+            .active_profile()?
+            .and_then(|p| p.port_range)
+            .unwrap_or([settings.ports.range_start, settings.ports.range_end]);
         self.registry.update_port_leases(|leases| {
             if let Some(port) = leases.table().get(id) {
                 return Ok(*port);
@@ -70,8 +104,8 @@ impl RegistryAdapter {
                 .try_allocate(
                     id,
                     PortRange {
-                        start: settings.ports.range_start,
-                        end: settings.ports.range_end,
+                        start: range[0],
+                        end: range[1],
                     },
                     &reserved,
                     |port| match self.probe.port_binding(port, None)? {
@@ -173,6 +207,16 @@ impl RuntimeStore for RegistryAdapter {
         self.registry
             .record_started(id, Timestamp::now())
             .map_err(|e| StoreError(e.to_string()))
+    }
+    fn profile_environment(&self) -> Result<BTreeMap<String, String>, StoreError> {
+        self.active_profile()
+            .map(|p| p.map_or_else(BTreeMap::new, |p| p.env))
+            .map_err(StoreError)
+    }
+    fn profile_port_range(&self) -> Result<Option<[u16; 2]>, StoreError> {
+        self.active_profile()
+            .map(|p| p.and_then(|p| p.port_range))
+            .map_err(StoreError)
     }
     fn resolve_dependency(&self, name: &str) -> Result<Option<InstanceId>, StoreError> {
         Ok(self

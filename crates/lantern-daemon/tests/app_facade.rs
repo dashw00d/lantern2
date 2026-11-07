@@ -1,5 +1,5 @@
 use lantern_core::{
-    api::{OperationStatus, RegisterProjectRequest},
+    api::{OperationStatus, PatchProjectRequest, PrepareRequest, RegisterProjectRequest, ReloadRequest},
     detect::Templates,
     dirs::Dirs,
     ids::InstanceId,
@@ -96,11 +96,10 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
     let (registry, _) =
         RegistryHandle::open(&dirs, settings.clone(), Templates::default(), temp.0.clone(), bus).unwrap();
     let probe: Arc<dyn PortProbe> = Arc::new(Ready);
-    let adapter = Arc::new(RegistryAdapter::new(
-        registry.clone(),
-        probe.clone(),
-        settings.clone(),
-    ));
+    let adapter = Arc::new(
+        RegistryAdapter::new(registry.clone(), probe.clone(), settings.clone())
+            .with_profile_dir(dirs.config.join("profiles")),
+    );
     let oneshot = Arc::new(RuntimeOneShot::default());
     let git = Git::detect().await.unwrap();
     let service = Arc::new(InstanceService::new(
@@ -175,20 +174,141 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
         .await
         .unwrap();
     let id: InstanceId = project.primary;
+    let (profile, created) = app
+        .put_profile(
+            "testing".into(),
+            serde_json::json!({"env":{"APP_STAGE":"from-${PROJECT}-${PORT}"}, "port_range":[39660,39679]}),
+        )
+        .await
+        .unwrap();
+    assert!(created);
+    assert_eq!(profile["name"], "testing");
+    assert!(app.activate_profile("testing".into()).await.unwrap().is_empty());
     let on = app.start(id.clone()).await.unwrap();
     let outcome = tracker.wait(&on.id, Duration::from_secs(8)).await.unwrap();
     assert_eq!(outcome.status, OperationStatus::Succeeded, "{:?}", outcome.error);
     let view = app.instance(id.clone()).await.unwrap();
     assert_eq!(view.runtime.status, InstanceStatus::Running);
-    assert!((39660..=39669).contains(&view.runtime.port.unwrap()));
+    assert!((39660..=39679).contains(&view.runtime.port.unwrap()));
+    let script = fs::read_to_string(temp.0.join(format!(
+        "run/lantern-test-assembly-inst-{}.service.sh",
+        id.safe_name()
+    )))
+    .unwrap();
+    assert!(
+        script.contains("APP_STAGE")
+            && script.contains(&format!("from-sample-{}", view.runtime.port.unwrap()))
+    );
     assert_eq!(app.instances(InstanceFilter::default()).await.unwrap().len(), 1);
+    assert_eq!(
+        app.check_health(id.clone()).await.unwrap().state,
+        lantern_core::model::HealthState::Healthy
+    );
     let off = app.stop(id.clone()).await.unwrap();
     let outcome = tracker.wait(&off.id, Duration::from_secs(8)).await.unwrap();
     assert_eq!(outcome.status, OperationStatus::Succeeded, "{:?}", outcome.error);
     assert_eq!(
-        app.instance(id).await.unwrap().runtime.status,
+        app.instance(id.clone()).await.unwrap().runtime.status,
         InstanceStatus::Stopped
     );
+    fs::write(
+        temp.0.join("project/lantern.yaml"),
+        "id: sample\ntype: proxy\nrun: {cmd: 'python3 -m http.server ${PORT}'}\nsetup: ['sleep 30']\n",
+    )
+    .unwrap();
+    app.reload_project(
+        project_id(&id),
+        ReloadRequest {
+            discard_overrides: false,
+        },
+    )
+    .await
+    .unwrap();
+    let prepare = app
+        .prepare(id.clone(), PrepareRequest { force: true })
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if fake.calls().iter().any(|c| c.contains("-setup-")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        fake.calls().iter().any(|c| c.contains("-setup-")),
+        "setup did not start: {:?}",
+        fake.calls()
+    );
+    let joined = app
+        .prepare(id.clone(), PrepareRequest { force: true })
+        .await
+        .unwrap();
+    assert_eq!(prepare.id, joined.id);
+    assert_eq!(
+        app.start(id.clone()).await.unwrap_err().code,
+        "operation_in_progress"
+    );
+    let stop = app.stop(id.clone()).await.unwrap();
+    let first = tracker.wait(&prepare.id, Duration::from_secs(8)).await.unwrap();
+    let second = tracker.wait(&stop.id, Duration::from_secs(8)).await.unwrap();
+    assert_eq!(first.status, OperationStatus::Cancelled);
+    assert_eq!(second.status, OperationStatus::Succeeded, "{:?}", second.error);
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|c| c.starts_with("stop ") && c.contains("-setup-"))
+    );
+    let renamed = lantern_core::ids::ProjectId::parse("renamed").unwrap();
+    let renamed_detail = app
+        .patch_project(
+            project_id(&id),
+            PatchProjectRequest {
+                id: Some(renamed.clone()),
+                name: None,
+                enabled: None,
+                tags: None,
+                overrides: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed_detail.summary.project.id, renamed);
+    assert!(
+        renamed_detail
+            .summary
+            .project
+            .aliases
+            .contains(&"sample".to_owned())
+    );
+    assert_eq!(registry.lookup_project("sample"), Some(renamed.clone()));
+    assert!(
+        registry
+            .state_snapshot()
+            .port_leases
+            .contains_key(&InstanceId::primary(&renamed))
+    );
+    fs::create_dir_all(&app.dirs.config).unwrap();
+    fs::write(
+        app.dirs.config.join("config.toml"),
+        "# preserve this comment\n[runtime]\nstartup_timeout_secs = 60\n",
+    )
+    .unwrap();
+    let patched = app
+        .patch_settings(serde_json::json!({"runtime":{"startup_timeout_secs":25}}))
+        .await
+        .unwrap();
+    assert_eq!(patched.settings["runtime"]["startup_timeout_secs"], 25);
+    assert_eq!(patched.restart_required, vec!["runtime.startup_timeout_secs"]);
+    assert!(
+        fs::read_to_string(app.dirs.config.join("config.toml"))
+            .unwrap()
+            .contains("# preserve this comment")
+    );
+    assert!(app.reload_settings().await.is_err());
     shutdown.cancel();
     registry.flush().await.unwrap();
+}
+
+fn project_id(id: &InstanceId) -> lantern_core::ids::ProjectId {
+    id.project()
 }
