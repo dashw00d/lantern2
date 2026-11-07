@@ -396,7 +396,20 @@ async fn execute(ctx: &mut Context<'_>, system: &dyn SystemActions) -> Result<Op
             let value = auxiliary_request(ctx, method, &path, None).await?;
             Ok(Some(Reply::pretty(&value)?))
         }
-        Command::Init { yes } => run_system(system, SystemCommand::Init { yes: *yes }).map(Some),
+        Command::Init {
+            yes,
+            system_steps,
+            uid,
+        } => {
+            let command = if *system_steps {
+                SystemCommand::InitSystem {
+                    uid: uid.expect("clap requires uid"),
+                }
+            } else {
+                SystemCommand::Init { yes: *yes }
+            };
+            run_system(system, command).map(Some)
+        }
         Command::Doctor { fix } => run_system(system, SystemCommand::Doctor { fix: *fix }).map(Some),
         Command::Uninstall { purge_data, yes } => run_system(
             system,
@@ -625,9 +638,23 @@ fn run_system(system: &dyn SystemActions, command: SystemCommand) -> Result<Repl
                 .iter()
                 .any(|check| check.get("status").and_then(Value::as_str) == Some("fail"))
         });
+    let setup_failed = matches!(
+        command,
+        SystemCommand::Init { .. } | SystemCommand::InitSystem { .. }
+    ) && ["user_steps", "system_steps"]
+        .iter()
+        .filter_map(|key| value.get(*key).and_then(Value::as_array))
+        .flatten()
+        .any(|step| {
+            step.get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| state.starts_with("Failed"))
+        });
     let mut result = Reply::pretty(&value)?;
     if failed {
         result.code = 8;
+    } else if setup_failed {
+        result.code = 1;
     }
     Ok(result)
 }

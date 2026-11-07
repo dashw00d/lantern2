@@ -17,6 +17,27 @@ use std::path::PathBuf;
 pub struct System;
 impl SystemActions for System {
     fn execute(&self, command: &SystemCommand) -> Result<Value, String> {
+        if let SystemCommand::InitSystem { uid } = command {
+            let user = init::ResolvedUser::from_uid(*uid)?;
+            let runner = ProcessRunner {
+                fake_root: user.paths.fake_root.is_some(),
+            };
+            let context = SystemInitCtx {
+                paths: &user.paths,
+                settings: &user.settings,
+                runner: &runner,
+                uid: *uid,
+                port_strategy: PortStrategy::Sysctl,
+                from_package: false,
+                migrate_v1: false,
+                allow_fake_cleanup: false,
+                system_trust_step: None,
+            };
+            let outcomes = init::run_system_steps(&context);
+            return Ok(
+                json!({"system_steps":outcomes.iter().map(|o| json!({"id":o.id,"state":format!("{:?}",o.state),"detail":o.detail})).collect::<Vec<_>>() }),
+            );
+        }
         let env = ProcessEnv;
         let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is required")?);
         let dirs = Dirs::from_env(&env)?;
@@ -101,8 +122,10 @@ impl SystemActions for System {
                     .iter()
                     .map(|s| json!({"id":s.id, "state":format!("{:?}",s.state), "needs_root":s.needs_root}))
                     .collect();
-                Ok(json!({"user_steps":outcomes,"system_steps":root,"pkexec_required":plan.pkexec.is_some()}))
+                let pkexec = plan.pkexec.map(|command| json!({"program":command.program, "args":command.args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>() }));
+                Ok(json!({"user_steps":outcomes,"system_steps":root,"pkexec":pkexec}))
             }
+            SystemCommand::InitSystem { .. } => unreachable!("handled before loading caller environment"),
             SystemCommand::Uninstall { .. } => Err("uninstall is not implemented by lantern-system".into()),
         }
     }

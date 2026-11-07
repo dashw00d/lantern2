@@ -107,6 +107,12 @@ pub enum Command {
     Init {
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Run the root-owned steps for the specified target user.
+        #[arg(long, requires = "uid")]
+        system_steps: bool,
+        /// Numeric target user for privileged setup.
+        #[arg(long, requires = "system_steps")]
+        uid: Option<u32>,
     },
     /// Remove system integration.
     Uninstall {

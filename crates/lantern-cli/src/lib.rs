@@ -32,6 +32,8 @@ pub enum CliAction {
 pub enum SystemCommand {
     /// Initialize the machine.
     Init { yes: bool },
+    /// Run privileged setup for a validated target uid.
+    InitSystem { uid: u32 },
     /// Run diagnostics.
     Doctor { fix: bool },
     /// Remove system integration.

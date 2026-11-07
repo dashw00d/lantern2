@@ -767,3 +767,25 @@ async fn multiple_target_progress_subscribes_concurrently() {
     assert_eq!(out, "op-a\nop-b\n");
     assert_eq!(subscriptions.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn system_step_dispatch_propagates_failure_without_elevation() {
+    struct FakeSystem;
+    impl lantern_cli::SystemActions for FakeSystem {
+        fn execute(&self, command: &lantern_cli::SystemCommand) -> Result<Value, String> {
+            assert!(matches!(
+                command,
+                lantern_cli::SystemCommand::InitSystem { uid: 1234 }
+            ));
+            Ok(json!({"system_steps":[{"id":"dns", "state":"Failed", "detail":"fixture"}]}))
+        }
+    }
+    let cli = Cli::try_parse_from(["lantern", "init", "--system-steps", "--uid", "1234"]).unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    assert!(matches!(
+        dispatch(cli, &FakeSystem, &mut out, &mut err, false).await,
+        CliAction::Exit(1)
+    ));
+    assert!(String::from_utf8(out).unwrap().contains("fixture"));
+}
