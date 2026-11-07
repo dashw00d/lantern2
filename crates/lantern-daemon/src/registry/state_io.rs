@@ -77,6 +77,7 @@ impl StateIo {
     /// Lock the state directory, load or recover its state, and spawn the writer on the current runtime.
     pub fn open(dirs: &Dirs) -> Result<(Self, StateFile, Recovery), Error> {
         fs::create_dir_all(&dirs.state)?;
+        fs::set_permissions(&dirs.state, fs::Permissions::from_mode(0o700))?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
