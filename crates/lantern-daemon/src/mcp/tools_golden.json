@@ -224,7 +224,7 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Which ports are in use: Lantern's assignment per instance (with status, health, URL), processes Lantern did not start that listen on localhost (pid, command, working directory, the project they appear to belong to), and port conflicts. Never guess a port; use this.",
+    "description": "Show assigned ports by instance id, with status, health and URL. Matched hand-started listeners may add source, pid and branch. Use list_listeners for unmatched sockets; never guess a port.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -528,6 +528,7 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "port": {
+          "default": null,
           "description": "Restrict to a port.",
           "format": "uint16",
           "maximum": 65535,

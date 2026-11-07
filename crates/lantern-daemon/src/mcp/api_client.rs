@@ -4,6 +4,7 @@ use super::{
     LanternMcp,
     upstream::{ToolApiClient, ToolApiResponse, UpstreamPolicy},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use lantern_core::{
     api::{EndpointEntry, Risk},
     ids::InstanceId,
@@ -18,12 +19,57 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
+#[derive(Debug)]
+struct GateCount {
+    active: usize,
+    limit: usize,
+}
+#[derive(Debug)]
+struct InstanceGate {
+    count: std::sync::Mutex<GateCount>,
+    changed: Notify,
+}
+impl InstanceGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            count: std::sync::Mutex::new(GateCount { active: 0, limit }),
+            changed: Notify::new(),
+        }
+    }
+    async fn acquire(self: Arc<Self>, limit: usize) -> InstancePermit {
+        {
+            let mut count = self.count.lock().expect("instance gate");
+            // A lower observed limit applies to queued and new calls; raising it waits for restart.
+            count.limit = count.limit.min(limit);
+        }
+        loop {
+            let notified = self.changed.notified();
+            {
+                let mut count = self.count.lock().expect("instance gate");
+                if count.active < count.limit {
+                    count.active += 1;
+                    return InstancePermit(self.clone());
+                }
+            }
+            notified.await;
+        }
+    }
+}
+struct InstancePermit(Arc<InstanceGate>);
+impl Drop for InstancePermit {
+    fn drop(&mut self) {
+        let mut count = self.0.count.lock().expect("instance gate");
+        count.active -= 1;
+        drop(count);
+        self.0.changed.notify_one();
+    }
+}
 #[derive(Debug, Clone)]
 enum JobState {
     Running,
-    Finished(Result<String, String>),
+    Finished(Result<Value, String>),
 }
 #[derive(Debug, Clone)]
 struct Job {
@@ -39,7 +85,7 @@ pub(super) struct ApiState {
     pub trust_risk_metadata: bool,
     pub allow_critical_calls: bool,
     global: Arc<Semaphore>,
-    limits: Arc<Mutex<HashMap<InstanceId, Arc<Semaphore>>>>,
+    limits: Arc<Mutex<HashMap<InstanceId, Arc<InstanceGate>>>>,
     jobs: Arc<Mutex<HashMap<String, Job>>>,
     sequence: Arc<AtomicU64>,
 }
@@ -118,17 +164,42 @@ fn effective_risk(method: &str, path: &str, endpoints: &[EndpointEntry], project
         .unwrap_or(inferred);
     endpoint.max(declared_risk(project_risk))
 }
-fn result(response: ToolApiResponse, limit: usize) -> Result<String, String> {
-    let mut text = match String::from_utf8(response.body) {
-        Ok(s) => s,
-        Err(e) => format!(
+fn result(response: ToolApiResponse, limit: usize) -> Result<Value, String> {
+    let mime = response
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream")
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_ascii_lowercase();
+    if response.status < 400
+        && !response.truncated
+        && ["image/png", "image/jpeg", "image/webp", "image/gif"].contains(&mime.as_str())
+    {
+        return Ok(json!({"$lantern_image": {"data": STANDARD.encode(response.body), "mime": mime}}));
+    }
+    let text_type = mime.starts_with("text/")
+        || mime.contains("json")
+        || mime.contains("yaml")
+        || mime.contains("xml")
+        || response.content_type.is_none();
+    let mut text = if text_type {
+        match String::from_utf8(response.body) {
+            Ok(s) => s,
+            Err(e) => format!(
+                "[binary response: {}, {} bytes, not shown]",
+                mime,
+                e.as_bytes().len()
+            ),
+        }
+    } else {
+        format!(
             "[binary response: {}, {} bytes, not shown]",
-            response
-                .content_type
-                .as_deref()
-                .unwrap_or("application/octet-stream"),
-            e.as_bytes().len()
-        ),
+            mime,
+            response.body.len()
+        )
     };
     if response.truncated {
         text.push_str(&format!(
@@ -142,8 +213,9 @@ fn result(response: ToolApiResponse, limit: usize) -> Result<String, String> {
             text.chars().take(2000).collect::<String>()
         ));
     }
-    Ok(text)
+    Ok(Value::String(text))
 }
+
 impl LanternMcp {
     pub(super) async fn job_result(&self, id: &str, compat: bool) -> Result<Value, String> {
         let value = self.api.job(id).await?;
@@ -164,6 +236,12 @@ impl LanternMcp {
         let instance = self.facade.instance(id.clone()).await.map_err(|e| e.message)?;
         let manifest = self.facade.manifest(id.clone()).await.map_err(|e| e.message)?;
         let routing = &manifest["routing"];
+        if !routing.is_object()
+            || !manifest["endpoints"].is_array()
+            || !routing["requires_confirmation"].is_boolean()
+        {
+            return Err("Cannot verify complete manifest risk metadata; no request was sent.".into());
+        }
         let method = a["method"].as_str().unwrap_or("GET").to_ascii_uppercase();
         let path = a["path"].as_str().unwrap_or_default();
         let base = if id.is_primary() {
@@ -228,7 +306,26 @@ impl LanternMcp {
         let decoded = percent_encoding::percent_decode_str(path.split('?').next().unwrap_or(path))
             .decode_utf8()
             .map_err(|_| "Invalid path encoding")?;
-        let risk = effective_risk(&method, &decoded, &endpoints, routing["risk"].as_str());
+        let mut risk = effective_risk(&method, &decoded, &endpoints, routing["risk"].as_str());
+        for endpoint in manifest["endpoints"].as_array().expect("checked array") {
+            if endpoint["method"]
+                .as_str()
+                .is_some_and(|m| m.eq_ignore_ascii_case(&method))
+                && endpoint["path"]
+                    .as_str()
+                    .is_some_and(|p| matches_path(p, &decoded))
+            {
+                let endpoint_risk = endpoint["risk"].as_str().map_or_else(
+                    || match method.as_str() {
+                        "GET" => 0,
+                        "DELETE" => 2,
+                        _ => 1,
+                    },
+                    |r| declared_risk(Some(r)),
+                );
+                risk = risk.max(endpoint_risk);
+            }
+        }
         if risk >= 3 && !self.api.allow_critical_calls {
             return Err("Not sent: critical calls are disabled by mcp.allow_critical_calls.".into());
         }
@@ -247,18 +344,18 @@ impl LanternMcp {
             if n == 0 {
                 return Err("Invalid max_concurrent; no request was sent.".into());
             }
-            let sem = {
+            let n = n.min(1_000) as usize;
+            let gate = {
                 let mut limits = self.api.limits.lock().await;
                 limits
                     .entry(id)
-                    .or_insert_with(|| Arc::new(Semaphore::new(n.min(1_000) as usize)))
+                    .or_insert_with(|| Arc::new(InstanceGate::new(n)))
                     .clone()
             };
             Some(
-                tokio::time::timeout(Duration::from_secs(5), sem.acquire_owned())
+                tokio::time::timeout(Duration::from_secs(5), gate.acquire(n))
                     .await
-                    .map_err(|_| "busy: project API limit reached")?
-                    .map_err(|_| "API semaphore closed")?,
+                    .map_err(|_| "busy: project API limit reached")?,
             )
         } else {
             None
@@ -274,7 +371,16 @@ impl LanternMcp {
                 let mut jobs = self.api.jobs.lock().await;
                 jobs.retain(|_, j| j.finished.is_none_or(|t| t.elapsed() < Duration::from_secs(3600)));
                 if jobs.len() >= 200 {
-                    return Err("Too many retained API jobs; try again later.".into());
+                    let oldest_finished = jobs
+                        .iter()
+                        .filter(|(_, job)| job.finished.is_some())
+                        .min_by_key(|(_, job)| job.finished)
+                        .map(|(id, _)| id.clone());
+                    if let Some(id) = oldest_finished {
+                        jobs.remove(&id);
+                    } else {
+                        return Err("Too many active API jobs; try again later.".into());
+                    }
                 }
                 jobs.insert(
                     job_id.clone(),
@@ -304,7 +410,39 @@ impl LanternMcp {
             )
         } else {
             let _permits = (global, per_instance);
-            Ok(Value::String(result(client.send(request).await?, max)?))
+            result(client.send(request).await?, max)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn mcp_instance_gate_enforces_lowered_limit() {
+        let gate = Arc::new(InstanceGate::new(2));
+        let first = gate.clone().acquire(2).await;
+        let second = gate.clone().acquire(2).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), gate.clone().acquire(1))
+                .await
+                .is_err()
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), gate.clone().acquire(1))
+                .await
+                .is_err()
+        );
+        drop(second);
+        let one = tokio::time::timeout(Duration::from_millis(100), gate.clone().acquire(1))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), gate.clone().acquire(2))
+                .await
+                .is_err()
+        );
+        drop(one);
     }
 }

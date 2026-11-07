@@ -275,7 +275,8 @@ pub(super) fn scan(
         }
     }
     candidates.sort();
-    candidates.dedup_by(|a, b| a.1 == b.1);
+    let mut unique = HashSet::new();
+    candidates.retain(|(_, path)| unique.insert(path.clone()));
     let truncated = candidates.len() > max_files;
     for (_, path) in candidates.into_iter().take(max_files) {
         if seen.insert(path.clone()) {

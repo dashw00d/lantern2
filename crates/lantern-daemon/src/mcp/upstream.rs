@@ -146,6 +146,9 @@ fn valid_path(path: &str) -> bool {
             Ok(v) => v.into_owned(),
             Err(_) => return false,
         };
+        if next.contains('%') && next != decoded {
+            return false;
+        }
         if next.contains('\\')
             || next.chars().any(char::is_control)
             || next.starts_with("//")
@@ -165,6 +168,7 @@ fn valid_path(path: &str) -> bool {
 }
 impl UpstreamPolicy {
     /// Resolve and pin a registered base URL and relative request path; no arbitrary authority is accepted.
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare(
         &self,
         base: &str,
@@ -231,7 +235,11 @@ impl UpstreamPolicy {
         .map_err(|_| "Upstream DNS lookup timed out")?
         .map_err(|e| format!("Upstream DNS lookup failed: {e}"))?
         .collect::<Vec<_>>();
-        if addresses.is_empty() || addresses.iter().any(|a| forbidden(a.ip())) {
+        if addresses.is_empty()
+            || addresses
+                .iter()
+                .any(|a| forbidden(a.ip()) || (local_name && !permitted && !a.ip().is_loopback()))
+        {
             return Err("Upstream resolved to a forbidden address".into());
         }
         let (p, q) = path.split_once('?').map_or((path, None), |(p, q)| (p, Some(q)));

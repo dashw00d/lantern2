@@ -163,3 +163,18 @@ async fn mcp_intel_openapi_http_fetch() {
     shutdown.cancel();
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn mcp_intel_discovery_rejects_symlinked_scan_root() {
+    use std::os::unix::fs::symlink;
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    std::fs::write(outside.path().join("secret.md"), "must not appear").unwrap();
+    symlink(outside.path(), root.path().join("docs")).unwrap();
+    let service = intel(root.path().join("cache.json"));
+    let snapshot = service
+        .refresh(input(&root, "app", "id: app\n", None, false))
+        .await
+        .unwrap();
+    assert!(!snapshot.docs.iter().any(|d| d.path.contains("secret")));
+}

@@ -27,13 +27,13 @@ impl LanternMcp {
     async fn diagnose_service(&self, Parameters(args): Parameters<PromptArgs>) -> Vec<PromptMessage> {
         let target = args
             .instance
-            .map(|v| format!(" and instance '{v}'"))
+            .map(|v| format!(" and instance \"{v}\""))
             .unwrap_or_default();
+        let name = args.name;
         vec![PromptMessage::new_text(
             Role::User,
             format!(
-                "Please diagnose the service '{}'{}: check_health, get_project, get_project_logs and get_dependencies. If the port looks wrong, call get_ports or list_listeners. Identify the likely cause, suggest specific remediation, note downstream impact, and suggest relevant deploy commands.",
-                args.name, target
+                "Please diagnose the service \"{name}\" using the following steps:\n\n1. Check the health status using the check_health tool with name \"{name}\"{target}\n2. Get the project details using get_project with name \"{name}\"{target}\n3. Get recent logs using get_project_logs with name \"{name}\"{target}\n4. Check what depends on this service using get_dependencies with name \"{name}\"\n5. If the port looks wrong, call get_ports or list_listeners.\n\nBased on the results:\n- If the service is unhealthy, identify the likely cause from the logs\n- Suggest specific remediation steps\n- Note any downstream services that may be affected\n- If the service has deploy commands, suggest which one to run\n"
             ),
         )]
     }
@@ -42,11 +42,11 @@ impl LanternMcp {
         &self,
         Parameters(args): Parameters<DependencyPromptArgs>,
     ) -> Vec<PromptMessage> {
+        let name = args.name;
         vec![PromptMessage::new_text(
             Role::User,
             format!(
-                "Trace the dependency chain for project '{}': use get_dependencies, get_project for dependents, and check_health for all related projects. Summarize its direct dependencies, projects that depend on it, health, and the blast radius if it fails.",
-                args.name
+                "Trace the dependency chain for project \"{name}\":\n\n1. Get the dependency graph using get_dependencies with name \"{name}\"\n2. For each project that depends on \"{name}\", also get their details using get_project\n3. Check the health of all related projects using check_health\n\nProvide a summary that includes:\n- Direct dependencies of \"{name}\" (what it needs)\n- Projects that depend on \"{name}\" (what would break if it goes down)\n- Current health status of each related project\n- Risk assessment: what's the blast radius if \"{name}\" fails?\n"
             ),
         )]
     }

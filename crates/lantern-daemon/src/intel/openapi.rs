@@ -266,7 +266,7 @@ pub(super) async fn scan(input: Input<'_>) -> (Vec<EndpointEntry>, ApiMeta, bool
             }
         }
     }
-    let stale = enabled && !input.running && input.base.is_some();
+    let stale = enabled && !input.running;
     if stale {
         for e in input
             .previous

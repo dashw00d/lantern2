@@ -16,6 +16,12 @@ fn number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Erro
     .transpose()
 }
 
+fn port_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u16>, D::Error> {
+    number(d)?
+        .map(|n| u16::try_from(n).map_err(serde::de::Error::custom))
+        .transpose()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ListProjectsArgs {
     /// Filter by tag.
@@ -180,6 +186,7 @@ pub struct ListenersArgs {
     /// Restrict to a project.
     pub project: Option<String>,
     /// Restrict to a port.
+    #[serde(default, deserialize_with = "port_number")]
     pub port: Option<u16>,
     /// Only listeners with no matching instance.
     pub unmatched_only: Option<bool>,
