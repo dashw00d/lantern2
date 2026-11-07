@@ -47,6 +47,14 @@ pub enum FetchPolicy {
     /// Never fetch except a requested PR.
     Never,
 }
+/// Trust evidence supplied by the caller before executing PR code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrTrust {
+    /// The caller verified that the PR's head is in the base repository.
+    SameRepository,
+    /// The user explicitly confirmed running foreign PR code.
+    ConfirmedForeign,
+}
 /// Request to reuse or create a branch checkout.
 #[derive(Debug, Clone)]
 pub struct RunBranchRequest {
@@ -64,6 +72,8 @@ pub struct RunBranchRequest {
     pub detach: bool,
     /// Explicit remote selection, useful for ambiguity and PRs.
     pub remote: Option<String>,
+    /// Verified PR origin or explicit user confirmation; required for PR targets.
+    pub pr_trust: Option<PrTrust>,
 }
 /// Result of resolving a run-branch request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,6 +590,9 @@ impl InstanceService {
         let cancel = op.cancel_token();
         if cancel.is_cancelled() {
             return Err(InstanceError::Cancelled);
+        }
+        if matches!(req.target, BranchTarget::Pr(_)) && req.pr_trust.is_none() {
+            return Err(InstanceError::Refused("pr_trust_confirmation_required".into()));
         }
         let p = self.project(&req.project)?;
         let pr = p.project.repo.as_ref().ok_or(InstanceError::NotARepo)?.clone();

@@ -223,6 +223,7 @@ fn req(target: BranchTarget) -> lantern_daemon::instances::RunBranchRequest {
         fetch: FetchPolicy::Never,
         detach: false,
         remote: None,
+        pr_trust: Some(lantern_daemon::instances::PrTrust::SameRepository),
     }
 }
 fn operation() -> lantern_daemon::operations::OpHandle {
@@ -487,6 +488,16 @@ async fn instances_pr_detached_and_option_ref_safety() {
         ],
     );
     let op = operation();
+    let mut unconfirmed = req(BranchTarget::Pr(42));
+    unconfirmed.pr_trust = None;
+    assert!(
+        service
+            .run_branch(unconfirmed, &op)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("pr_trust_confirmation_required")
+    );
     let pr = service.run_branch(req(BranchTarget::Pr(42)), &op).await.unwrap();
     assert_eq!(pr.instance.as_str(), "myapp@pr-42");
     let detached = service

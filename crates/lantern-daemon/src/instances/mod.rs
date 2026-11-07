@@ -119,8 +119,8 @@ pub enum InstanceError {
 /// Instance reconciliation and preparation service.
 pub mod service;
 pub use service::{
-    BranchTarget, CheckoutObservation, FetchPolicy, InstanceService, Outcome, Prepared, RunBranchRequest,
-    RunBranchResponse,
+    BranchTarget, CheckoutObservation, FetchPolicy, InstanceService, Outcome, PrTrust, Prepared,
+    RunBranchRequest, RunBranchResponse,
 };
 
 /// Worktree removal and GC safety checks.
