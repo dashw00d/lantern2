@@ -98,6 +98,8 @@ struct Pending {
     since: Instant,
     operation: Option<OperationId>,
     step: String,
+    request_id: u64,
+    early: BTreeMap<OperationId, (String, bool, Option<String>)>,
 }
 
 #[derive(Debug)]
@@ -108,6 +110,7 @@ struct App {
     client: Client,
     mirror: Mirror,
     pending: BTreeMap<InstanceId, Pending>,
+    next_request_id: u64,
     toasts: Vec<String>,
     filter: String,
     why: Option<String>,
@@ -136,7 +139,7 @@ enum Message {
     Theme(theme::Mode),
     Stream(Box<StreamEvent>),
     Command(Command),
-    CommandDone(InstanceId, Box<Result<OperationResponse, String>>),
+    CommandDone(InstanceId, u64, Box<Result<OperationResponse, String>>),
     Tick(Instant),
     Filter(String),
     Dismiss(usize),
@@ -180,6 +183,7 @@ impl App {
             client,
             mirror: Mirror::default(),
             pending: BTreeMap::new(),
+            next_request_id: 0,
             toasts: prefs_error.into_iter().collect(),
             filter: String::new(),
             why: None,
@@ -305,6 +309,14 @@ impl App {
                 UiEvent::Quit => iced::exit(),
             },
             Message::Stream(event) => {
+                if matches!(&*event, StreamEvent::Connecting { .. } | StreamEvent::Lost { .. })
+                    && self.log_target.is_some()
+                {
+                    // A backlog reply from the previous connection must never overwrite this view.
+                    self.log_epoch = self.log_epoch.wrapping_add(1);
+                    self.log_loading = false;
+                    self.log_live.clear();
+                }
                 if matches!(&*event, StreamEvent::Connected)
                     && let Some(id) = self.log_target.clone()
                 {
@@ -363,6 +375,14 @@ impl App {
                                     .get(id)
                                     .is_none_or(|instance| !settled(pending.kind, instance.runtime.status))
                             });
+                            if let Some(id) = &self.log_target
+                                && !self.mirror.live.instances.contains_key(id)
+                            {
+                                self.toasts.push(format!("{id} is no longer available"));
+                                self.log_target = None;
+                                self.log_epoch = self.log_epoch.wrapping_add(1);
+                                self.stream_generation = self.stream_generation.wrapping_add(1);
+                            }
                         }
                         Effect::Transition { id, status } => {
                             if self.pending.get(&id).is_some_and(|p| settled(p.kind, status)) {
@@ -376,19 +396,21 @@ impl App {
                             done,
                             error,
                         } => {
-                            let matches = self
-                                .pending
-                                .get(&instance)
-                                .is_some_and(|p| p.operation.as_ref().is_none_or(|known| known == &op));
-                            if matches {
-                                if done {
-                                    self.pending.remove(&instance);
-                                    if let Some(error) = error {
-                                        self.toasts.push(error);
+                            if let Some(pending) = self.pending.get_mut(&instance) {
+                                if pending.operation.is_none() {
+                                    if pending.early.len() == 8 && !pending.early.contains_key(&op) {
+                                        pending.early.pop_first();
                                     }
-                                } else if let Some(pending) = self.pending.get_mut(&instance) {
-                                    pending.operation = Some(op);
-                                    pending.step = step;
+                                    pending.early.insert(op, (step, done, error));
+                                } else if pending.operation.as_ref() == Some(&op) {
+                                    if done {
+                                        self.pending.remove(&instance);
+                                        if let Some(error) = error {
+                                            self.toasts.push(error);
+                                        }
+                                    } else {
+                                        pending.step = step;
+                                    }
                                 }
                             }
                         }
@@ -410,6 +432,8 @@ impl App {
                     return Task::none();
                 }
                 let id = cmd.id.clone();
+                self.next_request_id = self.next_request_id.wrapping_add(1);
+                let request_id = self.next_request_id;
                 self.pending.insert(
                     id.clone(),
                     Pending {
@@ -417,20 +441,31 @@ impl App {
                         since: Instant::now(),
                         operation: None,
                         step: "Working…".into(),
+                        request_id,
+                        early: BTreeMap::new(),
                     },
                 );
                 let client = self.client.clone();
                 Task::perform(async move { cmd.execute(&client).await }, move |result| {
-                    Message::CommandDone(id.clone(), Box::new(result))
+                    Message::CommandDone(id.clone(), request_id, Box::new(result))
                 })
             }
-            Message::CommandDone(id, result) => {
+            Message::CommandDone(id, request_id, result) => {
+                let matches = self
+                    .pending
+                    .get(&id)
+                    .is_some_and(|pending| pending.request_id == request_id);
                 match *result {
                     Err(error) => {
-                        self.pending.remove(&id);
+                        if matches {
+                            self.pending.remove(&id);
+                        }
                         self.toasts.push(error);
                     }
                     Ok(response) => {
+                        if !matches {
+                            return Task::none();
+                        }
                         if response.operation.noop
                             || matches!(
                                 response.operation.status,
@@ -444,7 +479,22 @@ impl App {
                                 self.toasts.push(error.message);
                             }
                         } else if let Some(pending) = self.pending.get_mut(&id) {
-                            pending.operation = Some(response.operation.id);
+                            let operation = response.operation.id;
+                            if let Some((step, done, error)) = pending.early.remove(&operation) {
+                                if done {
+                                    self.pending.remove(&id);
+                                    if let Some(error) = error {
+                                        self.toasts.push(error);
+                                    }
+                                } else {
+                                    pending.step = step;
+                                    pending.operation = Some(operation);
+                                    pending.early.clear();
+                                }
+                            } else {
+                                pending.operation = Some(operation);
+                                pending.early.clear();
+                            }
                         }
                     }
                 }
@@ -1264,5 +1314,91 @@ mod tests {
                 .status,
             InstanceStatus::Stopped
         );
+    }
+    #[test]
+    fn pending_correlates_early_progress_and_stale_http_replies() {
+        use lantern_core::api::{Operation, OperationKind};
+        let mut app = app();
+        complete(&mut app);
+        let id = InstanceId::parse("example").unwrap();
+        drop(app.update(Message::Command(Command {
+            id: id.clone(),
+            kind: CommandKind::Start,
+        })));
+        let request = app.pending[&id].request_id;
+        let progress = |op: &str, done| {
+            Message::Stream(Box::new(StreamEvent::Event(WireEvent::OperationProgress {
+                op: OperationId(op.into()),
+                instance: id.clone(),
+                step: "starting".into(),
+                done,
+                error: None,
+            })))
+        };
+        drop(app.update(progress("unrelated", true)));
+        drop(app.update(progress("ours", true)));
+        assert!(app.pending.contains_key(&id));
+        let response = OperationResponse {
+            operation: Operation {
+                id: OperationId("ours".into()),
+                kind: OperationKind::Start,
+                instance: Some(id.clone()),
+                status: OperationStatus::Running,
+                noop: false,
+                step: None,
+                steps: vec![],
+                created_at: "2026-11-06T00:00:00Z".parse().unwrap(),
+                finished_at: None,
+                error: None,
+                result: None,
+            },
+            instance: None,
+            created: None,
+            forgotten: None,
+        };
+        drop(app.update(Message::CommandDone(id.clone(), request, Box::new(Ok(response)))));
+        assert!(!app.pending.contains_key(&id));
+        drop(app.update(Message::Command(Command {
+            id: id.clone(),
+            kind: CommandKind::Stop,
+        })));
+        drop(app.update(Message::CommandDone(
+            id.clone(),
+            request,
+            Box::new(Err("late failure".into())),
+        )));
+        assert_eq!(app.pending[&id].kind, CommandKind::Stop);
+    }
+    #[test]
+    fn old_backlog_reply_cannot_replace_logs_after_disconnect() {
+        use lantern_core::model::Stream;
+        let mut app = app();
+        complete(&mut app);
+        let id = InstanceId::parse("example").unwrap();
+        drop(app.update(Message::OpenLogs(id.clone())));
+        let line = LogLine {
+            instance: id.clone(),
+            stream: Stream::Stdout,
+            line: "kept".into(),
+            ts: "2026-11-06T00:00:00Z".parse().unwrap(),
+        };
+        app.logs.push(line);
+        drop(app.update(Message::Stream(Box::new(StreamEvent::Connected))));
+        let epoch = app.log_epoch;
+        drop(app.update(Message::Stream(Box::new(StreamEvent::Lost {
+            error: "offline".into(),
+            daemon_unreachable: true,
+            attempt: 0,
+            retry_in: Duration::from_secs(1),
+        }))));
+        let page = LogPage {
+            instance: id.clone(),
+            lines: vec![],
+            buffered: 0,
+            truncated: false,
+        };
+        drop(app.update(Message::LogBacklog(id, epoch, Ok(page))));
+        assert_eq!(app.logs.len(), 1);
+        assert_eq!(app.logs.get(0).unwrap().line, "kept");
     }
 }
