@@ -1094,3 +1094,31 @@ async fn instances_setup_rejects_missing_required_port_lease() {
     assert!(runner.calls.lock().unwrap().is_empty());
     op.finish(OpOutcome::Cancelled);
 }
+
+#[tokio::test]
+async fn instances_managed_repository_symlink_cannot_redirect_creation() {
+    let t = Temp::new();
+    let (root, _, store, _, service) = fixture(&t, EMPTY).await;
+    git_cmd(&root, &["branch", "redirect"]);
+    let managed = t.0.join("managed");
+    let outside = t.0.join("outside");
+    fs::create_dir(&managed).unwrap();
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, managed.join("mono")).unwrap();
+    let op = operation();
+    assert!(
+        service
+            .run_branch(req(BranchTarget::Branch("redirect".into())), &op)
+            .await
+            .is_err()
+    );
+    assert!(!outside.join("redirect").exists());
+    assert!(
+        !store
+            .records()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id.as_str() == "myapp@redirect")
+    );
+    op.finish(OpOutcome::Cancelled);
+}

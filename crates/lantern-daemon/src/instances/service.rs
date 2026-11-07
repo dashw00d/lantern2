@@ -318,6 +318,13 @@ impl InstanceService {
         trees.sort_by(|a, b| a.path.cmp(&b.path));
         for p in projects {
             let pr = p.project.repo.as_ref().ok_or(InstanceError::NotARepo)?;
+            if pr
+                .subpath
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(InstanceError::UnsafePath("invalid project subpath".into()));
+            }
             let mut ordered = trees.clone();
             ordered.sort_by_key(|w| (w.path != pr.git_root, w.path.clone()));
             for wt in ordered.iter().filter(|w| !w.bare) {
@@ -751,8 +758,6 @@ impl InstanceService {
                 )
             }
         };
-        let (id, revived) = self.allocate(&p, &desired, None, true)?;
-        let slug = id.slug().expect("derived id");
         if Path::new(&p.repo_slug).components().count() != 1
             || !matches!(
                 Path::new(&p.repo_slug).components().next(),
@@ -768,7 +773,27 @@ impl InstanceService {
         {
             return Err(InstanceError::UnsafePath("invalid project subpath".into()));
         }
-        let root = self.worktrees_dir.join(&p.repo_slug).join(slug);
+        std::fs::create_dir_all(&self.worktrees_dir)?;
+        let managed_root = std::fs::canonicalize(&self.worktrees_dir)?;
+        let repo_dir = managed_root.join(&p.repo_slug);
+        match std::fs::symlink_metadata(&repo_dir) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(InstanceError::UnsafePath(
+                    "managed repository directory is not a real directory".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&repo_dir)?,
+            Err(e) => return Err(e.into()),
+        }
+        if !std::fs::canonicalize(&repo_dir)?.starts_with(&managed_root) {
+            return Err(InstanceError::UnsafePath(
+                "repository directory escapes managed root".into(),
+            ));
+        }
+        let (id, revived) = self.allocate(&p, &desired, None, true)?;
+        let slug = id.slug().expect("derived id");
+        let root = repo_dir.join(slug);
         let project_path = root.join(&pr.subpath);
         let previous = revived.clone();
         let mut record = revived.unwrap_or_else(|| {
@@ -788,7 +813,6 @@ impl InstanceService {
         self.store
             .upsert(&id, record.clone())
             .map_err(InstanceError::Adapter)?;
-        std::fs::create_dir_all(root.parent().expect("managed parent"))?;
         op.step("Creating worktree");
         if let Err(e) = repo.add_worktree(&root, &mode, &cancel).await {
             // A failed git call does not establish ownership of an on-disk path.
