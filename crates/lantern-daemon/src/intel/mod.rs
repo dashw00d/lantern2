@@ -41,6 +41,7 @@ pub struct IntelInput {
 struct Record {
     snapshot: Arc<IntelSnapshot>,
     root: Option<PathBuf>,
+    manifest: Option<Arc<ResolvedManifest>>,
     max_bytes: u64,
 }
 struct Inner {
@@ -99,6 +100,17 @@ impl Intel {
             .get(id)
             .map(|r| r.snapshot.clone())
     }
+    /// Check whether the cached docs were scanned from this exact checkout and manifest.
+    pub async fn matches_manifest(
+        &self,
+        id: &InstanceId,
+        checkout: &std::path::Path,
+        manifest: &ResolvedManifest,
+    ) -> bool {
+        self.inner.records.read().await.get(id).is_some_and(|record| {
+            record.root.as_deref() == Some(checkout) && record.manifest.as_deref() == Some(manifest)
+        })
+    }
     /// Refresh one instance; independent instances can refresh concurrently, at most four at a time.
     pub async fn refresh(&self, input: IntelInput) -> Result<Arc<IntelSnapshot>, String> {
         tokio::time::timeout(Duration::from_secs(30), self.refresh_inner(input))
@@ -155,6 +167,7 @@ impl Intel {
             Record {
                 snapshot: snapshot.clone(),
                 root: Some(input.checkout),
+                manifest: Some(input.manifest),
                 max_bytes,
             },
         );
@@ -337,6 +350,7 @@ impl Intel {
                     Record {
                         snapshot: Arc::new(snapshot),
                         root: None,
+                        manifest: None,
                         max_bytes: 1_048_576,
                     },
                 );

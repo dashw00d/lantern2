@@ -834,6 +834,11 @@ impl DaemonFacade for AppFacade {
             .await
             .ok_or_else(|| error("unavailable", "intel has not been refreshed; use POST refresh"))?;
         let mut snapshot = (*snapshot).clone();
+        let input = self.intel_input(&id)?;
+        snapshot.stale |= !self
+            .intel_handle()?
+            .matches_manifest(&id, &input.checkout, &input.manifest)
+            .await;
         if let Some(max_age) = max_age {
             snapshot.stale |= snapshot.refreshed_at.is_none_or(|at| {
                 Timestamp::now().as_second().saturating_sub(at.as_second()) > i64::from(max_age)
@@ -860,7 +865,29 @@ impl DaemonFacade for AppFacade {
         Ok(self.intel_handle()?.refresh_all(inputs).await)
     }
     async fn docs(&self, id: InstanceId) -> FacadeResult<Vec<DocEntry>> {
-        Ok(self.intel(id, None).await?.docs)
+        let input = self.intel_input(&id)?;
+        if !self
+            .intel_handle()?
+            .matches_manifest(&id, &input.checkout, &input.manifest)
+            .await
+        {
+            return Err(error("unavailable", "document cache is stale; refresh intel"));
+        }
+        let snapshot = self.intel(id.clone(), None).await?;
+        let current = self.intel_input(&id)?;
+        if current.checkout != input.checkout
+            || current.manifest != input.manifest
+            || !self
+                .intel_handle()?
+                .matches_manifest(&id, &input.checkout, &input.manifest)
+                .await
+        {
+            return Err(error(
+                "unavailable",
+                "manifest changed while listing documents; refresh intel",
+            ));
+        }
+        Ok(snapshot.docs)
     }
     async fn doc(
         &self,
@@ -869,8 +896,16 @@ impl DaemonFacade for AppFacade {
         offset: Option<u64>,
         max_chars: Option<u64>,
     ) -> FacadeResult<DocContent> {
-        self.view(&id)?;
-        self.intel_handle()?
+        let input = self.intel_input(&id)?;
+        if !self
+            .intel_handle()?
+            .matches_manifest(&id, &input.checkout, &input.manifest)
+            .await
+        {
+            return Err(error("unavailable", "document cache is stale; refresh intel"));
+        }
+        let content = self
+            .intel_handle()?
             .read_doc(
                 &id,
                 &path,
@@ -890,7 +925,21 @@ impl DaemonFacade for AppFacade {
                     "doc_not_found"
                 };
                 error(code, message)
-            })
+            })?;
+        let current = self.intel_input(&id)?;
+        if current.checkout != input.checkout
+            || current.manifest != input.manifest
+            || !self
+                .intel_handle()?
+                .matches_manifest(&id, &input.checkout, &input.manifest)
+                .await
+        {
+            return Err(error(
+                "unavailable",
+                "manifest changed while reading document; refresh intel",
+            ));
+        }
+        Ok(content)
     }
     async fn endpoints(
         &self,

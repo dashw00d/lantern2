@@ -271,6 +271,23 @@ async fn app_facade_starts_and_stops_real_registry_with_fake_systemd() {
             .iter()
             .any(|d| d.path == "CHANGELOG.md")
     );
+    let changed_manifest = "id: sample\ntype: proxy\nrun: {cmd: 'python3 -m http.server ${PORT}'}\ndocs_auto: {enabled: false}\ndocs: [CHANGELOG.md]\nendpoints: [{method: GET, path: /hello, description: Hello}]\n";
+    fs::write(temp.0.join("project/lantern.yaml"), changed_manifest).unwrap();
+    registry.reload_project(&id.project()).unwrap();
+    assert_eq!(app.docs(id.clone()).await.unwrap_err().code, "unavailable");
+    assert_eq!(
+        app.doc(id.clone(), "README.md".into(), None, None)
+            .await
+            .unwrap_err()
+            .code,
+        "unavailable"
+    );
+    assert!(app.intel(id.clone(), None).await.unwrap().stale);
+    app.refresh_intel(id.clone()).await.unwrap();
+    assert_eq!(app.docs(id.clone()).await.unwrap()[0].path, "CHANGELOG.md");
+    fs::write(temp.0.join("project/lantern.yaml"), "id: sample\ntype: proxy\nrun: {cmd: 'python3 -m http.server ${PORT}'}\ndocs: [README.md]\nendpoints: [{method: GET, path: /hello, description: Hello}]\n").unwrap();
+    registry.reload_project(&id.project()).unwrap();
+    app.refresh_intel(id.clone()).await.unwrap();
     let intel_stop = CancellationToken::new();
     let worker = lantern_daemon::app::intel_worker::spawn(Arc::new(app.clone()), &bus, intel_stop.clone());
     tokio::time::sleep(Duration::from_millis(100)).await;
