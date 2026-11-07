@@ -344,7 +344,21 @@ fn command(runner: &dyn CommandRunner, program: &Path, args: &[&str]) -> Result<
         Err(String::from_utf8_lossy(&out.stderr).trim().into())
     }
 }
-fn user_command(ctx: &DoctorCtx<'_>, args: &[&str]) -> Result<String, String> {
+fn command_failure(output: &crate::command::CommandOutput, command: &str) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+    if detail.is_empty() {
+        format!("{command} failed without output")
+    } else {
+        format!("{command}: {detail}")
+    }
+}
+fn user_output(ctx: &DoctorCtx<'_>, args: &[&str]) -> Result<crate::command::CommandOutput, String> {
     let mut spec = CommandSpec::new("/usr/bin/systemctl", args.iter().copied(), false);
     let runtime = ctx
         .paths
@@ -358,12 +372,30 @@ fn user_command(ctx: &DoctorCtx<'_>, args: &[&str]) -> Result<String, String> {
         "DBUS_SESSION_BUS_ADDRESS".into(),
         format!("unix:path={}/bus", runtime.display()).into(),
     );
-    let out = ctx.runner.run(&spec).map_err(|e| e.to_string())?;
+    ctx.runner
+        .run(&spec)
+        .map_err(|e| format!("systemctl {}: {e}", args.join(" ")))
+}
+fn user_command(ctx: &DoctorCtx<'_>, args: &[&str]) -> Result<String, String> {
+    let out = user_output(ctx, args)?;
     if out.success {
         Ok(String::from_utf8_lossy(&out.stdout).trim().into())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().into())
+        Err(command_failure(&out, &format!("systemctl {}", args.join(" "))))
     }
+}
+fn session_check(ctx: &DoctorCtx<'_>) -> Check {
+    let state = user_command(ctx, &["--user", "show-environment"])
+        .and_then(|_| user_output(ctx, &["--user", "is-system-running"]));
+    let (status, detail, fix) = match state {
+        Ok(out) => match String::from_utf8_lossy(&out.stdout).trim() {
+            "running" if out.success => (CheckStatus::Ok, "user systemd manager is running".into(), "systemctl --user --failed"),
+            "degraded" => (CheckStatus::Warn, "user systemd manager is running but some units failed; inspect them with systemctl --user --failed".into(), "systemctl --user --failed"),
+            _ => (CheckStatus::Fail, command_failure(&out, "systemctl --user is-system-running"), "systemctl --user status"),
+        },
+        Err(detail) => (CheckStatus::Fail, detail, "systemctl --user status"),
+    };
+    item("session.systemd", "User systemd", status, detail, fix, false)
 }
 fn free_ports(ctx: &DoctorCtx<'_>) -> Result<String, String> {
     let mut saw = false;
@@ -543,13 +575,12 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
         "systemctl --user start lantern",
         false,
     ));
-    let session = user_command(ctx, &["--user", "show-environment"])
-        .and_then(|_| user_command(ctx, &["--user", "is-enabled", "lantern.service"]))
-        .map(|_| "user systemd session and unit are available".into());
+    checks.push(session_check(ctx));
     checks.push(from_result(
-        "session.systemd",
-        "User systemd",
-        session,
+        "session.unit",
+        "Lantern user unit",
+        user_command(ctx, &["--user", "is-enabled", "lantern.service"])
+            .map(|state| format!("Lantern user unit is {state}")),
         "systemctl --user enable lantern",
         false,
     ));

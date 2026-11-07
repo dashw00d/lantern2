@@ -1221,3 +1221,83 @@ fn constrained_root_accepts_local_tls_and_rejects_external_dns_in_memory() {
         "unexpected error: {outside}"
     );
 }
+
+#[test]
+fn doctor_session_classifies_manager_state_and_preserves_command_details() {
+    use lantern_core::api::CheckStatus;
+    use lantern_system::doctor::{DoctorCtx, run};
+    struct ManagerRunner<'a> {
+        base: RecordingRunner,
+        state: &'a str,
+        success: bool,
+        environment_error: Option<&'a str>,
+    }
+    impl CommandRunner for ManagerRunner<'_> {
+        fn run(&self, spec: &CommandSpec) -> io::Result<CommandOutput> {
+            let args: Vec<_> = spec.args.iter().map(|a| a.to_string_lossy()).collect();
+            if args.iter().any(|a| a == "show-environment") {
+                if let Some(error) = self.environment_error {
+                    return Ok(CommandOutput {
+                        success: false,
+                        stdout: Vec::new(),
+                        stderr: error.as_bytes().to_vec(),
+                    });
+                }
+            }
+            if args.iter().any(|a| a == "is-system-running") {
+                return Ok(CommandOutput {
+                    success: self.success,
+                    stdout: self.state.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            self.base.run(spec)
+        }
+    }
+    let f = Fixture::new();
+    let settings = lantern_core::settings::Settings::default();
+    for (state, success, error, expected) in [
+        ("running\n", true, None, CheckStatus::Ok),
+        ("degraded\n", false, None, CheckStatus::Warn),
+        ("offline\n", false, None, CheckStatus::Fail),
+        ("", false, None, CheckStatus::Fail),
+        (
+            "running\n",
+            true,
+            Some("cannot connect to bus"),
+            CheckStatus::Fail,
+        ),
+    ] {
+        let runner = ManagerRunner {
+            base: RecordingRunner::new(&f),
+            state,
+            success,
+            environment_error: error,
+        };
+        let ctx = DoctorCtx {
+            paths: &f.paths,
+            settings: &settings,
+            runner: &runner,
+            network: &OfflineNetwork,
+            caddy: &f.paths.bundled_caddy,
+            certutil: None,
+            search_path: vec![],
+        };
+        let checks = run(&ctx);
+        let check = checks.iter().find(|c| c.id == "session.systemd").unwrap();
+        assert_eq!(check.status, expected, "{state:?} {error:?}");
+        assert!(!check.detail.is_empty());
+        if state.trim() == "degraded" {
+            assert!(check.detail.contains("systemctl --user --failed"));
+            assert_eq!(check.fix.as_ref().unwrap().command, "systemctl --user --failed");
+        } else if state.trim() == "offline" {
+            assert!(check.detail.contains("offline"));
+        }
+        if let Some(error) = error {
+            assert!(check.detail.contains(error));
+        }
+        let unit = checks.iter().find(|c| c.id == "session.unit").unwrap();
+        assert_eq!(unit.status, CheckStatus::Fail);
+        assert!(unit.detail.contains("failed without output"));
+    }
+}
