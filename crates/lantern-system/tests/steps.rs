@@ -101,7 +101,8 @@ impl CommandRunner for RecordingRunner {
                 let db = PathBuf::from(args[1].strip_prefix("sql:").unwrap());
                 if args.iter().any(|a| a == "-L") {
                     match state.nss.get(&db) {
-                        Some(cert) => out.stdout = cert.clone(),
+                        Some(cert) if args.iter().any(|a| a == "-n") => out.stdout = cert.clone(),
+                        Some(_) => out.stdout = b"Certificate Nickname                                         Trust Attributes\nLantern Local CA                                             C,,\n".to_vec(),
                         None => out.success = false,
                     }
                 } else if args.iter().any(|a| a == "-N") {
@@ -402,7 +403,9 @@ impl Step for FakeStep {
 }
 #[test]
 fn init_composes_steps_with_uid_and_settings_validation() {
-    use lantern_system::init::{InitCtx, SystemInitCtx, pkexec_invocation, run_system_steps, run_user_steps};
+    use lantern_system::init::{
+        InitCtx, SystemInitCtx, pkexec_invocation, run_init, run_system_steps, run_user_steps,
+    };
     let f = Fixture::new();
     let runner = RecordingRunner::new(&f);
     f.write(&f.paths.sysctl_live, b"1024");
@@ -452,6 +455,25 @@ fn init_composes_steps_with_uid_and_settings_validation() {
         allow_fake_cleanup: false,
         system_trust_step: Some(&trust),
     };
+    let before_plan = runner
+        .state
+        .borrow()
+        .commands
+        .iter()
+        .filter(|c| c.mutating)
+        .count();
+    let plan = run_init(&user, &system).unwrap();
+    assert!(plan.pkexec.is_some());
+    assert_eq!(
+        runner
+            .state
+            .borrow()
+            .commands
+            .iter()
+            .filter(|c| c.mutating)
+            .count(),
+        before_plan
+    );
     assert!(
         run_system_steps(&system)
             .iter()
@@ -462,6 +484,7 @@ fn init_composes_steps_with_uid_and_settings_validation() {
             .iter()
             .all(|o| o.state == OutcomeState::AlreadyDone)
     );
+    assert!(run_init(&user, &system).unwrap().pkexec.is_none());
     let before = runner.state.borrow().commands.len();
     let invalid = SystemInitCtx { uid: 0, ..system };
     assert_eq!(run_system_steps(&invalid)[0].state, OutcomeState::Failed);
@@ -479,4 +502,102 @@ fn init_composes_steps_with_uid_and_settings_validation() {
             .iter()
             .any(|c| c.program == Path::new("/usr/bin/pkexec"))
     );
+}
+
+struct FailReload<'a>(&'a RecordingRunner);
+impl CommandRunner for FailReload<'_> {
+    fn run(&self, spec: &CommandSpec) -> io::Result<CommandOutput> {
+        if spec.args.iter().any(|a| a == "reload") {
+            self.0.state.borrow_mut().commands.push(spec.clone());
+            return Ok(CommandOutput {
+                success: false,
+                stdout: vec![],
+                stderr: b"reload failed".to_vec(),
+            });
+        }
+        self.0.run(spec)
+    }
+}
+#[test]
+fn failed_dns_reload_restores_previous_file_and_remains_pending() {
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    let failing = FailReload(&runner);
+    f.write(&f.paths.dns_delegate, b"prior config\n");
+    let dns = DnsDelegateStep {
+        paths: &f.paths,
+        runner: &failing,
+        tld: "glow",
+        listen: "127.0.0.1:5354".parse().unwrap(),
+        from_package: false,
+    };
+    assert_eq!(dns.apply().state, OutcomeState::Failed);
+    assert_eq!(fs::read(&f.paths.dns_delegate).unwrap(), b"prior config\n");
+    assert!(matches!(dns.check(), StepState::Pending(_)));
+}
+#[test]
+fn root_file_symlinks_are_rejected_and_v1_cleanup_does_not_follow_parents() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    let outside = f.paths.home.join("external");
+    fs::create_dir_all(&outside).unwrap();
+    let target = outside.join("keep.caddy");
+    f.write(&target, b"keep");
+    let sites = f.paths.system(Path::new("/etc/caddy/sites.d"));
+    fs::create_dir_all(sites.parent().unwrap()).unwrap();
+    symlink(&outside, &sites).unwrap();
+    let step = V1MigrateStep {
+        paths: &f.paths,
+        runner: &runner,
+        allow_fake_cleanup: true,
+    };
+    assert_eq!(step.apply().state, OutcomeState::Failed);
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+    fs::create_dir_all(f.paths.dns_delegate.parent().unwrap()).unwrap();
+    symlink(&target, &f.paths.dns_delegate).unwrap();
+    let dns = DnsDelegateStep {
+        paths: &f.paths,
+        runner: &runner,
+        tld: "glow",
+        listen: "127.0.0.1:5354".parse().unwrap(),
+        from_package: false,
+    };
+    assert_eq!(dns.apply().state, OutcomeState::Failed);
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+}
+#[test]
+fn nss_matching_certificate_without_ssl_ca_trust_is_not_done() {
+    struct Untrusted<'a>(&'a RecordingRunner);
+    impl CommandRunner for Untrusted<'_> {
+        fn run(&self, command: &CommandSpec) -> io::Result<CommandOutput> {
+            let mut out = self.0.run(command)?;
+            if command.program == Path::new("/usr/bin/certutil")
+                && command.args.iter().any(|a| a == "-L")
+                && !command.args.iter().any(|a| a == "-n")
+                && out.success
+            {
+                out.stdout = b"Lantern Local CA   ,,\n".to_vec();
+            }
+            Ok(out)
+        }
+    }
+    let f = Fixture::new();
+    let runner = RecordingRunner::new(&f);
+    f.write(
+        &f.paths.root_cert,
+        b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+    );
+    let step = NssTrustStep {
+        paths: &f.paths,
+        runner: &runner,
+        certutil: Some(Path::new("/usr/bin/certutil")),
+    };
+    assert_eq!(step.apply().state, OutcomeState::Changed);
+    let untrusted = Untrusted(&runner);
+    let other = NssTrustStep {
+        runner: &untrusted,
+        ..step
+    };
+    assert!(matches!(other.check(), StepState::Pending(_)));
 }

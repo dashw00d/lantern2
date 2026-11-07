@@ -62,7 +62,9 @@ impl Step for DnsDelegateStep<'_> {
         if self.tld == "localhost" {
             return StepState::Skipped("localhost needs no DNS delegate".into());
         }
-        if fs::read(&self.paths.dns_delegate).is_ok_and(|s| s == contents.as_bytes()) {
+        if fs::symlink_metadata(&self.paths.dns_delegate).is_ok_and(|m| m.file_type().is_file())
+            && fs::read(&self.paths.dns_delegate).is_ok_and(|s| s == contents.as_bytes())
+        {
             return StepState::Done("DNS delegate matches settings".into());
         }
         if self.from_package && self.paths.dns_delegate.exists() {
@@ -74,17 +76,36 @@ impl Step for DnsDelegateStep<'_> {
         if let Err(out) = preflight(self.id(), self.check()) {
             return out;
         }
-        let result = delegate_contents(self.tld, self.listen)
-            .and_then(|s| {
-                atomic_write(&self.paths.dns_delegate, s.as_bytes(), 0o644).map_err(|e| e.to_string())
-            })
-            .and_then(|_| {
-                run_checked(
-                    self.runner,
-                    &CommandSpec::new("/usr/bin/systemctl", ["reload", "systemd-resolved"], true),
-                )
-                .map(|_| ())
-            });
+        let result = (|| -> Result<(), String> {
+            use std::os::unix::fs::PermissionsExt;
+            let original = match fs::symlink_metadata(&self.paths.dns_delegate) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err("refusing a symlinked DNS delegate".into());
+                }
+                Ok(meta) => Some((
+                    fs::read(&self.paths.dns_delegate).map_err(|e| e.to_string())?,
+                    meta.permissions().mode() & 0o777,
+                )),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.to_string()),
+            };
+            let contents = delegate_contents(self.tld, self.listen)?;
+            atomic_write(&self.paths.dns_delegate, contents.as_bytes(), 0o644).map_err(|e| e.to_string())?;
+            if let Err(e) = run_checked(
+                self.runner,
+                &CommandSpec::new("/usr/bin/systemctl", ["reload", "systemd-resolved"], true),
+            ) {
+                let restored = match original {
+                    Some((data, mode)) => atomic_write(&self.paths.dns_delegate, &data, mode).map(|_| ()),
+                    None => fs::remove_file(&self.paths.dns_delegate),
+                };
+                return match restored {
+                    Ok(()) => Err(e),
+                    Err(restore) => Err(format!("{e}; failed to restore delegate: {restore}")),
+                };
+            }
+            Ok(())
+        })();
         match result {
             Ok(()) => StepOutcome::new(
                 self.id(),

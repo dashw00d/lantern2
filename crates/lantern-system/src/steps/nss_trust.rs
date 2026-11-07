@@ -95,12 +95,27 @@ pub fn certutil_command(
     args.extend_from_slice(operation);
     CommandSpec::new(program, args, mutating)
 }
-/// Compare the certificate already in one NSS database with the Lantern root.
+/// Compare the DER and SSL trusted-CA flag in one NSS database with the Lantern root.
 pub fn trusted(runner: &dyn CommandRunner, certutil: &Path, db: &NssDatabase, root_der: &[u8]) -> bool {
     let args = ["-L", "-n", "Lantern Local CA", "-a"].map(OsString::from);
-    runner
+    let matches = runner
         .run(&certutil_command(certutil, db, &args, false))
-        .is_ok_and(|o| o.success && certificate_der(&o.stdout).is_ok_and(|der| der == root_der))
+        .is_ok_and(|o| o.success && certificate_der(&o.stdout).is_ok_and(|der| der == root_der));
+    if !matches {
+        return false;
+    }
+    let listing = [OsString::from("-L")];
+    runner
+        .run(&certutil_command(certutil, db, &listing, false))
+        .is_ok_and(|o| {
+            o.success
+                && String::from_utf8_lossy(&o.stdout).lines().any(|line| {
+                    line.trim_start()
+                        .strip_prefix("Lantern Local CA")
+                        .and_then(|s| s.split_whitespace().next())
+                        .is_some_and(|flags| flags.split(',').next().is_some_and(|ssl| ssl.contains('C')))
+                })
+        })
 }
 /// Install the Lantern root into all discovered NSS stores.
 pub struct NssTrustStep<'a> {

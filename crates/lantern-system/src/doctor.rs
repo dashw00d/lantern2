@@ -484,8 +484,8 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
         "ports.free",
         "Port availability",
         free_ports(ctx),
-        "sudo systemctl disable --now nginx",
-        true,
+        "lantern doctor",
+        false,
     ));
     if tld == "localhost" {
         for id in ["dns.resolved", "dns.delegate", "dns.responder", "dns.system"] {
@@ -702,8 +702,8 @@ pub fn run(ctx: &DoctorCtx<'_>) -> Vec<Check> {
             "first Lantern on PATH: {}",
             shadow.map_or_else(|| "not found".into(), |p| p.display().to_string())
         ),
-        "sudo rm /usr/local/bin/lantern",
-        true,
+        "command -v lantern",
+        false,
     ));
     for (id, title, fix) in [
         ("services.mailpit", "Mailpit", "lantern services"),

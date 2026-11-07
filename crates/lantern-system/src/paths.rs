@@ -124,6 +124,16 @@ impl LanternPaths {
         })
     }
 
+    /// Override the XDG config root used for the user unit and tray entry.
+    pub fn with_user_config_root(mut self, root: &Path) -> Result<Self, String> {
+        if !root.is_absolute() || root.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err("XDG config root must be absolute and contain no '..'".into());
+        }
+        self.user_unit = root.join("systemd/user/lantern.service");
+        self.autostart = root.join("autostart/lantern-tray.desktop");
+        Ok(self)
+    }
+
     /// Prefix a fixed absolute system path with the isolated test root when present.
     pub fn system(&self, path: &Path) -> PathBuf {
         assert!(path.is_absolute() && !path.components().any(|c| matches!(c, Component::ParentDir)));
