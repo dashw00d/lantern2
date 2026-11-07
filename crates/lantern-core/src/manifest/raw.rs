@@ -21,18 +21,27 @@ fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D
     }
 }
 fn string_or_list<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
-    let v = one_or_many(d)?;
-    Ok(v.map(|v| {
-        v.into_iter()
-            .flat_map(|s| {
-                s.split([',', '\n'])
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(
+            s.split([',', '\n'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )),
+        Some(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .map(|v| {
+                v.as_str()
                     .map(str::to_owned)
-                    .collect::<Vec<_>>()
+                    .ok_or_else(|| D::Error::custom("expected a string"))
             })
-            .collect()
-    }))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        _ => Err(D::Error::custom("expected a string or list of strings")),
+    }
 }
 fn lenient_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
     let v = Option::<serde_json::Value>::deserialize(d)?;

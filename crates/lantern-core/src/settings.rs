@@ -115,6 +115,60 @@ impl EnvSource for ProcessEnv {
         std::env::var(key).ok()
     }
 }
+/// Resolved XDG directories; no directories are created by this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dirs {
+    pub config: PathBuf,
+    pub state: PathBuf,
+    pub data: PathBuf,
+}
+impl Dirs {
+    /// Resolve Lantern and XDG overrides from a caller-supplied environment.
+    pub fn from_env(env: &dyn EnvSource) -> Result<Self, String> {
+        let home = env.get("HOME").map(PathBuf::from);
+        fn path(
+            env: &dyn EnvSource,
+            home: Option<&Path>,
+            lantern: &str,
+            xdg: &str,
+            fallback: &str,
+        ) -> Result<PathBuf, String> {
+            if let Some(value) = env.get(lantern).filter(|s| !s.is_empty()) {
+                return Ok(PathBuf::from(value));
+            }
+            let root = if let Some(value) = env.get(xdg).filter(|s| Path::new(s).is_absolute()) {
+                PathBuf::from(value)
+            } else {
+                home.ok_or_else(|| format!("{xdg} and HOME are unset"))?
+                    .join(fallback)
+            };
+            Ok(root.join("lantern"))
+        }
+        Ok(Self {
+            config: path(
+                env,
+                home.as_deref(),
+                "LANTERN_CONFIG_DIR",
+                "XDG_CONFIG_HOME",
+                ".config",
+            )?,
+            state: path(
+                env,
+                home.as_deref(),
+                "LANTERN_STATE_DIR",
+                "XDG_STATE_HOME",
+                ".local/state",
+            )?,
+            data: path(
+                env,
+                home.as_deref(),
+                "LANTERN_DATA_DIR",
+                "XDG_DATA_HOME",
+                ".local/share",
+            )?,
+        })
+    }
+}
 /// A nonfatal settings warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {
@@ -313,6 +367,10 @@ pub fn edit_setting(src: &str, path: &str, value: toml_edit::Value) -> Result<St
             return Err("empty setting path component".into());
         }
         if parts.peek().is_none() {
+            let mut value = value;
+            if let Some(old) = table.get(part).and_then(toml_edit::Item::as_value) {
+                *value.decor_mut() = old.decor().clone();
+            }
             table.insert(part, toml_edit::Item::Value(value));
             return Ok(doc.to_string());
         }
@@ -379,6 +437,16 @@ mod tests {
         assert_eq!(x.warnings[0].path, "clients.unknown");
     }
     #[test]
+    fn resolves_xdg_and_lantern_directories() {
+        let mut env = BTreeMap::new();
+        env.insert("HOME".into(), "/home/test".into());
+        env.insert("LANTERN_STATE_DIR".into(), "/tmp/lantern-state".into());
+        let dirs = Dirs::from_env(&env).unwrap();
+        assert_eq!(dirs.config, PathBuf::from("/home/test/.config/lantern"));
+        assert_eq!(dirs.state, PathBuf::from("/tmp/lantern-state"));
+        assert_eq!(dirs.data, PathBuf::from("/home/test/.local/share/lantern"));
+    }
+    #[test]
     fn edit_keeps_comments() {
         let s = edit_setting(
             "# comment\n[daemon]\nport = 4777 # keep\n",
@@ -388,5 +456,6 @@ mod tests {
         .unwrap();
         assert!(s.contains("# comment"));
         assert!(s.contains("5000"));
+        assert!(s.contains("# keep"));
     }
 }

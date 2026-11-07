@@ -161,52 +161,50 @@ impl TemplateString {
                 i += 3;
                 continue;
             }
-            if tail.starts_with("${") {
-                if let Some(end) = tail.find('}') {
-                    let name = &tail[2..end];
-                    if let Some(var) = TemplateVar::parse(name) {
-                        if !literal.is_empty() {
-                            segments.push(Segment::Lit(std::mem::take(&mut literal)));
-                        }
-                        segments.push(Segment::Var(var));
-                        if name == "NAME" || name == "PATH" {
-                            lints.push(TemplateLint { code: "deprecated_var".into(), name: name.into(), offset: i, message: if name == "PATH" { "${PATH} means the checkout directory, not the shell PATH; use ${CHECKOUT} (or $PATH for the shell path)".into() } else { "${NAME} is deprecated; use ${PROJECT}".into() } });
-                        }
-                        if single {
-                            lints.push(TemplateLint {
-                                code: "var_in_single_quotes".into(),
-                                name: name.into(),
-                                offset: i,
-                                message: format!("${{{name}}} will not expand inside shell single quotes"),
-                            });
-                        }
-                    } else {
-                        literal.push_str(&tail[..=end]);
-                        if !declared.contains(name)
-                            && !name.is_empty()
-                            && name
-                                .bytes()
-                                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-                        {
-                            if let Some(near) = NAMES
-                                .iter()
-                                .min_by_key(|candidate| distance(name, candidate))
-                                .filter(|candidate| distance(name, candidate) <= 2)
-                            {
-                                lints.push(TemplateLint {
-                                    code: "possible_var_typo".into(),
-                                    name: name.into(),
-                                    offset: i,
-                                    message: format!(
-                                        "${{{name}}} passes through unchanged; did you mean ${{{near}}}?"
-                                    ),
-                                });
-                            }
-                        }
+            if tail.starts_with("${")
+                && let Some(end) = tail.find('}')
+            {
+                let name = &tail[2..end];
+                if let Some(var) = TemplateVar::parse(name) {
+                    if !literal.is_empty() {
+                        segments.push(Segment::Lit(std::mem::take(&mut literal)));
                     }
-                    i += end + 1;
-                    continue;
+                    segments.push(Segment::Var(var));
+                    if name == "NAME" || name == "PATH" {
+                        lints.push(TemplateLint { code: "deprecated_var".into(), name: name.into(), offset: i, message: if name == "PATH" { "${PATH} means the checkout directory, not the shell PATH; use ${CHECKOUT} (or $PATH for the shell path)".into() } else { "${NAME} is deprecated; use ${PROJECT}".into() } });
+                    }
+                    if single {
+                        lints.push(TemplateLint {
+                            code: "var_in_single_quotes".into(),
+                            name: name.into(),
+                            offset: i,
+                            message: format!("${{{name}}} will not expand inside shell single quotes"),
+                        });
+                    }
+                } else {
+                    literal.push_str(&tail[..=end]);
+                    if !declared.contains(name)
+                        && !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                        && let Some(near) = NAMES
+                            .iter()
+                            .min_by_key(|candidate| distance(name, candidate))
+                            .filter(|candidate| distance(name, candidate) <= 2)
+                    {
+                        lints.push(TemplateLint {
+                            code: "possible_var_typo".into(),
+                            name: name.into(),
+                            offset: i,
+                            message: format!(
+                                "${{{name}}} passes through unchanged; did you mean ${{{near}}}?"
+                            ),
+                        });
+                    }
                 }
+                i += end + 1;
+                continue;
             }
             let ch = tail.chars().next().expect("nonempty");
             literal.push(ch);

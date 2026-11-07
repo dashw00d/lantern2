@@ -12,6 +12,7 @@ use raw::*;
 use serde::{Deserialize, Serialize, de::IntoDeserializer};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 
@@ -210,23 +211,24 @@ fn inspect_keys(
                 } else {
                     format!("{parent}.{}", k.value)
                 };
-                if let Some(known) = fields(parent) {
-                    if !known.contains(&k.value.as_str()) && !k.value.starts_with("x-") {
-                        let hint = known
-                            .iter()
-                            .min_by_key(|n| edit_distance(&k.value, n))
-                            .filter(|n| edit_distance(&k.value, n) <= 2)
-                            .map(|n| format!("; did you mean `{n}`?"))
-                            .unwrap_or_default();
-                        ds.push(diagnostic(
-                            Severity::Warning,
-                            "unknown_key",
-                            &p,
-                            format!("unknown key (ignored){hint}"),
-                            file,
-                            keys,
-                        ));
-                    }
+                if let Some(known) = fields(parent)
+                    && !known.contains(&k.value.as_str())
+                    && !k.value.starts_with("x-")
+                {
+                    let hint = known
+                        .iter()
+                        .min_by_key(|n| edit_distance(&k.value, n))
+                        .filter(|n| edit_distance(&k.value, n) <= 2)
+                        .map(|n| format!("; did you mean `{n}`?"))
+                        .unwrap_or_default();
+                    ds.push(diagnostic(
+                        Severity::Warning,
+                        "unknown_key",
+                        &p,
+                        format!("unknown key (ignored){hint}"),
+                        file,
+                        keys,
+                    ));
                 }
                 inspect_keys(v, &p, keys, file, ds);
             }
@@ -252,6 +254,23 @@ fn bad_rel(s: &str, allow_root_slash: bool) -> bool {
         )
     }) || s.split('/').any(|p| p == ".git")
 }
+fn bad_checkout_path(s: &str) -> bool {
+    let mut depth = 0usize;
+    for component in Path::new(s).components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) => return true,
+            Component::ParentDir => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+        }
+    }
+    false
+}
 fn valid_env_key(s: &str) -> bool {
     let mut c = s.chars();
     c.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -268,17 +287,16 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
             "only version 1 is supported".into(),
         );
     }
-    if let Some(id) = &raw.id {
-        if let Ok(normal) = ProjectId::from_name(id) {
-            if normal.as_str() != id {
-                add(
-                    Severity::Warning,
-                    "id_normalized",
-                    "id",
-                    format!("id normalized to {normal}"),
-                );
-            }
-        }
+    if let Some(id) = &raw.id
+        && let Ok(normal) = ProjectId::from_name(id)
+        && normal.as_str() != id
+    {
+        add(
+            Severity::Warning,
+            "id_normalized",
+            "id",
+            format!("id normalized to {normal}"),
+        );
     }
     for (path, value, valid) in [
         (
@@ -292,15 +310,15 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
             &["proxy", "php", "static", "unknown"][..],
         ),
     ] {
-        if let Some(v) = value {
-            if !valid.contains(&v) {
-                add(
-                    Severity::Warning,
-                    "unknown_value",
-                    path,
-                    format!("unknown value {v:?}; using default"),
-                );
-            }
+        if let Some(v) = value
+            && !valid.contains(&v)
+        {
+            add(
+                Severity::Warning,
+                "unknown_value",
+                path,
+                format!("unknown value {v:?}; using default"),
+            );
         }
     }
     for (path, value) in [
@@ -311,15 +329,15 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
             raw.deploy.as_ref().and_then(|x| x.env_file.as_deref()),
         ),
     ] {
-        if let Some(v) = value {
-            if bad_rel(v, false) {
-                add(
-                    Severity::Error,
-                    "bad_path",
-                    path,
-                    "path must stay inside the checkout".into(),
-                );
-            }
+        if let Some(v) = value
+            && bad_checkout_path(v)
+        {
+            add(
+                Severity::Error,
+                "bad_path",
+                path,
+                "path must stay inside the checkout".into(),
+            );
         }
     }
     if let Some(docs) = &raw.docs {
@@ -338,16 +356,15 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
         ("upstream_url", raw.upstream_url.as_deref()),
         ("base_url", raw.base_url.as_deref()),
     ] {
-        if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
-            if !url::Url::parse(v).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
-            {
-                add(
-                    Severity::Error,
-                    "bad_value",
-                    path,
-                    "expected an HTTP(S) URL".into(),
-                );
-            }
+        if let Some(v) = value.filter(|v| !v.trim().is_empty())
+            && !url::Url::parse(v).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
+        {
+            add(
+                Severity::Error,
+                "bad_value",
+                path,
+                "expected an HTTP(S) URL".into(),
+            );
         }
     }
     if raw
@@ -362,8 +379,8 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
             "expected a path beginning with /".into(),
         );
     }
-    if let Some(domain) = &raw.domain {
-        if domain.is_empty()
+    if let Some(domain) = &raw.domain
+        && (domain.is_empty()
             || domain.len() > 253
             || domain.split('.').any(|s| {
                 s.is_empty()
@@ -371,15 +388,14 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
                     || s.starts_with('-')
                     || s.ends_with('-')
                     || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            })
-        {
-            add(
-                Severity::Error,
-                "bad_value",
-                "domain",
-                "expected a hostname".into(),
-            );
-        }
+            }))
+    {
+        add(
+            Severity::Error,
+            "bad_value",
+            "domain",
+            "expected a hostname".into(),
+        );
     }
     if let Some(w) = &raw.worktree {
         for (key, list) in [("copy", &w.copy), ("link", &w.link)] {
@@ -542,11 +558,11 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
             }
         }
     }
-    if let Some(w) = &raw.worktree {
-        if let Some(env) = &w.env {
-            for (k, v) in env {
-                templates.push((format!("worktree.env.{k}"), v, false));
-            }
+    if let Some(w) = &raw.worktree
+        && let Some(env) = &w.env
+    {
+        for (k, v) in env {
+            templates.push((format!("worktree.env.{k}"), v, false));
         }
     }
     if let Some(setup) = &raw.setup {
@@ -586,24 +602,20 @@ fn sem_validate(raw: &RawManifest, file: &Path, pos: &BTreeMap<String, Position>
     if raw.serve.as_deref() == Some("proxy")
         && raw.upstream_url.is_none()
         && raw.deploy.as_ref().and_then(|d| d.start.as_ref()).is_none()
+        && let Some(run) = &raw.run
+        && let Some(cmd) = &run.cmd
+        && !TemplateString::parse(cmd).0.mentions("PORT")
+        && !run
+            .env
+            .as_ref()
+            .is_some_and(|env| env.values().any(|v| TemplateString::parse(v).0.mentions("PORT")))
     {
-        if let Some(run) = &raw.run {
-            if let Some(cmd) = &run.cmd {
-                if !TemplateString::parse(cmd).0.mentions("PORT")
-                    && !run
-                        .env
-                        .as_ref()
-                        .is_some_and(|env| env.values().any(|v| TemplateString::parse(v).0.mentions("PORT")))
-                {
-                    add(
-                        Severity::Warning,
-                        "port_not_referenced",
-                        "run.cmd",
-                        "command does not reference the assigned port".into(),
-                    );
-                }
-            }
-        }
+        add(
+            Severity::Warning,
+            "port_not_referenced",
+            "run.cmd",
+            "command does not reference the assigned port".into(),
+        );
     }
 }
 
@@ -710,7 +722,28 @@ pub fn load(dir: &Path) -> std::io::Result<Option<ParsedManifest>> {
     let Some(path) = find_manifest(dir) else {
         return Ok(None);
     };
-    let bytes = std::fs::read(&path)?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)?
+        .take((yaml::MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > yaml::MAX_BYTES {
+        return Ok(Some(ParsedManifest {
+            raw: RawManifest::default(),
+            usable: false,
+            file: path.clone(),
+            diagnostics: vec![Diagnostic {
+                severity: Severity::Error,
+                code: "file_too_large".into(),
+                path: String::new(),
+                file: path,
+                line: None,
+                column: None,
+                message: "YAML exceeds 1 MiB".into(),
+                expected: None,
+                help: None,
+            }],
+        }));
+    }
     let mut parsed = match std::str::from_utf8(&bytes) {
         Ok(src) => parse_manifest(src, &path),
         Err(_) => ParsedManifest {
@@ -784,6 +817,63 @@ pub struct DeploySpec {
     pub status: Option<TemplateString>,
     pub env_file: Option<String>,
 }
+/// Effective project feature switches.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Features {
+    pub mailpit: bool,
+    pub auto_start: bool,
+    pub auto_open_browser: bool,
+}
+/// Effective routing and agent metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Routing {
+    pub aliases: Vec<String>,
+    pub paths: BTreeMap<String, String>,
+    pub websocket: bool,
+    pub triggers: Vec<String>,
+    pub risk: Option<String>,
+    pub requires_confirmation: bool,
+    pub max_concurrent: u32,
+    pub agents: Vec<String>,
+}
+/// A resolved document reference and its inferred kind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocRef {
+    pub path: String,
+    pub kind: String,
+}
+/// A resolved endpoint with a normalized method.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Endpoint {
+    pub method: String,
+    pub path: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub risk: Option<String>,
+    pub body_hint: Option<serde_json::Value>,
+    pub params: Option<serde_json::Value>,
+}
+fn inferred_doc_kind(path: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    if name.starts_with("readme") {
+        "readme"
+    } else if name.starts_with("changelog") {
+        "changelog"
+    } else if name.starts_with("contributing") {
+        "contributing"
+    } else if name.ends_with(".md") {
+        "markdown"
+    } else if name.ends_with(".txt") {
+        "text"
+    } else {
+        "unknown"
+    }
+    .to_string()
+}
 /// An executable template together with whether it is built in.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TemplateDefinition {
@@ -825,10 +915,10 @@ pub struct ResolvedManifest {
     pub worktree: WorktreeSpec,
     pub deploy: DeploySpec,
     pub depends_on: Vec<String>,
-    pub features: FeaturesSection,
-    pub routing: RoutingSection,
-    pub docs: Vec<DocEntry>,
-    pub endpoints: Vec<EndpointEntry>,
+    pub features: Features,
+    pub routing: Routing,
+    pub docs: Vec<DocRef>,
+    pub endpoints: Vec<Endpoint>,
     pub docs_auto: Option<DocsAuto>,
     pub api_auto: Option<ApiAuto>,
     pub provenance: Provenance,
@@ -843,9 +933,8 @@ pub struct ResolveInput<'a> {
     pub checkout: Option<&'a ParsedManifest>,
     pub overrides: &'a RawManifest,
     pub templates: &'a dyn TemplateLookup,
-    pub detection: &'a dyn DetectionInfo,
-    pub tld: &'a str,
-    pub default_template: &'a str,
+    pub detection: &'a crate::detect::Detection,
+    pub settings: &'a crate::settings::Settings,
 }
 impl std::fmt::Debug for ResolveInput<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -869,14 +958,29 @@ fn sparse(raw: &RawManifest) -> serde_json::Value {
     v
 }
 fn merge(base: &mut serde_json::Value, incoming: serde_json::Value) {
-    match (base, incoming) {
-        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
-            for (k, v) in b {
-                merge(a.entry(k).or_insert(serde_json::Value::Null), v);
+    fn inner(base: &mut serde_json::Value, incoming: serde_json::Value, path: &str) {
+        let merge_map = path.is_empty()
+            || (!path.contains('.')
+                && matches!(
+                    path,
+                    "run" | "worktree" | "deploy" | "features" | "routing" | "docs_auto" | "api_auto"
+                ))
+            || matches!(path, "run.env" | "worktree.env");
+        match (base, incoming) {
+            (serde_json::Value::Object(a), serde_json::Value::Object(b)) if merge_map => {
+                for (key, value) in b {
+                    let next = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    inner(a.entry(key).or_insert(serde_json::Value::Null), value, &next);
+                }
             }
+            (slot, value) => *slot = value,
         }
-        (a, b) => *a = b,
     }
+    inner(base, incoming, "");
 }
 fn has_way(raw: &RawManifest) -> bool {
     raw.run
@@ -907,11 +1011,11 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
         provenance.files.push(primary.file.clone());
         diagnostics.extend(primary.diagnostics.clone());
     }
-    if !input.is_primary {
-        if let Some(checkout) = input.checkout {
-            provenance.files.push(checkout.file.clone());
-            diagnostics.extend(checkout.diagnostics.clone());
-        }
+    if !input.is_primary
+        && let Some(checkout) = input.checkout
+    {
+        provenance.files.push(checkout.file.clone());
+        diagnostics.extend(checkout.diagnostics.clone());
     }
     let selected = if input.is_primary {
         input.primary
@@ -931,11 +1035,13 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
         "repo_url",
         "domain",
     ];
-    if !input.is_primary && input.checkout.is_some() {
+    if !input.is_primary
+        && let Some(checkout) = input.checkout
+    {
         if let Some(obj) = source.as_object_mut() {
             for key in identity {
                 if obj.remove(key).is_some() {
-                    let p = input.checkout.expect("checked");
+                    let p = checkout;
                     diagnostics.push(Diagnostic {
                         severity: Severity::Info,
                         code: "identity_key_ignored".into(),
@@ -968,35 +1074,18 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
     let explicit = high.template.as_deref();
     let desired = explicit.or_else(|| {
         if !has_way(&high) {
-            input
-                .detection
-                .template_name()
-                .or_else(|| (!input.default_template.is_empty()).then_some(input.default_template))
+            input.detection.template_name().or_else(|| {
+                (!input.settings.templates.default.is_empty())
+                    .then_some(input.settings.templates.default.as_str())
+            })
         } else {
-            None
+            (!input.settings.templates.default.is_empty())
+                .then_some(input.settings.templates.default.as_str())
         }
     });
     let mut template = None;
     if let Some(name) = desired {
-        if let Some(mut def) = input.templates.get(name) {
-            def.manifest.id = None;
-            def.manifest.name = None;
-            def.manifest.description = None;
-            def.manifest.domain = None;
-            def.manifest.repo_url = None;
-            def.manifest.enabled = None;
-            if def.builtin {
-                if name == "php" && input.detection.framework_name() == "php" {
-                    if let Some(root) = input.detection.php_root() {
-                        def.manifest.root = Some(root.to_string());
-                    }
-                }
-                if let Some(run) = &mut def.manifest.run {
-                    if let Some(cmd) = &mut run.cmd {
-                        *cmd = input.detection.rewrite_builtin(cmd);
-                    }
-                }
-            }
+        if let Some(def) = input.templates.get(name) {
             template = Some((name.to_string(), def));
         } else {
             diagnostics.push(Diagnostic {
@@ -1010,10 +1099,31 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
                 expected: None,
                 help: None,
             });
-            if explicit.is_some() {
-                if let Some(fallback) = input.detection.template_name() {
-                    template = input.templates.get(fallback).map(|d| (fallback.to_string(), d));
-                }
+            if explicit.is_some()
+                && let Some(fallback) = input.detection.template_name()
+            {
+                template = input.templates.get(fallback).map(|d| (fallback.to_string(), d));
+            }
+        }
+    }
+    if let Some((name, def)) = &mut template {
+        def.manifest.id = None;
+        def.manifest.name = None;
+        def.manifest.description = None;
+        def.manifest.domain = None;
+        def.manifest.repo_url = None;
+        def.manifest.enabled = None;
+        if def.builtin {
+            if name == "php"
+                && input.detection.framework_name() == "php"
+                && let Some(root) = input.detection.php_root()
+            {
+                def.manifest.root = Some(root.to_owned());
+            }
+            if let Some(run) = &mut def.manifest.run
+                && let Some(cmd) = &mut run.cmd
+            {
+                *cmd = input.detection.rewrite_builtin(cmd);
             }
         }
     }
@@ -1046,6 +1156,21 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
     }
     merge(&mut merged, overrides);
     let mut raw: RawManifest = serde_json::from_value(merged).unwrap_or_default();
+    // Overrides and template layers also need semantic validation. Preserve more specific
+    // file diagnostics already emitted by the parser when a code and path match.
+    let mut effective_diagnostics = Vec::new();
+    let source_file = selected
+        .map(|p| p.file.as_path())
+        .unwrap_or_else(|| Path::new(""));
+    sem_validate(&raw, source_file, &BTreeMap::new(), &mut effective_diagnostics);
+    for diagnostic in effective_diagnostics {
+        if !diagnostics
+            .iter()
+            .any(|old| old.code == diagnostic.code && old.path == diagnostic.path)
+        {
+            diagnostics.push(diagnostic);
+        }
+    }
     let requested_id = raw.id.as_deref().unwrap_or(input.dir_name);
     if let Err(err) = ProjectId::from_name(requested_id) {
         diagnostics.push(Diagnostic {
@@ -1094,47 +1219,122 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
         if d.contains('.') {
             d
         } else {
-            format!("{}.{}", d, input.tld.trim_start_matches('.'))
+            format!(
+                "{}.{}",
+                d,
+                input.settings.domains.tld.as_str().trim_start_matches('.')
+            )
         }
     });
-    if let Some(d) = &domain {
-        if !d.ends_with(&format!(".{}", input.tld.trim_start_matches('.'))) {
-            diagnostics.push(Diagnostic {
-                severity: Severity::Warning,
-                code: "domain_outside_tld".into(),
-                path: "domain".into(),
-                file: selected.map(|p| p.file.clone()).unwrap_or_default(),
-                line: None,
-                column: None,
-                message: "domain is outside the configured TLD".into(),
-                expected: None,
-                help: None,
-            });
-        }
+    if let Some(d) = &domain
+        && !d.ends_with(&format!(
+            ".{}",
+            input.settings.domains.tld.as_str().trim_start_matches('.')
+        ))
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            code: "domain_outside_tld".into(),
+            path: "domain".into(),
+            file: selected.map(|p| p.file.clone()).unwrap_or_default(),
+            line: None,
+            column: None,
+            message: "domain is outside the configured TLD".into(),
+            expected: None,
+            help: None,
+        });
     }
     let root = raw.root.take().or_else(|| match serve {
         ServeMode::Php => Some("public".into()),
         ServeMode::Static => Some(".".into()),
         _ => None,
     });
-    if let Some(r) = &mut raw.routing {
-        if r.risk
-            .as_deref()
-            .is_some_and(|r| !["low", "medium", "high"].contains(&r))
-        {
-            r.risk = None;
-        }
-    }
-    let mut endpoints = raw.endpoints.take().unwrap_or_default();
-    for e in &mut endpoints {
-        e.method = Some(e.method.as_deref().unwrap_or("GET").to_ascii_uppercase());
-        if e.risk
-            .as_deref()
-            .is_some_and(|r| !["low", "medium", "high"].contains(&r))
-        {
-            e.risk = None;
-        }
-    }
+    let features = raw.features.take().unwrap_or_default();
+    let features = Features {
+        mailpit: features.mailpit.unwrap_or(false),
+        auto_start: features.auto_start.unwrap_or(false),
+        auto_open_browser: features.auto_open_browser.unwrap_or(false),
+    };
+    let routing = raw.routing.take().unwrap_or_default();
+    let routing = Routing {
+        aliases: routing.aliases.unwrap_or_default(),
+        paths: routing.paths.unwrap_or_default(),
+        websocket: routing.websocket.unwrap_or(false),
+        triggers: routing.triggers.unwrap_or_default(),
+        risk: routing
+            .risk
+            .filter(|r| ["low", "medium", "high"].contains(&r.as_str())),
+        requires_confirmation: routing.requires_confirmation.unwrap_or(false),
+        max_concurrent: routing.max_concurrent.unwrap_or(1),
+        agents: routing.agents.unwrap_or_default(),
+    };
+    let docs = raw
+        .docs
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| {
+            let (path, kind) = match d {
+                DocEntry::Path(path) => (path, None),
+                DocEntry::Full { path, kind } => (path, kind),
+            };
+            let kind = kind.unwrap_or_else(|| inferred_doc_kind(&path));
+            DocRef { path, kind }
+        })
+        .collect();
+    let endpoints = raw
+        .endpoints
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| Endpoint {
+            method: e.method.as_deref().unwrap_or("GET").to_ascii_uppercase(),
+            path: e.path,
+            description: e.description,
+            category: e.category,
+            risk: e.risk.filter(|r| ["low", "medium", "high"].contains(&r.as_str())),
+            body_hint: e.body_hint,
+            params: e.params,
+        })
+        .collect();
+    let docs_auto = raw.docs_auto.take().map(|mut d| {
+        d.enabled.get_or_insert(true);
+        d.patterns.get_or_insert_with(|| {
+            [
+                "README.md",
+                "CHANGELOG.md",
+                "AGENTS.md",
+                "CLAUDE.md",
+                "BRAIN.md",
+                "SKILL.md",
+                "docs/**/*.md",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        });
+        d.ignore.get_or_insert_with(|| {
+            [".git/**", "node_modules/**", "deps/**", "_build/**"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        });
+        d.max_files.get_or_insert(100);
+        d.max_bytes.get_or_insert(1_048_576);
+        d
+    });
+    let api_auto = raw.api_auto.take().map(|mut a| {
+        a.enabled.get_or_insert(true);
+        a.candidates.get_or_insert_with(|| {
+            ["/openapi.json", "/swagger.json", "/docs/openapi.json"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        });
+        a.timeout_ms.get_or_insert(2500);
+        a.max_endpoints.get_or_insert(400);
+        a
+    });
     let usable = !diagnostics.iter().any(|d| d.severity == Severity::Error);
     ResolvedManifest {
         name: raw.name.take().unwrap_or_else(|| id.to_string()),
@@ -1170,12 +1370,12 @@ pub fn resolve(input: ResolveInput<'_>) -> ResolvedManifest {
             env_file: dep.env_file,
         },
         depends_on: raw.depends_on.unwrap_or_default(),
-        features: raw.features.unwrap_or_default(),
-        routing: raw.routing.unwrap_or_default(),
-        docs: raw.docs.unwrap_or_default(),
+        features,
+        routing,
+        docs,
         endpoints,
-        docs_auto: raw.docs_auto,
-        api_auto: raw.api_auto,
+        docs_auto,
+        api_auto,
         provenance,
         diagnostics,
         usable,
@@ -1191,6 +1391,7 @@ mod tests {
             None
         }
     }
+    #[allow(dead_code)]
     struct NoDetection;
     impl DetectionInfo for NoDetection {
         fn framework_name(&self) -> &str {
@@ -1249,16 +1450,86 @@ mod tests {
             checkout: Some(&checkout),
             overrides: &overrides,
             templates: &NoTemplates,
-            detection: &NoDetection,
-            tld: "glow",
-            default_template: "",
+            detection: &crate::detect::Detection::default(),
+            settings: &crate::settings::Settings::default(),
         });
         assert_eq!(r.id.as_str(), "app");
         assert_eq!(r.name, "Primary");
         assert_eq!(r.run.cmd.unwrap().source(), "branch");
-        assert!(r.run.env.get("A").is_none());
+        assert!(!r.run.env.contains_key("A"));
         assert_eq!(r.setup, Some(vec![]));
         assert!(r.diagnostics.iter().any(|d| d.code == "identity_key_ignored"));
+    }
+    #[test]
+    fn layers_merge_env_and_replace_other_maps_and_validate_overrides() {
+        let parsed = parse_manifest(
+            "id: app\ntemplate: nextjs\nrun:\n  env: { A: lower, B: lower }\nrouting:\n  paths: { '/a': first, '/b': second }\ndocs: [README.md]\napi_auto: {}\n",
+            "lantern.yaml",
+        );
+        let overrides = parse_manifest(
+            "run:\n  env: { B: higher }\nrouting:\n  paths: { '/a': changed }\n",
+            "override.yaml",
+        )
+        .raw;
+        let detection = crate::detect::Detection {
+            package_manager: Some(crate::detect::PackageManager::Pnpm),
+            ..Default::default()
+        };
+        let settings = crate::settings::Settings::default();
+        let templates = crate::detect::Templates::default();
+        let resolved = resolve(ResolveInput {
+            dir_name: "app",
+            is_primary: true,
+            primary: Some(&parsed),
+            checkout: None,
+            overrides: &overrides,
+            templates: &templates,
+            detection: &detection,
+            settings: &settings,
+        });
+        assert!(resolved.usable, "{:?}", resolved.diagnostics);
+        assert!(
+            resolved
+                .run
+                .cmd
+                .as_ref()
+                .unwrap()
+                .source()
+                .starts_with("pnpm exec next")
+        );
+        assert_eq!(resolved.run.env["A"].source(), "lower");
+        assert_eq!(resolved.run.env["B"].source(), "higher");
+        assert_eq!(resolved.routing.paths.len(), 1);
+        assert_eq!(resolved.routing.paths["/a"], "changed");
+        assert_eq!(resolved.docs[0].kind, "readme");
+        assert_eq!(resolved.api_auto.unwrap().timeout_ms, Some(2500));
+        let bad = RawManifest {
+            setup: Some(vec!["  ".into()]),
+            ..Default::default()
+        };
+        let broken = resolve(ResolveInput {
+            dir_name: "app",
+            is_primary: true,
+            primary: Some(&parsed),
+            checkout: None,
+            overrides: &bad,
+            templates: &templates,
+            detection: &detection,
+            settings: &settings,
+        });
+        assert!(!broken.usable);
+        assert!(
+            broken
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "bad_value" && d.path == "setup[0]")
+        );
+    }
+    #[test]
+    fn v1_list_and_safe_relative_paths() {
+        let p = parse_manifest("tags: ['a,b', c]\nrun: { cwd: src/.. }\n", "lantern.yaml");
+        assert!(p.usable, "{:?}", p.diagnostics);
+        assert_eq!(p.raw.tags, Some(vec!["a,b".into(), "c".into()]));
     }
     #[test]
     fn worktree_paths_and_unknown_nested_keys() {

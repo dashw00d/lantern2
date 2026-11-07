@@ -132,11 +132,10 @@ fn detect_pm(
         .as_ref()
         .and_then(|v| v.get("packageManager"))
         .and_then(|v| v.as_str())
+        && let Some(pm) = manager_name(name)
     {
-        if let Some(pm) = manager_name(name) {
-            evidence.push(format!("package.json packageManager={name}"));
-            return Some(pm);
-        }
+        evidence.push(format!("package.json packageManager={name}"));
+        return Some(pm);
     }
     for p in paths {
         for (name, pm) in [
@@ -408,6 +407,133 @@ pub fn builtin_source(name: &str) -> Option<&'static str> {
 pub struct Templates {
     pub user: BTreeMap<String, manifest::raw::RawManifest>,
 }
+/// Validate a user template filename stem.
+pub fn valid_template_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 48
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+impl Templates {
+    /// Load user templates from a directory; valid user files shadow embedded templates.
+    pub fn load_dir(dir: &Path) -> std::io::Result<(Self, Vec<manifest::Diagnostic>)> {
+        use std::io::Read;
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Self::default(), vec![])),
+            Err(e) => return Err(e),
+        };
+        let mut paths = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "yaml" || e == "yml"))
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|p| {
+            (
+                p.file_stem().map(|s| s.to_os_string()),
+                p.extension().map(|e| if e == "yaml" { 0 } else { 1 }),
+            )
+        });
+        let mut result = Self::default();
+        let mut diagnostics = Vec::new();
+        for path in paths {
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            if !valid_template_name(name) {
+                diagnostics.push(template_diag(
+                    &path,
+                    "bad_value",
+                    "name",
+                    "invalid template filename",
+                    manifest::Severity::Error,
+                ));
+                continue;
+            }
+            if result.user.contains_key(name) {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            fs::File::open(&path)?
+                .take((crate::yaml::MAX_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > crate::yaml::MAX_BYTES {
+                diagnostics.push(template_diag(
+                    &path,
+                    "file_too_large",
+                    "",
+                    "template exceeds 1 MiB",
+                    manifest::Severity::Error,
+                ));
+                continue;
+            }
+            let src = match std::str::from_utf8(&bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    diagnostics.push(template_diag(
+                        &path,
+                        "not_utf8",
+                        "",
+                        "template is not UTF-8",
+                        manifest::Severity::Error,
+                    ));
+                    continue;
+                }
+            };
+            let mut parsed = manifest::parse_manifest(src, &path);
+            if parsed.raw.name.as_deref().is_some_and(|n| n != name) {
+                parsed.diagnostics.push(template_diag(
+                    &path,
+                    "bad_value",
+                    "name",
+                    "template name must match the filename",
+                    manifest::Severity::Error,
+                ));
+                parsed.usable = false;
+            }
+            for (key, present) in [
+                ("id", parsed.raw.id.is_some()),
+                ("domain", parsed.raw.domain.is_some()),
+                ("repo_url", parsed.raw.repo_url.is_some()),
+                ("enabled", parsed.raw.enabled.is_some()),
+            ] {
+                if present {
+                    parsed.diagnostics.push(template_diag(
+                        &path,
+                        "template_key_ignored",
+                        key,
+                        "identity key is ignored in templates",
+                        manifest::Severity::Warning,
+                    ));
+                }
+            }
+            diagnostics.extend(parsed.diagnostics);
+            if parsed.usable {
+                result.user.insert(name.to_owned(), parsed.raw);
+            }
+        }
+        Ok((result, diagnostics))
+    }
+}
+fn template_diag(
+    path: &Path,
+    code: &str,
+    key: &str,
+    message: &str,
+    severity: manifest::Severity,
+) -> manifest::Diagnostic {
+    manifest::Diagnostic {
+        severity,
+        code: code.into(),
+        path: key.into(),
+        file: path.into(),
+        line: None,
+        column: None,
+        message: message.into(),
+        expected: None,
+        help: None,
+    }
+}
 impl TemplateLookup for Templates {
     fn get(&self, name: &str) -> Option<TemplateDefinition> {
         if let Some(raw) = self.user.get(name) {
@@ -456,6 +582,23 @@ mod tests {
             d.rewrite_builtin("uvicorn app.main:app --port ${PORT}")
                 .starts_with("uv run uvicorn app:web")
         );
+    }
+    #[test]
+    fn user_templates_shadow_builtins() {
+        let dir = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/v1/templates"
+        ));
+        let (templates, diagnostics) = Templates::load_dir(dir).unwrap();
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == manifest::Severity::Error),
+            "{diagnostics:?}"
+        );
+        let next = templates.get("nextjs").unwrap();
+        assert!(!next.builtin);
+        assert!(next.manifest.run.unwrap().cmd.unwrap().contains("npx next"));
     }
     #[test]
     fn builtin_templates_parse() {

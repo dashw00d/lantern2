@@ -152,7 +152,10 @@ pub fn parse_to_tree(src: &str) -> Result<Spanned<Node>, Error> {
         let lower = message.to_lowercase();
         let code = if lower.contains("duplicate") {
             "duplicate_key"
-        } else if lower.contains("multiple document") || lower.contains("more than one document") {
+        } else if lower.contains("multiple document")
+            || lower.contains("multiple yaml document")
+            || lower.contains("more than one document")
+        {
             "multiple_documents"
         } else if lower.contains("budget") || lower.contains("limit") {
             "yaml_limits"
@@ -217,6 +220,15 @@ mod tests {
         let error = serde_saphyr::from_str::<Manifest>("run:\n  cmd: [one, two]\n").unwrap_err();
         let pos = error.location().unwrap();
         assert_eq!((pos.line(), pos.column()), (2, 8));
+    }
+    #[test]
+    fn empty_and_multiple_documents() {
+        assert!(matches!(
+            parse_to_tree("# only a comment\n").unwrap().value,
+            Node::Null
+        ));
+        let err = parse_to_tree("one: 1\n---\ntwo: 2\n").unwrap_err();
+        assert_eq!(err.code, "multiple_documents");
     }
     #[test]
     fn duplicate_keys_fail() {

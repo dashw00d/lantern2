@@ -15,6 +15,7 @@ use std::{
 /// Profile services, start targets and environment overlay.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Profile {
     pub description: Option<String>,
     pub services: Vec<String>,
@@ -23,18 +24,6 @@ pub struct Profile {
     pub env: BTreeMap<String, String>,
     pub port_range: Option<[u16; 2]>,
     pub stop_others: bool,
-}
-impl Default for Profile {
-    fn default() -> Self {
-        Self {
-            description: None,
-            services: vec![],
-            auto_start: vec![],
-            env: BTreeMap::new(),
-            port_range: None,
-            stop_others: false,
-        }
-    }
 }
 /// A parsed profile and diagnostics.
 #[derive(Debug, Clone, PartialEq)]
@@ -203,17 +192,17 @@ pub fn parse_profile(src: &str, file: impl AsRef<Path>) -> ParsedProfile {
             }
         }
     }
-    if let Some([start, end]) = profile.port_range {
-        if start < 1024 || start >= end || u32::from(end) - u32::from(start) + 1 < 16 {
-            diagnostics.push(diag(
-                Severity::Error,
-                "bad_value",
-                "port_range",
-                file,
-                position("port_range"),
-                "invalid port range",
-            ));
-        }
+    if let Some([start, end]) = profile.port_range
+        && (start < 1024 || start >= end || u32::from(end) - u32::from(start) + 1 < 16)
+    {
+        diagnostics.push(diag(
+            Severity::Error,
+            "bad_value",
+            "port_range",
+            file,
+            position("port_range"),
+            "invalid port range",
+        ));
     }
     let usable = !diagnostics.iter().any(|d| d.severity == Severity::Error);
     ParsedProfile {
@@ -239,6 +228,92 @@ pub fn builtin(name: &str) -> Option<Profile> {
     p.usable.then_some(p.profile)
 }
 
+/// User profiles shadow embedded profiles of the same name.
+#[derive(Debug, Clone, Default)]
+pub struct Profiles {
+    pub user: BTreeMap<String, Profile>,
+}
+impl Profiles {
+    /// Find a profile, preferring a user file.
+    pub fn get(&self, name: &str) -> Option<Profile> {
+        self.user.get(name).cloned().or_else(|| builtin(name))
+    }
+    /// Read profile files and return their diagnostics.
+    pub fn load_dir(dir: &Path) -> std::io::Result<(Self, Vec<Diagnostic>)> {
+        use std::io::Read;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Self::default(), vec![])),
+            Err(e) => return Err(e),
+        };
+        let mut paths = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "yaml" || e == "yml"))
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|p| {
+            (
+                p.file_stem().map(|s| s.to_os_string()),
+                p.extension().map(|e| if e == "yaml" { 0 } else { 1 }),
+            )
+        });
+        let mut result = Self::default();
+        let mut diagnostics = Vec::new();
+        for path in paths {
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            if !valid_name(name) {
+                diagnostics.push(diag(
+                    Severity::Error,
+                    "bad_value",
+                    "name",
+                    &path,
+                    None,
+                    "invalid profile filename",
+                ));
+                continue;
+            }
+            if result.user.contains_key(name) {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)?
+                .take((yaml::MAX_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > yaml::MAX_BYTES {
+                diagnostics.push(diag(
+                    Severity::Error,
+                    "file_too_large",
+                    "",
+                    &path,
+                    None,
+                    "profile exceeds 1 MiB",
+                ));
+                continue;
+            }
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    diagnostics.push(diag(
+                        Severity::Error,
+                        "not_utf8",
+                        "",
+                        &path,
+                        None,
+                        "profile is not UTF-8",
+                    ));
+                    continue;
+                }
+            };
+            let parsed = parse_profile(text, &path);
+            diagnostics.extend(parsed.diagnostics);
+            if parsed.usable {
+                result.user.insert(name.to_owned(), parsed.profile);
+            }
+        }
+        Ok((result, diagnostics))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +327,14 @@ mod tests {
         assert_eq!(d.auto_start, ["*"]);
         let p = parse_profile("auto_start_projects: [app]\n", "profile.yaml");
         assert_eq!(p.profile.auto_start, ["app"]);
+    }
+    #[test]
+    fn user_profiles_shadow_builtins() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/profiles"));
+        let (profiles, diagnostics) = Profiles::load_dir(dir).unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(profiles.get("light").unwrap().services, vec!["redis"]);
+        assert_eq!(profiles.get("demo").unwrap().port_range, Some([29900, 29999]));
     }
     #[test]
     fn reserved_and_typo() {
