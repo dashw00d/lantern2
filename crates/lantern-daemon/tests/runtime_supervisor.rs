@@ -1522,6 +1522,81 @@ print('\n'.join(rows))
 }
 
 #[tokio::test]
+async fn runtime_deploy_output_waits_briefly_for_journal_delivery() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("LANTERN_JOURNAL_DELAY_CHILD").is_some() {
+        let temp = Temp::new();
+        let store = Arc::new(Store::default());
+        let id = store.insert("delayed-output", &temp.0, "unused", &[]);
+        {
+            let mut all = store.instances.lock().unwrap();
+            Arc::make_mut(&mut all.get_mut(&id).unwrap().manifest)
+                .deploy
+                .status = Some(lantern_core::template::TemplateString::parse("echo delayed").0);
+        }
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = Arc::new(DeploySystemd {
+            fake: FakeSystemd::default(),
+            running,
+            verbs: Mutex::new(vec![]),
+        });
+        let rt = Runtime::with_scoped_journal(
+            config(&temp),
+            store,
+            Arc::new(FakeProbe(Mutex::new(ProbeMode::Waiting))),
+            backend,
+            OperationTracker::new(EventBus::new()),
+            lantern_daemon::runtime::RuntimeAdapters {
+                preparer: Arc::new(lantern_daemon::runtime::seams::NoopPreparer),
+                router: Arc::new(lantern_daemon::runtime::seams::UnavailableRouter),
+                services: Arc::new(lantern_daemon::runtime::seams::UnavailableServices),
+            },
+            true,
+        );
+        assert!(
+            rt.deploy_status(&id)
+                .await
+                .unwrap()
+                .output
+                .contains("delayed-output-line")
+        );
+        rt.shutdown_background();
+        return;
+    }
+    let temp = Temp::new();
+    let fake = temp.0.join("journalctl");
+    std::fs::write(
+        &fake,
+        r##"#!/usr/bin/python3
+import os, sys
+if '--output=cat' in sys.argv:
+    marker = os.environ['LANTERN_JOURNAL_DELAY_CHILD']
+    if os.path.exists(marker): print('delayed-output-line')
+    else: open(marker, 'w').close()
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime_deploy_output_waits_briefly_for_journal_delivery",
+            "--nocapture",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", temp.0.display()))
+        .env("LANTERN_JOURNAL_DELAY_CHILD", temp.0.join("first-read"))
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn runtime_captures_and_refreshes_shell_env_when_sources_change() {
     use std::os::unix::fs::PermissionsExt;
     let temp = Temp::new();

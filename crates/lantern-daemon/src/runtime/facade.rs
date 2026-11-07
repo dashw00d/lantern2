@@ -2403,26 +2403,29 @@ impl Runtime {
                 return Err(RuntimeError::Other(message));
             }
         };
-        let output = tokio::process::Command::new("journalctl")
-            .args([
-                "--user",
-                "--no-pager",
-                "--output=cat",
-                "--lines=1000",
-                "--user-unit",
-                &unit,
-            ])
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| RuntimeError::Other(e.to_string()))?;
-        if !output.status.success() {
-            return Err(RuntimeError::Other(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
+        // The unit can exit just before journald makes its last messages visible.
+        // Retry an empty exact-unit query briefly; silent commands remain valid.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let output = tokio::process::Command::new("journalctl")
+                .args(["--user", "--no-pager", "--output=cat", "--lines=1000"])
+                .arg(format!("_SYSTEMD_USER_SLICE={}", self.inner.config.names.slice))
+                .arg(format!("_SYSTEMD_USER_UNIT={unit}"))
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| RuntimeError::Other(e.to_string()))?;
+            if !output.status.success() {
+                return Err(RuntimeError::Other(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ));
+            }
+            if !output.stdout.is_empty() || Instant::now() >= deadline {
+                let bytes = &output.stdout[..output.stdout.len().min(1024 * 1024)];
+                return Ok((result, String::from_utf8_lossy(bytes).into_owned()));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let bytes = &output.stdout[..output.stdout.len().min(1024 * 1024)];
-        Ok((result, String::from_utf8_lossy(bytes).into_owned()))
     }
     /// Run configured deploy logs and return its bounded journal output.
     pub async fn deploy_logs(&self, id: &InstanceId) -> Result<String, RuntimeError> {
