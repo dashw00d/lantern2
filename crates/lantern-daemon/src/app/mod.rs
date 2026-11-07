@@ -2,3 +2,6 @@
 
 /// Bridges registry, checkout preparation, and runtime interfaces.
 pub mod adapters;
+
+/// Demand-driven listener discovery integration.
+pub mod discovery;
