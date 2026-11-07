@@ -62,6 +62,16 @@ impl LanternPaths {
         cache: PathBuf,
         fake_root: Option<PathBuf>,
     ) -> Result<Self, String> {
+        let fake_root = fake_root.or_else(|| {
+            std::env::var_os("LANTERN_FAKE_ROOT")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        });
+        if fake_root.as_ref().is_some_and(|p| {
+            p == Path::new("/") || std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+        }) {
+            return Err("fake root must not be / or a symlink".into());
+        }
         for path in [&dirs.config, &dirs.state, &dirs.data, &home, &cache]
             .into_iter()
             .chain(runtime.iter())
