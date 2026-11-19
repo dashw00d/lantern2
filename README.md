@@ -232,3 +232,7 @@ cd ui && npm run dev                    # control center with hot reload
 ## Regenerating the screenshots
 
 The images in `docs/screenshots/` are produced by [`scripts/screenshots/`](scripts/screenshots/): `demo.sh` starts an isolated daemon (own ports, config and `HOME` under `/tmp`) seeded with generic demo projects, `capture.mjs` takes the web and terminal screenshots with headless Chromium, and `gui.sh` captures the native GUI under Xvfb.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
