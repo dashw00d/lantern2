@@ -1,0 +1,13 @@
+{
+  "name": "lantern-screenshots",
+  "private": true,
+  "description": "Regenerates docs/screenshots from a seeded, isolated Lantern daemon (see demo.sh)",
+  "type": "module",
+  "scripts": {
+    "capture": "node capture.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.65.1",
+    "sharp": "^0.34.5"
+  }
+}
