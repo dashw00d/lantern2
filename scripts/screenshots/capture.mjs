@@ -62,13 +62,20 @@ for (const scheme of ['light', 'dark']) {
     await page.screenshot({ clip: { x: 0, y: 0, width: 1280, height: clipH }, fullPage: true }));
   if (scheme === 'light') {
     await page.setViewportSize({ width: 1280, height: 480 }); // a short window keeps the drawer on the newest lines
-    await page.getByRole('button', { name: 'Logs' }).nth(2).click(); // Mailer Worker's card (sorted by name)
+    await page.locator('article', { hasText: 'Mailer Worker' }).getByRole('button', { name: 'Logs', exact: true }).click();
     await page.getByText('cannot connect to Redis').first().waitFor();
     await page.waitForTimeout(500);
     assertClean('logs drawer', await page.evaluate(() => document.body.innerText));
     await save('logs.png', await page.screenshot());
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.reload();
+    await page.getByText('Storefront').first().waitFor();
+    await page.locator('article', { hasText: 'Storefront' }).getByRole('button', { name: /main/ }).click();
+    await page.getByText('Branches & worktrees').waitFor();
+    await page.waitForTimeout(400);
+    assertClean('branches modal', await page.evaluate(() => document.body.innerText));
+    await save('branches.png', await page.screenshot());
+    await page.getByRole('button', { name: 'Close' }).click();
     await page.getByRole('button', { name: 'Add tool' }).click();
     await page.getByText('marketing-site').first().waitFor();
     assertClean('add tool dialog', await page.evaluate(() => document.body.innerText));

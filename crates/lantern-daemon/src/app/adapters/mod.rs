@@ -244,6 +244,18 @@ impl InstanceStore for RegistryAdapter {
     fn set_setup_stale(&self, id: &InstanceId, stale: bool) -> Result<(), String> {
         RegistryAdapter::set_setup_stale(self, id, stale)
     }
+    fn set_checkout_git(
+        &self,
+        id: &InstanceId,
+        git_root: Option<std::path::PathBuf>,
+        branch: Option<String>,
+        head: Option<String>,
+        locked: Option<String>,
+    ) -> Result<(), String> {
+        self.registry
+            .set_checkout_git(id, git_root, branch, head, locked)
+            .map_err(|e| e.to_string())
+    }
     fn flush(&self) -> crate::instances::InstanceStoreFlushFuture<'_> {
         Box::pin(self.flush_registry())
     }

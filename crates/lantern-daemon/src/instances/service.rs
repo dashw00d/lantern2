@@ -422,6 +422,15 @@ impl InstanceService {
                     }
                 }
                 observed.insert(id.clone());
+                self.store
+                    .set_checkout_git(
+                        &id,
+                        Some(wt.path.clone()),
+                        wt.branch.clone(),
+                        wt.head.clone(),
+                        wt.locked.clone(),
+                    )
+                    .map_err(InstanceError::Adapter)?;
                 self.observations.lock().expect("observations lock").insert(
                     id,
                     CheckoutObservation {

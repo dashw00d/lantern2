@@ -70,7 +70,7 @@ listen = "127.0.0.1:15354"
 
 [workspaces]
 roots = ["$DEMO"]
-depth = 1
+depth = 2
 
 [ports]
 range_start = 38000
@@ -105,12 +105,17 @@ while True:
 EOF
   for d in storefront orders-api; do
     (cd "$DEMO/$d" && git init -q -b main && git add -A \
-      && git -c user.name=Demo -c user.email=demo@example.com commit -q -m "Initial commit" && git branch feature-checkout)
+      && git -c user.name=Demo -c user.email=demo@example.com commit -q -m "Initial commit" \
+      && git branch feature-checkout && git branch fix-cart)
   done
-  # A folder with no lantern.yaml, so the "Add tool" dialog has a suggestion to show.
-  mkdir -p "$DEMO/marketing-site"
+  (cd "$DEMO/storefront" && git worktree add -q "$DEMO/storefront-fix-cart" fix-cart)
+  # Folders with no lantern.yaml, so the "Add tool" dialog shows detected suggestions across ecosystems.
+  mkdir -p "$DEMO/marketing-site" "$DEMO/blog" "$DEMO/billing-api"
   echo '{ "name": "marketing-site", "private": true, "scripts": { "dev": "vite" }, "devDependencies": { "vite": "^6.0.0" } }' > "$DEMO/marketing-site/package.json"
   echo '<html></html>' > "$DEMO/marketing-site/index.html"
+  echo '{ "name": "blog", "private": true, "dependencies": { "astro": "^5.0.0" } }' > "$DEMO/blog/package.json"
+  printf 'module example.com/billing\n\ngo 1.24\n' > "$DEMO/billing-api/go.mod"
+  touch "$DEMO/billing-api/.air.toml"
   # A manifest with a deliberate mistake for `lantern manifest check`.
   printf 'id: demo\nrun:\n  cmd: [npm, run, dev]\n' > "$BROKEN/lantern.yaml"
 
@@ -121,6 +126,7 @@ EOF
   "$BIN" scan "$DEMO" > /dev/null
   "$BIN" --no-color on storefront orders-api docs-site admin-dashboard
   "$BIN" --no-color run storefront@feature-checkout
+  post /api/projects/storefront/sync
   "$BIN" on mailer-worker > /dev/null 2>&1 || true   # fails by design
   post /api/launchers '{"name":"Run API tests","cmd":"python3 run_tests.py","cwd":"'"$DEMO"'/orders-api"}'
   post /api/launchers '{"name":"Watch job queue","cmd":"python3 -u watch_jobs.py","cwd":"'"$DEMO"'/orders-api"}'

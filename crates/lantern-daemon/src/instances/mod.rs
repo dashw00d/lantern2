@@ -56,6 +56,17 @@ pub trait InstanceStore: Send + Sync {
     fn set_setup_stale(&self, _id: &InstanceId, _stale: bool) -> Result<(), String> {
         Ok(())
     }
+    /// Publish live git checkout metadata (git root, branch, head, lock) for an observed checkout.
+    fn set_checkout_git(
+        &self,
+        _id: &InstanceId,
+        _git_root: Option<PathBuf>,
+        _branch: Option<String>,
+        _head: Option<String>,
+        _locked: Option<String>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Persist pending instance mutations before an irreversible Git operation.
     fn flush(&self) -> InstanceStoreFlushFuture<'_> {
         Box::pin(async { Ok(()) })

@@ -501,6 +501,33 @@ impl RegistryHandle {
         s.publish_project(&project);
         Ok(())
     }
+    /// Update live git metadata on an instance checkout and publish if changed.
+    pub fn set_checkout_git(
+        &self,
+        id: &InstanceId,
+        git_root: Option<PathBuf>,
+        branch: Option<String>,
+        head: Option<String>,
+        locked: Option<String>,
+    ) -> Result<(), Error> {
+        let mut s = self.lock();
+        let Some(checkout) = s.checkouts.get_mut(id) else {
+            return Err(Error::InstanceNotFound(id.clone()));
+        };
+        if checkout.git_root != git_root
+            || checkout.branch != branch
+            || checkout.head != head
+            || checkout.locked != locked
+        {
+            checkout.git_root = git_root;
+            checkout.branch = branch;
+            checkout.head = head;
+            checkout.locked = locked;
+            s.publish_index();
+            s.publish_instance(id);
+        }
+        Ok(())
+    }
     /// Remove a non-primary instance and its lease without deleting any files.
     pub fn remove_instance(&self, id: &InstanceId) -> Result<(), Error> {
         if id.is_primary() {

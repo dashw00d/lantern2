@@ -175,15 +175,18 @@ export function ToolCard({
           </Button>
         ) : null}
         <div className="flex-1" />
-        <Button
-          variant="ghost"
-          size="sm"
-          title={hasGit ? 'Branches and worktrees' : 'Check for git repository & worktrees'}
-          onClick={() => actions.openBranches(project)}
-        >
-          <GitBranch className="h-4 w-4" />
-          {worktreeCount > 0 ? worktreeCount : hasGit ? 'Branches' : 'Git'}
-        </Button>
+        {hasGit ? (
+          <Button
+            variant="ghost"
+            size={worktreeCount > 0 ? 'sm' : 'icon'}
+            title="Branches & worktrees"
+            aria-label="Branches & worktrees"
+            onClick={() => actions.openBranches(project)}
+          >
+            <GitBranch className="h-4 w-4" />
+            {worktreeCount > 0 ? worktreeCount : null}
+          </Button>
+        ) : null}
         {primary && managed ? (
           <Button variant="ghost" size="sm" onClick={() => actions.logs(primary, project.name)}>
             <ScrollText className="h-4 w-4" />
