@@ -23,18 +23,19 @@ Lantern keeps one registry of your projects and runs each dev server as a superv
 ## Features
 
 **Run and supervise dev servers**
-- Describe a project in a `lantern.yaml` (command, port variable, health endpoint, environment). Lantern can also detect common setups and ships 13 built-in templates: Django, FastAPI, Flask, Laravel, Next.js, Nuxt, PHP, React Router, Remix, static sites, Symfony and Vite.
+- Describe a project in a `lantern.yaml` (command, port variable, health endpoint, environment). Lantern can also auto-detect projects (including inside monorepos) and ships 30 built-in templates: Angular, Astro, Django, Docker Compose, Docusaurus, Expo, FastAPI, Flask, Go, Gradio, Hugo, Laravel, MkDocs, Next.js, Node/Deno, Nuxt, PHP, Rails, React Router, Remix, Rust, static sites, Storybook, Streamlit, SvelteKit, Symfony, Vite, VitePress and Wrangler.
 - Each server runs as a transient **systemd user unit**, so it keeps running if the Lantern daemon restarts, is stopped as a whole process group, and writes to the user journal.
 - Sticky port leases from a configurable range (default 29000-29999), passed to your command as `${PORT}`.
 - Readiness and health checks, crash detection with backoff and retries, and a plain-language failure reason on the card and in `lantern ls`.
 - Saved **commands** (tests, seed scripts, queue workers) that you can run, stop and read logs for from the control center.
 
 **Branches and worktrees**
-- `lantern run myapp@feature-x` reuses or creates a git worktree for the branch, prepares it (copy `.env` files, link folders, run `setup:` commands), and starts it on its own port and name.
-- Monorepos are supported: a project can live in a subdirectory of a repo.
+- `lantern run myapp@feature-x` — or the control center's **Branches & worktrees** modal — reuses or creates a git worktree for any branch, prepares it (copy `.env` files, link folders, run `setup:` commands), and starts it on its own port and URL.
+- Inspect every primary, user-created and Lantern-managed worktree, pin branches onto cards, sync git state, and safely remove managed worktrees with dirty/unpushed preflight checks.
+- Monorepos are supported: projects can live in subdirectories of a git repo and are detected during workspace scans.
 
 **See everything that is listening**
-- Lantern reads the kernel's listening sockets, maps each one to a process and working directory, and matches it to a project and branch. A `pnpm dev` you started by hand shows up as an *external* instance.
+- Lantern reads the kernel's listening sockets, maps each one to a process and working directory, and matches it to a project and branch. A `pnpm dev` you started by hand shows up as an *external* instance that you can adopt onto its `.glow` domain, or add unmatched folders straight from the control center.
 
 **Built for AI agents (MCP)**
 - A built-in [MCP](https://modelcontextprotocol.io) server at `/mcp` (stateless streamable HTTP) with 22 tools: `list_projects`, `start_project`, `stop_project`, `restart_project`, `get_project_logs`, `list_instances`, `start_branch`, `list_listeners`, `setup_project`, `call_tool_api` and more.
@@ -42,14 +43,18 @@ Lantern keeps one registry of your projects and runs each dev server as a superv
 - Agents can read a project's docs and API endpoints (including OpenAPI) through the same server.
 
 **Clients**
-- A web **control center** served by the daemon (React, embedded in the binary).
+- A web **control center** served by the daemon (React, embedded in the binary) with project/worktree removal, branch management, custom commands, suggestion dismissal, and live `*.glow` HTTPS diagnostics.
 - A full-featured **CLI** with `--json` output, shell completions and an NDJSON event stream.
 - A native **GUI** (`lantern gui`) with a tray icon, and a Tauri 2 desktop window in [`desktop/`](desktop/).
 
 **Optional named HTTPS URLs**
-- With Caddy and a one-time `lantern init`, projects also get `https://<name>.glow` URLs (and `https://<branch>.<name>.glow` for branches) from a local, name-constrained certificate authority. See [Named HTTPS URLs](#named-https-urls-optional).
+- With Caddy and a one-time `lantern init`, projects get `https://<name>.glow` URLs (and `https://<branch>.<name>.glow` for branches) from a local, name-constrained certificate authority. Once active, the control center shows a green `*.glow` badge and **Open** buttons automatically use the named HTTPS URLs. See [Named HTTPS URLs](#named-https-urls-optional).
 
 ## Screenshots
+
+### Branches and worktrees
+
+![Lantern Branches & worktrees modal for Storefront showing primary main, a running managed feature-checkout worktree, a stopped user worktree fix-cart, and a Run branch launcher](docs/screenshots/branches.png)
 
 ### Logs and failure reasons
 
@@ -57,7 +62,7 @@ Lantern keeps one registry of your projects and runs each dev server as a superv
 
 ### Add a project
 
-![Lantern "Add a tool" dialog offering a detected Vite project found in the workspace folders](docs/screenshots/add-tool.png)
+![Lantern "Add a tool" dialog offering detected Go, Astro and Vite projects found in workspace folders with dismiss buttons and an optional custom command](docs/screenshots/add-tool.png)
 
 ### The `lantern` CLI
 
@@ -111,9 +116,9 @@ lantern logs -f my-app # follow the logs
 lantern off my-app     # stop it
 ```
 
-Open <http://127.0.0.1:4777> for the control center. Without named HTTPS set up, reach each app on its own port: the control center's **Open** button goes there, and `lantern ls` shows the port (for example `http://127.0.0.1:29000`). `lantern open my-app` opens the named `https://my-app.glow` URL, which only resolves after the setup in [Named HTTPS URLs](#named-https-urls-optional).
+Open <http://127.0.0.1:4777> for the control center. Without named HTTPS set up, **Open** buttons fall back to each app's loopback port (for example `http://127.0.0.1:29000`); once [Named HTTPS URLs](#named-https-urls-optional) are configured, **Open** automatically uses `https://my-app.glow` (the header `*.glow` badge shows live status and any remaining `lantern doctor` fixes).
 
-Lantern scans the workspace folders listed in `~/.config/lantern/config.toml` (defaults `~/sites` and `~/tools`) for directories that contain a `lantern.yaml`, and suggests folders that look like dev projects.
+Lantern scans the workspace folders listed in `~/.config/lantern/config.toml` (defaults `~/sites` and `~/tools`, with glob support in `workspaces.ignore`) for directories that contain a `lantern.yaml`, and suggests folders that look like dev projects (including nested monorepo subprojects).
 
 To keep the daemon running in the background, [`packaging/lantern.service`](packaging/lantern.service) is a systemd user unit for it (it expects the binary at `/usr/bin/lantern`; adjust `ExecStart` if you installed elsewhere).
 
