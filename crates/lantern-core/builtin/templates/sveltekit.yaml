@@ -1,0 +1,8 @@
+name: sveltekit
+type: proxy
+run:
+  cmd: "npx vite dev --host ${HOST} --port ${PORT} --strictPort"
+  env:
+    __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: "${DOMAIN}"
+routing:
+  websocket: true

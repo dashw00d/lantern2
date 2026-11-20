@@ -1,0 +1,4 @@
+name: docker-compose
+type: proxy
+run:
+  cmd: "docker compose up"

@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
-import { FolderPlus, RefreshCw } from 'lucide-react'
-import { api, type Suggestion } from './api'
+import { FolderPlus, RefreshCw, X } from 'lucide-react'
+import { api, type AddProjectOptions, type Suggestion } from './api'
 import { Button, Modal, Tile, inputClass, shortPath } from './ui'
 
 export function AddTools({ onClose, onAdded, onError }: { onClose: () => void; onAdded: () => void; onError: (e: unknown) => void }) {
   const [items, setItems] = useState<Suggestion[] | null>(null)
   const [path, setPath] = useState('')
+  const [customCmd, setCustomCmd] = useState('')
+  const [showCustom, setShowCustom] = useState(false)
   const [busy, setBusy] = useState<string | null>(null)
   const [showAll, setShowAll] = useState(false)
 
@@ -31,13 +33,26 @@ export function AddTools({ onClose, onAdded, onError }: { onClose: () => void; o
     load()
   }, [])
 
-  const add = async (p: string) => {
+  const add = async (p: string, opts?: AddProjectOptions) => {
     setBusy(p)
     try {
-      await api.addProject(p)
+      await api.addProject(p, opts)
       setItems((xs) => xs?.filter((x) => x.path !== p) ?? null)
       setPath('')
+      setCustomCmd('')
       onAdded()
+    } catch (e) {
+      onError(e)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const dismiss = async (p: string) => {
+    setBusy(`dismiss:${p}`)
+    try {
+      await api.dismissSuggestion(p)
+      setItems((xs) => xs?.filter((x) => x.path !== p) ?? null)
     } catch (e) {
       onError(e)
     } finally {
@@ -51,20 +66,47 @@ export function AddTools({ onClose, onAdded, onError }: { onClose: () => void; o
   return (
     <Modal title="Add a tool" onClose={onClose} wide>
       <form
-        className="flex gap-2"
+        className="space-y-2.5"
         onSubmit={(e) => {
           e.preventDefault()
-          if (path.trim()) add(path.trim())
+          const p = path.trim()
+          if (!p) return
+          const cmd = customCmd.trim()
+          add(
+            p,
+            cmd
+              ? { overrides: { type: 'proxy', run: { cmd } } }
+              : undefined,
+          )
         }}
       >
-        <input className={`${inputClass} font-mono`} value={path} onChange={(e) => setPath(e.target.value)} placeholder="/path/to/project" autoFocus />
-        <Button variant="primary" type="submit" busy={busy === path.trim() && !!path.trim()}>
-          Add folder
-        </Button>
+        <div className="flex gap-2">
+          <input className={`${inputClass} font-mono`} value={path} onChange={(e) => setPath(e.target.value)} placeholder="/path/to/project" autoFocus />
+          <Button variant="primary" type="submit" busy={busy === path.trim() && !!path.trim()}>
+            Add folder
+          </Button>
+        </div>
+        {showCustom ? (
+          <input
+            className={`${inputClass} font-mono text-xs`}
+            value={customCmd}
+            onChange={(e) => setCustomCmd(e.target.value)}
+            placeholder="Optional run command, e.g. pnpm dev --port ${PORT}"
+          />
+        ) : null}
+        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+          <p>
+            Reads <span className="font-mono">lantern.yaml</span> or auto-detects Vite, Next, Astro, SvelteKit, Node, Python, Go, Rust, Rails, PHP, Docker Compose…
+          </p>
+          <button
+            type="button"
+            className="shrink-0 font-medium text-primary hover:underline"
+            onClick={() => setShowCustom((v) => !v)}
+          >
+            {showCustom ? 'Hide command' : 'Custom command'}
+          </button>
+        </div>
       </form>
-      <p className="mt-2 text-xs text-muted-foreground">
-        Lantern reads the folder's <span className="font-mono">lantern.yaml</span>, or works out how to run it (Vite, Next, Astro, Django…).
-      </p>
 
       <div className="mt-6 flex items-center justify-between">
         <h4 className="text-sm font-semibold">Found in your folders</h4>
@@ -81,7 +123,9 @@ export function AddTools({ onClose, onAdded, onError }: { onClose: () => void; o
             const parts = s.path.split('/').filter(Boolean)
             const leaf = parts.pop() ?? s.path
             // "app", "web", "frontend"… say nothing alone: name them after their parent folder.
-            const name = /^(app|web|web-app|webapp|frontend|client|ui|site|www)$/i.test(leaf) && parts.length ? `${parts.pop()}/${leaf}` : leaf
+            const name = /^(app|web|web-app|webapp|frontend|backend|server|client|ui|site|www|api)$/i.test(leaf) && parts.length
+              ? `${parts.pop()}/${leaf}`
+              : leaf
             return (
               <li key={s.path} className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-muted/60">
                 <Tile name={name} className="h-8 w-8" />
@@ -92,9 +136,24 @@ export function AddTools({ onClose, onAdded, onError }: { onClose: () => void; o
                 {s.framework && s.framework !== 'unknown' ? (
                   <span className="rounded-md bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">{s.framework}</span>
                 ) : null}
-                <Button size="sm" busy={busy === s.path} onClick={() => add(s.path)}>
+                <Button
+                  size="sm"
+                  busy={busy === s.path}
+                  onClick={() => add(s.path, s.proposed_id ? { id: s.proposed_id } : undefined)}
+                >
                   {busy === s.path ? null : <FolderPlus className="h-4 w-4" />}
                   Add
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8 text-muted-foreground hover:text-danger"
+                  title="Dismiss suggestion"
+                  aria-label={`Dismiss ${name}`}
+                  busy={busy === `dismiss:${s.path}`}
+                  onClick={() => dismiss(s.path)}
+                >
+                  {busy === `dismiss:${s.path}` ? null : <X className="h-4 w-4" />}
                 </Button>
               </li>
             )

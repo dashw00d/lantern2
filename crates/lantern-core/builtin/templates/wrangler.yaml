@@ -1,0 +1,6 @@
+name: wrangler
+type: proxy
+run:
+  cmd: "npx wrangler dev --ip ${HOST} --port ${PORT}"
+routing:
+  websocket: true

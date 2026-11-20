@@ -1,0 +1,6 @@
+name: rails
+type: proxy
+run:
+  cmd: "bundle exec rails server -b ${HOST} -p ${PORT}"
+routing:
+  websocket: true

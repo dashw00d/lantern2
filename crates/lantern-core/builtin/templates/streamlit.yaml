@@ -1,0 +1,6 @@
+name: streamlit
+type: proxy
+run:
+  cmd: "streamlit run app.py --server.address ${HOST} --server.port ${PORT} --server.headless true"
+routing:
+  websocket: true

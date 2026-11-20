@@ -331,12 +331,31 @@ impl RegistryHandle {
         }
         Ok(())
     }
+    /// Remove any repository entries no longer referenced by any registered project.
+    pub fn prune_orphan_repos(&self) -> usize {
+        let mut s = self.lock();
+        let referenced: std::collections::BTreeSet<PathBuf> = s
+            .file
+            .projects
+            .values()
+            .filter_map(|p| p.repo.as_ref().map(|r| r.common_dir.clone()))
+            .collect();
+        let before = s.file.repos.len();
+        s.file
+            .repos
+            .retain(|common_dir, _| referenced.contains(common_dir));
+        let removed = before.saturating_sub(s.file.repos.len());
+        if removed > 0 {
+            s.dirty();
+        }
+        removed
+    }
     /// Unregister a project and its instances and release their leases (does not remove files).
     pub fn remove_project(&self, id: &ProjectId) -> Result<(), Error> {
         let mut s = self.lock();
-        if s.file.projects.remove(id).is_none() {
+        let Some(removed_project) = s.file.projects.remove(id) else {
             return Err(Error::ProjectNotFound(id.clone()));
-        }
+        };
         let ids: Vec<_> = s
             .file
             .instances
@@ -346,6 +365,15 @@ impl RegistryHandle {
             .collect();
         for instance in ids {
             s.remove_instance_inner(&instance);
+        }
+        if let Some(repo) = removed_project.repo
+            && !s
+                .file
+                .projects
+                .values()
+                .any(|p| p.repo.as_ref().is_some_and(|r| r.common_dir == repo.common_dir))
+        {
+            s.file.repos.remove(&repo.common_dir);
         }
         s.dirty();
         s.publish_index();

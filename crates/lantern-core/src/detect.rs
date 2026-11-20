@@ -14,12 +14,29 @@ pub enum Framework {
     Php,
     NextJs,
     Nuxt,
+    Astro,
+    SvelteKit,
     ReactRouter,
     Remix,
+    Angular,
+    Expo,
+    VitePress,
+    Docusaurus,
+    Storybook,
     Vite,
+    Wrangler,
+    Node,
     FastApi,
     Django,
     Flask,
+    Streamlit,
+    Gradio,
+    MkDocs,
+    Rails,
+    Hugo,
+    Go,
+    Rust,
+    DockerCompose,
     Static,
     Unknown,
 }
@@ -31,12 +48,29 @@ impl Framework {
             Self::Php => "php",
             Self::NextJs => "nextjs",
             Self::Nuxt => "nuxt",
+            Self::Astro => "astro",
+            Self::SvelteKit => "sveltekit",
             Self::ReactRouter => "react-router",
             Self::Remix => "remix",
+            Self::Angular => "angular",
+            Self::Expo => "expo",
+            Self::VitePress => "vitepress",
+            Self::Docusaurus => "docusaurus",
+            Self::Storybook => "storybook",
             Self::Vite => "vite",
+            Self::Wrangler => "wrangler",
+            Self::Node => "node",
             Self::FastApi => "fastapi",
             Self::Django => "django",
             Self::Flask => "flask",
+            Self::Streamlit => "streamlit",
+            Self::Gradio => "gradio",
+            Self::MkDocs => "mkdocs",
+            Self::Rails => "rails",
+            Self::Hugo => "hugo",
+            Self::Go => "go",
+            Self::Rust => "rust",
+            Self::DockerCompose => "docker-compose",
             Self::Static => "static",
             Self::Unknown => "unknown",
         }
@@ -78,6 +112,11 @@ pub struct Detection {
     pub fastapi_entrypoint: Option<String>,
     pub remix_vite: bool,
     pub php_root: Option<String>,
+    pub node_script: Option<String>,
+    pub deno_task: Option<String>,
+    pub python_entrypoint: Option<String>,
+    pub go_air: bool,
+    pub rust_trunk: bool,
 }
 impl Default for Detection {
     fn default() -> Self {
@@ -91,6 +130,11 @@ impl Default for Detection {
             fastapi_entrypoint: None,
             remix_vite: false,
             php_root: None,
+            node_script: None,
+            deno_task: None,
+            python_entrypoint: None,
+            go_air: false,
+            rust_trunk: false,
         }
     }
 }
@@ -196,6 +240,45 @@ fn fastapi_entry(dir: &Path) -> Option<String> {
     }
     None
 }
+fn first_existing_file<'a>(dir: &Path, candidates: &[&'a str]) -> Option<&'a str> {
+    candidates.iter().copied().find(|f| dir.join(f).is_file())
+}
+fn deno_dev_task(dir: &Path) -> Option<String> {
+    for name in ["deno.json", "deno.jsonc"] {
+        if let Some(src) = read_bounded(&dir.join(name), 256 * 1024)
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&src)
+            && let Some(tasks) = val.get("tasks").and_then(|v| v.as_object())
+        {
+            for key in ["dev", "start", "serve"] {
+                if tasks.contains_key(key) {
+                    return Some(key.into());
+                }
+            }
+        }
+    }
+    None
+}
+fn cargo_has_web_crate(dir: &Path) -> bool {
+    let Some(src) = read_bounded(&dir.join("Cargo.toml"), 256 * 1024) else {
+        return false;
+    };
+    let lower = src.to_ascii_lowercase();
+    [
+        "axum",
+        "actix-web",
+        "rocket",
+        "warp",
+        "poem",
+        "salvo",
+        "leptos",
+        "dioxus",
+        "tide",
+        "tiny_http",
+        "rouille",
+    ]
+    .iter()
+    .any(|crate_name| lower.contains(crate_name))
+}
 /// Probe a directory without executing commands or following the network.
 pub fn detect_dir(dir: &Path) -> Detection {
     let paths = ancestors(dir);
@@ -209,6 +292,14 @@ pub fn detect_dir(dir: &Path) -> Detection {
                 .iter()
                 .any(|part| p.get(part).and_then(|v| v.get(key)).is_some())
         })
+    };
+    let has_script = |key: &str| {
+        package
+            .as_ref()
+            .and_then(|p| p.get("scripts"))
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
     };
     let py = python_files(dir);
     let has_py = |name: &str| py.iter().any(|p| has_text(p, name));
@@ -234,6 +325,22 @@ pub fn detect_dir(dir: &Path) -> Detection {
     ]
     .iter()
     .any(|p| dir.join(p).is_file());
+    let wrangler_config = ["wrangler.toml", "wrangler.json", "wrangler.jsonc"]
+        .iter()
+        .any(|p| dir.join(p).is_file());
+    let compose_file = [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+    ]
+    .iter()
+    .any(|p| dir.join(p).is_file());
+    let hugo_config = ["hugo.toml", "hugo.yaml", "hugo.json", "config.toml"]
+        .iter()
+        .any(|p| dir.join(p).is_file())
+        && dir.join("content").is_dir();
+    let deno_task = deno_dev_task(dir);
     let (framework, confidence, evidence) = if dir.join("artisan").is_file() && public_php {
         (Framework::Laravel, Confidence::High, "artisan + public/index.php")
     } else if dir.join("bin/console").is_file() && public_php {
@@ -253,6 +360,18 @@ pub fn detect_dir(dir: &Path) -> Detection {
         )
     } else if dep("nuxt") || dep("nuxt3") {
         (Framework::Nuxt, Confidence::High, "package.json dependency nuxt")
+    } else if dep("astro") {
+        (
+            Framework::Astro,
+            Confidence::High,
+            "package.json dependency astro",
+        )
+    } else if dep("@sveltejs/kit") {
+        (
+            Framework::SvelteKit,
+            Confidence::High,
+            "package.json dependency @sveltejs/kit",
+        )
     } else if dep("@react-router/dev") {
         (
             Framework::ReactRouter,
@@ -270,11 +389,51 @@ pub fn detect_dir(dir: &Path) -> Detection {
             },
             "package.json dependency @remix-run/dev",
         )
-    } else if dep("vite") {
+    } else if dep("@angular/cli") || dir.join("angular.json").is_file() {
+        (
+            Framework::Angular,
+            Confidence::High,
+            "Angular configuration or dependency",
+        )
+    } else if dep("expo") {
+        (Framework::Expo, Confidence::High, "package.json dependency expo")
+    } else if dep("vitepress") {
+        (
+            Framework::VitePress,
+            Confidence::High,
+            "package.json dependency vitepress",
+        )
+    } else if dep("@docusaurus/core") {
+        (
+            Framework::Docusaurus,
+            Confidence::High,
+            "package.json dependency @docusaurus/core",
+        )
+    } else if dep("storybook")
+        || dep("@storybook/react")
+        || dep("@storybook/vue3")
+        || dep("@storybook/svelte")
+    {
+        (
+            Framework::Storybook,
+            Confidence::Medium,
+            "package.json dependency storybook",
+        )
+    } else if dep("vite") || vite_config {
         (
             Framework::Vite,
             Confidence::Medium,
-            "package.json dependency vite",
+            if dep("vite") {
+                "package.json dependency vite"
+            } else {
+                "vite.config"
+            },
+        )
+    } else if dep("wrangler") || wrangler_config {
+        (
+            Framework::Wrangler,
+            Confidence::Medium,
+            "Wrangler configuration or dependency",
         )
     } else if has_py("fastapi") {
         d.fastapi_entrypoint = fastapi_entry(dir);
@@ -302,6 +461,72 @@ pub fn detect_dir(dir: &Path) -> Detection {
         || has_text(&dir.join("wsgi.py"), "flask")
     {
         (Framework::Flask, Confidence::Medium, "Flask source or dependency")
+    } else if has_py("streamlit") {
+        d.python_entrypoint = first_existing_file(dir, &["app.py", "streamlit_app.py", "Home.py", "main.py"])
+            .map(str::to_owned);
+        (
+            Framework::Streamlit,
+            Confidence::Medium,
+            "Python dependency streamlit",
+        )
+    } else if has_py("gradio") {
+        d.python_entrypoint = first_existing_file(dir, &["app.py", "demo.py", "main.py"]).map(str::to_owned);
+        (Framework::Gradio, Confidence::Medium, "Python dependency gradio")
+    } else if dir.join("mkdocs.yml").is_file() || dir.join("mkdocs.yaml").is_file() {
+        (Framework::MkDocs, Confidence::Medium, "mkdocs.yml")
+    } else if dir.join("Gemfile").is_file()
+        && (dir.join("bin/rails").is_file() || dir.join("config/application.rb").is_file())
+    {
+        (Framework::Rails, Confidence::High, "Gemfile + Rails app")
+    } else if hugo_config {
+        (Framework::Hugo, Confidence::Medium, "Hugo config + content/")
+    } else if let Some(task) = deno_task {
+        d.deno_task = Some(task);
+        (Framework::Node, Confidence::Medium, "deno.json task")
+    } else if has_script("dev") || has_script("start") {
+        d.node_script = Some(if has_script("dev") { "dev" } else { "start" }.into());
+        (
+            Framework::Node,
+            Confidence::Medium,
+            if has_script("dev") {
+                "package.json scripts.dev"
+            } else {
+                "package.json scripts.start"
+            },
+        )
+    } else if dir.join("go.mod").is_file()
+        && (dir.join(".air.toml").is_file()
+            || dir.join(".air.conf").is_file()
+            || dir.join("main.go").is_file()
+            || dir.join("cmd").is_dir())
+    {
+        d.go_air = dir.join(".air.toml").is_file() || dir.join(".air.conf").is_file();
+        (
+            Framework::Go,
+            Confidence::Medium,
+            if d.go_air {
+                "go.mod + .air.toml"
+            } else {
+                "go.mod + entrypoint"
+            },
+        )
+    } else if dir.join("Trunk.toml").is_file() || cargo_has_web_crate(dir) {
+        d.rust_trunk = dir.join("Trunk.toml").is_file();
+        (
+            Framework::Rust,
+            Confidence::Medium,
+            if d.rust_trunk {
+                "Trunk.toml"
+            } else {
+                "Cargo.toml web server crate"
+            },
+        )
+    } else if compose_file {
+        (
+            Framework::DockerCompose,
+            Confidence::Medium,
+            "Docker Compose file",
+        )
     } else if dir.join("index.html").is_file() {
         (Framework::Static, Confidence::Low, "index.html")
     } else {
@@ -315,7 +540,12 @@ pub fn detect_dir(dir: &Path) -> Detection {
     }
     if matches!(
         framework,
-        Framework::FastApi | Framework::Django | Framework::Flask
+        Framework::FastApi
+            | Framework::Django
+            | Framework::Flask
+            | Framework::Streamlit
+            | Framework::Gradio
+            | Framework::MkDocs
     ) {
         d.python_runner = Some(python);
     }
@@ -342,6 +572,28 @@ impl DetectionInfo for Detection {
         if let Some(entry) = &self.fastapi_entrypoint {
             cmd = cmd.replace("app.main:app", entry);
         }
+        if let Some(entry) = &self.python_entrypoint {
+            cmd = cmd.replace("app.py", entry);
+        }
+        if self.framework == Framework::Node {
+            if let Some(task) = &self.deno_task {
+                return format!("deno task {task}");
+            }
+            if let Some(script) = &self.node_script {
+                return match self.package_manager {
+                    Some(PackageManager::Pnpm) => format!("pnpm run {script}"),
+                    Some(PackageManager::Yarn) => format!("yarn {script}"),
+                    Some(PackageManager::Bun) => format!("bun run {script}"),
+                    _ => format!("npm run {script}"),
+                };
+            }
+        }
+        if self.framework == Framework::Go && self.go_air {
+            return "air".into();
+        }
+        if self.framework == Framework::Rust && self.rust_trunk {
+            return "trunk serve --address ${HOST} --port ${PORT}".into();
+        }
         if let Some(rest) = cmd.strip_prefix("npx ") {
             let prefix = match self.package_manager {
                 Some(PackageManager::Pnpm) => "pnpm exec ",
@@ -353,7 +605,12 @@ impl DetectionInfo for Detection {
         }
         if matches!(
             self.framework,
-            Framework::FastApi | Framework::Django | Framework::Flask
+            Framework::FastApi
+                | Framework::Django
+                | Framework::Flask
+                | Framework::Streamlit
+                | Framework::Gradio
+                | Framework::MkDocs
         ) {
             let prefix = match self.python_runner {
                 Some(PythonRunner::Uv) => "uv run ",
@@ -371,16 +628,33 @@ impl DetectionInfo for Detection {
 pub const BUILTIN_NAMES: &[&str] = &[
     "nextjs",
     "nuxt",
+    "astro",
+    "sveltekit",
     "remix",
     "react-router",
+    "angular",
+    "expo",
+    "vitepress",
+    "docusaurus",
+    "storybook",
     "vite",
+    "wrangler",
+    "node",
     "fastapi",
     "django",
     "flask",
+    "streamlit",
+    "gradio",
+    "mkdocs",
     "laravel",
     "laravel-serve",
     "symfony",
     "php",
+    "rails",
+    "hugo",
+    "go",
+    "rust",
+    "docker-compose",
     "static",
 ];
 /// Fetch an embedded template's YAML text.
@@ -388,16 +662,33 @@ pub fn builtin_source(name: &str) -> Option<&'static str> {
     match name {
         "nextjs" => Some(include_str!("../builtin/templates/nextjs.yaml")),
         "nuxt" => Some(include_str!("../builtin/templates/nuxt.yaml")),
+        "astro" => Some(include_str!("../builtin/templates/astro.yaml")),
+        "sveltekit" => Some(include_str!("../builtin/templates/sveltekit.yaml")),
         "remix" => Some(include_str!("../builtin/templates/remix.yaml")),
         "react-router" => Some(include_str!("../builtin/templates/react-router.yaml")),
+        "angular" => Some(include_str!("../builtin/templates/angular.yaml")),
+        "expo" => Some(include_str!("../builtin/templates/expo.yaml")),
+        "vitepress" => Some(include_str!("../builtin/templates/vitepress.yaml")),
+        "docusaurus" => Some(include_str!("../builtin/templates/docusaurus.yaml")),
+        "storybook" => Some(include_str!("../builtin/templates/storybook.yaml")),
         "vite" => Some(include_str!("../builtin/templates/vite.yaml")),
+        "wrangler" => Some(include_str!("../builtin/templates/wrangler.yaml")),
+        "node" => Some(include_str!("../builtin/templates/node.yaml")),
         "fastapi" => Some(include_str!("../builtin/templates/fastapi.yaml")),
         "django" => Some(include_str!("../builtin/templates/django.yaml")),
         "flask" => Some(include_str!("../builtin/templates/flask.yaml")),
+        "streamlit" => Some(include_str!("../builtin/templates/streamlit.yaml")),
+        "gradio" => Some(include_str!("../builtin/templates/gradio.yaml")),
+        "mkdocs" => Some(include_str!("../builtin/templates/mkdocs.yaml")),
         "laravel" => Some(include_str!("../builtin/templates/laravel.yaml")),
         "laravel-serve" => Some(include_str!("../builtin/templates/laravel-serve.yaml")),
         "symfony" => Some(include_str!("../builtin/templates/symfony.yaml")),
         "php" => Some(include_str!("../builtin/templates/php.yaml")),
+        "rails" => Some(include_str!("../builtin/templates/rails.yaml")),
+        "hugo" => Some(include_str!("../builtin/templates/hugo.yaml")),
+        "go" => Some(include_str!("../builtin/templates/go.yaml")),
+        "rust" => Some(include_str!("../builtin/templates/rust.yaml")),
+        "docker-compose" => Some(include_str!("../builtin/templates/docker-compose.yaml")),
         "static" => Some(include_str!("../builtin/templates/static.yaml")),
         _ => None,
     }
@@ -605,5 +896,69 @@ mod tests {
         for name in BUILTIN_NAMES {
             assert!(Templates::default().get(name).is_some(), "{name}");
         }
+    }
+    #[test]
+    fn extended_framework_detection() {
+        let root = std::env::temp_dir().join(format!("lantern-detect-ext-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        let astro = root.join("astro");
+        fs::create_dir_all(&astro).unwrap();
+        fs::write(astro.join("package.json"), r#"{"dependencies":{"astro":"^5.0"}}"#).unwrap();
+        fs::write(astro.join("pnpm-lock.yaml"), "").unwrap();
+        let d = detect_dir(&astro);
+        assert_eq!(d.framework, Framework::Astro);
+        assert_eq!(
+            d.rewrite_builtin("npx astro dev --host ${HOST} --port ${PORT}"),
+            "pnpm exec astro dev --host ${HOST} --port ${PORT}"
+        );
+
+        let svelte = root.join("svelte");
+        fs::create_dir_all(&svelte).unwrap();
+        fs::write(
+            svelte.join("package.json"),
+            r#"{"devDependencies":{"@sveltejs/kit":"^2.0","vite":"^6.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_dir(&svelte).framework, Framework::SvelteKit);
+
+        let node = root.join("node");
+        fs::create_dir_all(&node).unwrap();
+        fs::write(
+            node.join("package.json"),
+            r#"{"scripts":{"dev":"tsx watch src/index.ts"}}"#,
+        )
+        .unwrap();
+        fs::write(node.join("bun.lock"), "").unwrap();
+        let d = detect_dir(&node);
+        assert_eq!(d.framework, Framework::Node);
+        assert_eq!(d.rewrite_builtin("npm run dev"), "bun run dev");
+
+        let go = root.join("goapp");
+        fs::create_dir_all(&go).unwrap();
+        fs::write(go.join("go.mod"), "module example.com/app\n").unwrap();
+        fs::write(go.join(".air.toml"), "").unwrap();
+        let d = detect_dir(&go);
+        assert_eq!(d.framework, Framework::Go);
+        assert_eq!(d.rewrite_builtin("go run ."), "air");
+
+        let rust = root.join("rustapp");
+        fs::create_dir_all(&rust).unwrap();
+        fs::write(rust.join("Cargo.toml"), "[dependencies]\naxum = \"0.8\"\n").unwrap();
+        assert_eq!(detect_dir(&rust).framework, Framework::Rust);
+
+        let st = root.join("streamlitapp");
+        fs::create_dir_all(&st).unwrap();
+        fs::write(st.join("requirements.txt"), "streamlit>=1.30\n").unwrap();
+        fs::write(st.join("Home.py"), "import streamlit as st\n").unwrap();
+        fs::write(st.join("uv.lock"), "").unwrap();
+        let d = detect_dir(&st);
+        assert_eq!(d.framework, Framework::Streamlit);
+        assert!(
+            d.rewrite_builtin("streamlit run app.py")
+                .starts_with("uv run streamlit run Home.py")
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -19,7 +19,7 @@ use tauri::{
     webview::NewWindowResponse,
 };
 
-const DEFAULT_DAEMON: &str = "http://127.0.0.1:4778";
+const DEFAULT_DAEMON: &str = "http://127.0.0.1:4777";
 
 fn daemon_url() -> Url {
     std::env::var("LANTERN_DAEMON_URL")

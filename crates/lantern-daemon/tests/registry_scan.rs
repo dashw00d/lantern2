@@ -214,3 +214,51 @@ async fn registry_scan_listener_offer_is_confined_and_survives_scan() {
     reg.dismiss_suggestion(&app);
     assert!(reg.offer_suggestion(&nested).unwrap().is_none());
 }
+
+#[tokio::test]
+async fn registry_scan_glob_ignore_monorepo_descent_and_repo_cleanup() {
+    let t = Temp::new();
+    let workspace = t.mkdir("workspace");
+    let agents = t.mkdir("workspace/plexa-agents");
+    fs::write(agents.join("package.json"), r#"{"dependencies":{"vite":"1"}}"#).unwrap();
+    let mono = t.mkdir("workspace/mono");
+    fs::create_dir_all(mono.join(".git")).unwrap();
+    let web = t.mkdir("workspace/mono/web");
+    fs::write(web.join("lantern.yaml"), "id: mono-web\ntype: static\n").unwrap();
+    let api = t.mkdir("workspace/mono/api");
+    fs::write(api.join("package.json"), r#"{"dependencies":{"astro":"5"}}"#).unwrap();
+
+    let mut settings = Settings::default();
+    settings.workspaces.roots = vec![workspace.display().to_string()];
+    settings.workspaces.depth = 3;
+    settings.workspaces.ignore = vec!["*-agents".into()];
+
+    let (reg, _) = RegistryHandle::open(
+        &t.dirs(),
+        settings,
+        Templates::default(),
+        t.0.clone(),
+        EventBus::new(),
+    )
+    .unwrap();
+    let report = reg.scan_workspace(&t.dirs()).unwrap();
+
+    // Glob ignore skipped plexa-agents.
+    assert!(!report.suggestions.iter().any(|s| s.path == agents));
+    // Monorepo subproject manifest was registered with parent git repo + subpath.
+    let id = ProjectId::parse("mono-web").unwrap();
+    let record = reg.project_record(&id).unwrap();
+    let repo = record.repo.expect("monorepo git repo probed");
+    assert_eq!(repo.common_dir, mono.join(".git").canonicalize().unwrap());
+    assert_eq!(repo.subpath, PathBuf::from("web"));
+    // Subproject without manifest was suggested.
+    assert!(
+        report
+            .suggestions
+            .iter()
+            .any(|s| s.path == api && s.framework == "astro")
+    );
+    // Removing the project also prunes its unreferenced repo entry.
+    reg.remove_project(&id).unwrap();
+    assert!(reg.state_snapshot().repos.is_empty());
+}

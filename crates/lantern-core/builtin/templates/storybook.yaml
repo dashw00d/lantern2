@@ -1,0 +1,6 @@
+name: storybook
+type: proxy
+run:
+  cmd: "npx storybook dev -p ${PORT} --no-open"
+routing:
+  websocket: true

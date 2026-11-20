@@ -398,6 +398,32 @@ pub async fn run_until(args: DaemonArgs, shutdown: CancellationToken) -> Result<
     }
     let git_shutdown = shutdown.clone();
     let git_registry = registry.clone();
+    let startup_git = facade.git.clone();
+    let pruned = git_registry.prune_orphan_repos();
+    if pruned > 0 {
+        tracing::info!(pruned, "pruned orphaned git repository entries");
+    }
+    for mut record in git_registry.state_snapshot().projects.into_values() {
+        if record.repo.is_none()
+            && !record.missing
+            && record.root.is_dir()
+            && let Ok(Some(probe)) = startup_git.probe(&record.root).await
+        {
+            git_registry.upsert_repo(
+                probe.common_dir.clone(),
+                lantern_core::state::RepoRecord {
+                    slug: record.id.to_string(),
+                },
+            );
+            record.repo = Some(lantern_core::state::ProjectRepoRecord {
+                common_dir: probe.common_dir,
+                subpath: probe.subpath,
+            });
+            if let Err(error) = git_registry.upsert_project(record) {
+                tracing::warn!(%error, "backfill git repository metadata failed");
+            }
+        }
+    }
     let git_task = tokio::spawn(async move {
         loop {
             let repos: Vec<_> = git_registry.state_snapshot().repos.into_keys().collect();

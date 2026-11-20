@@ -1,6 +1,7 @@
 //! Bounded, manifest-first workspace scans and registry reconciliation.
 
 use super::{Error, RegistryHandle, expand_home};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use lantern_core::{
     Timestamp,
     api::{Confidence as ApiConfidence, Event, ScanSkip, Suggestion},
@@ -17,6 +18,95 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+fn build_ignore_matcher(patterns: &[String]) -> GlobSet {
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        if let Ok(glob) = GlobBuilder::new(pat).literal_separator(true).build() {
+            builder.add(glob);
+        }
+    }
+    builder.build().unwrap_or_else(|_| GlobSet::empty())
+}
+
+fn is_ignored_name(name: &str, custom: &[String], globs: &GlobSet) -> bool {
+    IGNORE.contains(&name) || custom.iter().any(|v| v == name) || globs.is_match(name)
+}
+
+fn proposed_project_id(path: &Path, depth: u8) -> Result<ProjectId, lantern_core::ids::IdError> {
+    let leaf = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let generic = matches!(
+        leaf.to_ascii_lowercase().as_str(),
+        "app"
+            | "web"
+            | "web-app"
+            | "webapp"
+            | "frontend"
+            | "backend"
+            | "server"
+            | "client"
+            | "ui"
+            | "site"
+            | "www"
+            | "api"
+    );
+    if depth > 1
+        && generic
+        && let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str())
+    {
+        let combined = format!("{parent}-{leaf}");
+        if let Ok(id) = ProjectId::from_name(&combined) {
+            return Ok(id);
+        }
+    }
+    match ProjectId::from_name(leaf) {
+        Ok(id) => Ok(id),
+        Err(err) => {
+            if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+                ProjectId::from_name(&format!("{parent}-{leaf}")).or(Err(err))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Probe a canonical project directory for its enclosing git repository (supporting monorepos and worktrees).
+fn probe_git_repo(path: &Path) -> Option<ProjectRepoRecord> {
+    for ancestor in path.ancestors() {
+        let dot_git = ancestor.join(".git");
+        if dot_git.is_dir() {
+            let common_dir = dot_git.canonicalize().ok()?;
+            let subpath = path.strip_prefix(ancestor).ok()?.to_path_buf();
+            return Some(ProjectRepoRecord { common_dir, subpath });
+        }
+        if dot_git.is_file() {
+            let content = fs::read_to_string(&dot_git).ok()?;
+            let raw = content.trim().strip_prefix("gitdir:")?.trim();
+            let gitdir = if Path::new(raw).is_absolute() {
+                PathBuf::from(raw)
+            } else {
+                ancestor.join(raw)
+            };
+            let gitdir = gitdir.canonicalize().ok()?;
+            let common_dir = match fs::read_to_string(gitdir.join("commondir")) {
+                Ok(rel) => {
+                    let rel = rel.trim();
+                    let p = if Path::new(rel).is_absolute() {
+                        PathBuf::from(rel)
+                    } else {
+                        gitdir.join(rel)
+                    };
+                    p.canonicalize().ok()?
+                }
+                Err(_) => gitdir,
+            };
+            let subpath = path.strip_prefix(ancestor).ok()?.to_path_buf();
+            return Some(ProjectRepoRecord { common_dir, subpath });
+        }
+    }
+    None
+}
 
 const IGNORE: &[&str] = &[
     "node_modules",
@@ -85,6 +175,7 @@ pub fn scan_roots(settings: &WorkspaceSettings, home: &Path, managed_worktrees: 
     let managed = managed_worktrees
         .canonicalize()
         .unwrap_or_else(|_| managed_worktrees.to_owned());
+    let ignore_globs = build_ignore_matcher(&settings.ignore);
     let mut visited = BTreeSet::new();
     for root in &settings.roots {
         let root = expand_home(root, home);
@@ -154,8 +245,7 @@ pub fn scan_roots(settings: &WorkspaceSettings, home: &Path, managed_worktrees: 
                 if (git || detection.framework != Framework::Unknown)
                     && (git || detection.confidence != Confidence::Low)
                 {
-                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                    match ProjectId::from_name(name) {
+                    match proposed_project_id(&path, depth) {
                         Ok(proposed_id) => report.suggestions.push(Suggestion {
                             path: path.clone(),
                             proposed_id,
@@ -173,7 +263,7 @@ pub fn scan_roots(settings: &WorkspaceSettings, home: &Path, managed_worktrees: 
                     }
                 }
             }
-            if git || depth >= settings.depth {
+            if depth >= settings.depth {
                 continue;
             }
             let entries = match fs::read_dir(&path) {
@@ -194,8 +284,7 @@ pub fn scan_roots(settings: &WorkspaceSettings, home: &Path, managed_worktrees: 
                 };
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if IGNORE.contains(&name.as_ref())
-                    || settings.ignore.iter().any(|v| v == name.as_ref())
+                if is_ignored_name(name.as_ref(), &settings.ignore, &ignore_globs)
                     || (name.starts_with('.') && !settings.include_hidden.iter().any(|v| v == name.as_ref()))
                 {
                     continue;
@@ -274,6 +363,17 @@ impl RegistryHandle {
                 if existing.source == ProjectSource::Detected {
                     existing.source = ProjectSource::Manifest;
                 }
+                if existing.repo.is_none()
+                    && let Some(repo) = probe_git_repo(&hit.path)
+                {
+                    self.upsert_repo(
+                        repo.common_dir.clone(),
+                        RepoRecord {
+                            slug: existing.id.to_string(),
+                        },
+                    );
+                    existing.repo = Some(repo);
+                }
                 self.upsert_project(existing)?;
                 continue;
             }
@@ -324,17 +424,9 @@ impl RegistryHandle {
                 ));
             }
             let now = Timestamp::now();
-            let git_dir = hit.path.join(".git");
-            let repo = if git_dir.is_dir() {
-                let common_dir = git_dir.canonicalize()?;
-                self.upsert_repo(common_dir.clone(), RepoRecord { slug: id.to_string() });
-                Some(ProjectRepoRecord {
-                    common_dir,
-                    subpath: PathBuf::new(),
-                })
-            } else {
-                None
-            };
+            let repo = probe_git_repo(&hit.path).inspect(|repo| {
+                self.upsert_repo(repo.common_dir.clone(), RepoRecord { slug: id.to_string() });
+            });
             self.upsert_project(ProjectRecord {
                 id: id.clone(),
                 aliases: vec![],
@@ -404,6 +496,7 @@ impl RegistryHandle {
         if !cwd.starts_with(&home) || cwd == home || s.checkouts.values().any(|c| cwd.starts_with(&c.path)) {
             return Ok(None);
         }
+        let ignore_globs = build_ignore_matcher(&s.settings.workspaces.ignore);
         let mut manifest_root = None;
         let mut git_root = None;
         let mut marker_root = None;
@@ -414,12 +507,7 @@ impl RegistryHandle {
             let ignored = path.strip_prefix(&home).ok().is_some_and(|relative| {
                 relative.components().any(|part| {
                     let name = part.as_os_str().to_string_lossy();
-                    IGNORE.contains(&name.as_ref())
-                        || s.settings
-                            .workspaces
-                            .ignore
-                            .iter()
-                            .any(|item| item == name.as_ref())
+                    is_ignored_name(name.as_ref(), &s.settings.workspaces.ignore, &ignore_globs)
                 })
             });
             if ignored {
@@ -432,9 +520,17 @@ impl RegistryHandle {
                 git_root = Some(path.to_path_buf());
             }
             if marker_root.is_none()
-                && ["package.json", "pyproject.toml", "composer.json"]
-                    .iter()
-                    .any(|f| path.join(f).is_file())
+                && [
+                    "package.json",
+                    "pyproject.toml",
+                    "composer.json",
+                    "Cargo.toml",
+                    "go.mod",
+                    "Gemfile",
+                    "deno.json",
+                ]
+                .iter()
+                .any(|f| path.join(f).is_file())
             {
                 marker_root = Some(path.to_path_buf());
             }

@@ -1,0 +1,6 @@
+name: hugo
+type: proxy
+run:
+  cmd: "hugo server --bind ${HOST} --port ${PORT}"
+routing:
+  websocket: true

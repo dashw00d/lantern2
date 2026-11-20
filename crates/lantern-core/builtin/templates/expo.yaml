@@ -1,0 +1,6 @@
+name: expo
+type: proxy
+run:
+  cmd: "npx expo start --web --port ${PORT}"
+routing:
+  websocket: true

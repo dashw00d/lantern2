@@ -1,0 +1,6 @@
+name: docusaurus
+type: proxy
+run:
+  cmd: "npx docusaurus start --host ${HOST} --port ${PORT} --no-open"
+routing:
+  websocket: true

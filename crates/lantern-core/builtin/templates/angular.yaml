@@ -1,0 +1,6 @@
+name: angular
+type: proxy
+run:
+  cmd: "npx ng serve --host ${HOST} --port ${PORT}"
+routing:
+  websocket: true

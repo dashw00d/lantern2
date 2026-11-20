@@ -1,0 +1,6 @@
+name: astro
+type: proxy
+run:
+  cmd: "npx astro dev --host ${HOST} --port ${PORT}"
+routing:
+  websocket: true

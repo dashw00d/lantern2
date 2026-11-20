@@ -1,12 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Plus, Search, WifiOff, X } from 'lucide-react'
-import { api, ApiError, type Instance, type Launcher, type Listener, type Project } from './api'
+import { Globe, Plus, Search, ShieldAlert, Trash2, WifiOff, X } from 'lucide-react'
+import {
+  api,
+  ApiError,
+  isNamedHttpsReady,
+  type Instance,
+  type Launcher,
+  type Listener,
+  type Project,
+  type SystemHealth,
+  type SystemInfo,
+} from './api'
 import { AddTools } from './AddTools'
+import { BranchesModal } from './BranchesModal'
 import { Commands } from './Commands'
+import { HealthModal } from './HealthModal'
 import { LogDrawer, type LogSource } from './LogDrawer'
 import { OtherServers } from './OtherServers'
 import { ToolCard, type ToolActions } from './ToolCard'
-import { Button, Section } from './ui'
+import { Button, Modal, Section, cn } from './ui'
 
 function usePoll<T>(load: () => Promise<T>, ms: number): [T | undefined, unknown, () => void] {
   const [data, setData] = useState<T>()
@@ -45,12 +57,22 @@ export function App() {
   const [instances, , refreshInstances] = usePoll<Instance[]>(api.instances, 1500)
   const [launchers, , refreshLaunchers] = usePoll<Launcher[]>(api.launchers, 2000)
   const [listeners] = usePoll<Listener[]>(api.listeners, 5000)
+  const [systemInfo] = usePoll<SystemInfo>(api.systemInfo, 60000)
+  const [health, , refreshHealth] = usePoll<SystemHealth>(api.systemHealth, 15000)
   const [query, setQuery] = useState('')
   const [logs, setLogs] = useState<LogSource | null>(null)
   const [adding, setAdding] = useState(false)
+  const [healthOpen, setHealthOpen] = useState(false)
+  const [branchesProjectId, setBranchesProjectId] = useState<string | null>(null)
+  const [removingProject, setRemovingProject] = useState<{ project: Project; managedWorktrees: number } | null>(null)
+  const [removeWorktrees, setRemoveWorktrees] = useState(false)
+  const [removingBusy, setRemovingBusy] = useState(false)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [pending, setPending] = useState<Record<string, number>>({})
   const search = useRef<HTMLInputElement>(null)
+
+  const namedHttpsReady = useMemo(() => isNamedHttpsReady(health), [health])
+  const tld = systemInfo?.tld ?? 'glow'
 
   const toast = useCallback((e: unknown) => {
     const text = e instanceof ApiError || e instanceof Error ? e.message : String(e)
@@ -86,6 +108,21 @@ export function App() {
     })
   }, [instances])
 
+  const openLogs = useCallback(
+    (inst: Instance, title: string) =>
+      setLogs({
+        title,
+        subtitle: inst.id,
+        load: async () =>
+          (await api.logs(inst.id)).map((l) => ({
+            ts: new Date(l.ts).toLocaleTimeString([], { hour12: false }),
+            text: l.line,
+            err: l.stream === 'stderr',
+          })),
+      }),
+    [],
+  )
+
   const actions: ToolActions = useMemo(
     () => ({
       act: async (inst, action) => {
@@ -102,21 +139,53 @@ export function App() {
         }
         refreshInstances()
       },
-      logs: (inst, title) =>
-        setLogs({
-          title,
-          subtitle: inst.id,
-          load: async () =>
-            (await api.logs(inst.id)).map((l) => ({
-              ts: new Date(l.ts).toLocaleTimeString([], { hour12: false }),
-              text: l.line,
-              err: l.stream === 'stderr',
-            })),
-        }),
+      logs: openLogs,
       pending: (id) => id in pending,
+      removeProject: (project, allInstances) => {
+        const managedWorktrees = allInstances.filter((i) => i.checkout.kind === 'managed').length
+        setRemoveWorktrees(false)
+        setRemovingProject({ project, managedWorktrees })
+      },
+      openBranches: (project) => setBranchesProjectId(project.id),
+      unpin: async (inst) => {
+        try {
+          await api.pinInstance(inst.id, false)
+          refreshInstances()
+        } catch (e) {
+          toast(e)
+        }
+      },
+      adopt: async (inst, adopt) => {
+        try {
+          if (adopt) await api.adoptInstance(inst.id)
+          else await api.unadoptInstance(inst.id)
+          refreshInstances()
+        } catch (e) {
+          toast(e)
+        }
+      },
+      namedHttpsReady,
     }),
-    [pending, refreshInstances, toast],
+    [namedHttpsReady, openLogs, pending, refreshInstances, toast],
   )
+
+  const confirmRemoveProject = async () => {
+    if (!removingProject) return
+    setRemovingBusy(true)
+    try {
+      await api.removeProject(removingProject.project.id, {
+        stop: true,
+        remove_worktrees: removeWorktrees,
+      })
+      setRemovingProject(null)
+      refreshProjects()
+      refreshInstances()
+    } catch (e) {
+      toast(e)
+    } finally {
+      setRemovingBusy(false)
+    }
+  }
 
   const q = query.trim().toLowerCase()
   const tools = (projects ?? [])
@@ -124,9 +193,12 @@ export function App() {
     .sort((a, b) => a.name.localeCompare(b.name))
   const byProject = new Map<string, Instance[]>()
   for (const i of instances ?? []) byProject.set(i.project, [...(byProject.get(i.project) ?? []), i])
-  const running = (instances ?? []).filter((i) => ['running', 'unhealthy', 'external', 'starting'].includes(i.runtime.status)).length
-    + (launchers ?? []).filter((l) => l.status === 'running').length
+  const running =
+    (instances ?? []).filter((i) => ['running', 'unhealthy', 'external', 'starting', 'preparing'].includes(i.runtime.status)).length +
+    (launchers ?? []).filter((l) => l.status === 'running').length
   const offline = projErr instanceof TypeError || (projErr !== null && projects === undefined)
+  const branchesProject = branchesProjectId ? (projects ?? []).find((p) => p.id === branchesProjectId) ?? null : null
+  const issueCount = health ? health.checks.filter((c) => c.status === 'fail' || c.status === 'warn').length : 0
 
   return (
     <div className="min-h-screen">
@@ -153,7 +225,25 @@ export function App() {
               <kbd className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 rounded border border-border px-1.5 font-mono text-[10px] text-muted-foreground">/</kbd>
             )}
           </div>
-          <div className="ml-auto text-sm text-muted-foreground">{running ? `${running} running` : 'Nothing running'}</div>
+          <div className="ml-auto flex items-center gap-3">
+            {health ? (
+              <button
+                type="button"
+                onClick={() => setHealthOpen(true)}
+                className={cn(
+                  'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition',
+                  namedHttpsReady
+                    ? 'border-success/30 bg-success/10 text-success hover:bg-success/15'
+                    : 'border-border bg-muted/60 text-muted-foreground hover:border-warning/40 hover:text-foreground',
+                )}
+                title={namedHttpsReady ? `*.${tld} HTTPS active` : `*.${tld} HTTPS setup (${issueCount} check${issueCount === 1 ? '' : 's'} need attention)`}
+              >
+                {namedHttpsReady ? <Globe className="h-3.5 w-3.5" /> : <ShieldAlert className="h-3.5 w-3.5 text-warning" />}
+                <span>*.{tld}</span>
+              </button>
+            ) : null}
+            <div className="text-sm text-muted-foreground">{running ? `${running} running` : 'Nothing running'}</div>
+          </div>
         </div>
       </header>
 
@@ -161,7 +251,7 @@ export function App() {
         <div className="border-b border-danger/30 bg-danger/10">
           <div className="mx-auto flex max-w-6xl items-center gap-2 px-5 py-2.5 text-sm text-danger">
             <WifiOff className="h-4 w-4" />
-            Can't reach the Lantern daemon. Start it with <code className="font-mono">systemctl --user start lantern-dev</code>.
+            Can't reach the Lantern daemon. Start it with <code className="font-mono">systemctl --user start lantern</code>.
           </div>
         </div>
       ) : null}
@@ -189,9 +279,13 @@ export function App() {
                 const all = byProject.get(p.id) ?? []
                 const primary = all.find((i) => i.id === p.primary)
                 const branches = all.filter(
-                  (i) => i.id !== p.primary && ['running', 'unhealthy', 'external', 'starting', 'crashed'].includes(i.runtime.status),
+                  (i) =>
+                    i.id !== p.primary &&
+                    (i.pinned ||
+                      i.visible ||
+                      ['running', 'unhealthy', 'external', 'starting', 'preparing', 'crashed'].includes(i.runtime.status)),
                 )
-                return <ToolCard key={p.id} project={p} primary={primary} branches={branches} actions={actions} />
+                return <ToolCard key={p.id} project={p} primary={primary} branches={branches} allInstances={all} actions={actions} />
               })}
             </div>
           ) : (
@@ -218,7 +312,14 @@ export function App() {
           }
         />
 
-        <OtherServers items={listeners ?? []} />
+        <OtherServers
+          items={listeners ?? []}
+          onAdded={() => {
+            refreshProjects()
+            refreshInstances()
+          }}
+          onError={toast}
+        />
       </main>
 
       {logs ? <LogDrawer source={logs} onClose={() => setLogs(null)} /> : null}
@@ -231,6 +332,55 @@ export function App() {
           }}
           onError={toast}
         />
+      ) : null}
+      {branchesProject ? (
+        <BranchesModal
+          project={branchesProject}
+          instances={byProject.get(branchesProject.id) ?? []}
+          namedHttpsReady={namedHttpsReady}
+          onClose={() => setBranchesProjectId(null)}
+          onRefresh={() => {
+            refreshProjects()
+            refreshInstances()
+          }}
+          onLogs={openLogs}
+          onError={toast}
+        />
+      ) : null}
+      {healthOpen ? (
+        <HealthModal
+          info={systemInfo}
+          health={health}
+          onRefresh={refreshHealth}
+          onClose={() => setHealthOpen(false)}
+        />
+      ) : null}
+      {removingProject ? (
+        <Modal title={`Remove ${removingProject.project.name}`} onClose={() => setRemovingProject(null)}>
+          <p className="text-sm text-muted-foreground">
+            Unregister <strong className="text-foreground">{removingProject.project.name}</strong> from Lantern? Any running instances will be stopped first. Your project files on disk are not deleted.
+          </p>
+          {removingProject.managedWorktrees > 0 ? (
+            <label className="mt-4 flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={removeWorktrees}
+                onChange={(e) => setRemoveWorktrees(e.target.checked)}
+                className="accent-danger"
+              />
+              Also remove {removingProject.managedWorktrees} Lantern-managed worktree{removingProject.managedWorktrees === 1 ? '' : 's'}
+            </label>
+          ) : null}
+          <div className="mt-5 flex items-center justify-end gap-2">
+            <Button variant="ghost" onClick={() => setRemovingProject(null)} disabled={removingBusy}>
+              Cancel
+            </Button>
+            <Button variant="danger" busy={removingBusy} onClick={confirmRemoveProject}>
+              {removingBusy ? null : <Trash2 className="h-4 w-4" />}
+              Remove
+            </Button>
+          </div>
+        </Modal>
       ) : null}
 
       <div className="fixed bottom-4 right-4 z-50 flex w-80 flex-col gap-2">

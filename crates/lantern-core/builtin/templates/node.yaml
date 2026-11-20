@@ -1,0 +1,6 @@
+name: node
+type: proxy
+run:
+  cmd: "npm run dev"
+routing:
+  websocket: true

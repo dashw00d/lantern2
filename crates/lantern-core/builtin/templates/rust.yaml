@@ -1,0 +1,4 @@
+name: rust
+type: proxy
+run:
+  cmd: "cargo run"

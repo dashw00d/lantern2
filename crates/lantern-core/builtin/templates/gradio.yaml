@@ -1,0 +1,9 @@
+name: gradio
+type: proxy
+run:
+  cmd: "python3 app.py"
+  env:
+    GRADIO_SERVER_NAME: "${HOST}"
+    GRADIO_SERVER_PORT: "${PORT}"
+routing:
+  websocket: true

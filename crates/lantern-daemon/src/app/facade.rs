@@ -615,6 +615,7 @@ impl DaemonFacade for AppFacade {
         } else {
             None
         };
+        let repo_common_dir = repo.as_ref().map(|r| r.common_dir.clone());
         let now = Timestamp::now();
         let registered = self.registry.upsert_project(ProjectRecord {
             id: id.clone(),
@@ -641,6 +642,11 @@ impl DaemonFacade for AppFacade {
                 crate::registry::Error::Conflict(_) => error_api_conflict(&error),
                 _ => internal(error),
             });
+        }
+        if let Some(common_dir) = repo_common_dir
+            && let Err(error) = self.instances_service.refresh_repo(&common_dir).await
+        {
+            tracing::warn!(%error, path=%common_dir.display(), "initial git worktree refresh failed");
         }
         self.registry.flush().await.map_err(internal)?;
         self.summary(&id)
@@ -1119,10 +1125,7 @@ impl DaemonFacade for AppFacade {
         let instances = self.project_instances(id.clone()).await?;
         for instance in &instances {
             if matches!(instance.runtime.status, InstanceStatus::External) {
-                return Err(error(
-                    "not_controllable",
-                    "external processes cannot be stopped by Lantern",
-                ));
+                continue;
             }
             if !matches!(
                 instance.runtime.status,
@@ -1396,9 +1399,27 @@ impl DaemonFacade for AppFacade {
             .registry
             .project(&id)
             .ok_or_else(|| error("project_not_found", format!("project {id} not found")))?;
-        if let Some(repo) = project.repo {
+        let common_dir = if let Some(repo) = project.repo {
+            Some(repo.common_dir)
+        } else if project.root.is_dir()
+            && let Some(probe) = self.git.probe(&project.root).await.map_err(internal)?
+        {
+            self.registry
+                .upsert_repo(probe.common_dir.clone(), RepoRecord { slug: id.to_string() });
+            if let Some(mut record) = self.registry.project_record(&id) {
+                record.repo = Some(ProjectRepoRecord {
+                    common_dir: probe.common_dir.clone(),
+                    subpath: probe.subpath,
+                });
+                self.registry.upsert_project(record).map_err(internal)?;
+            }
+            Some(probe.common_dir)
+        } else {
+            None
+        };
+        if let Some(common_dir) = common_dir {
             self.instances_service
-                .refresh_repo(&repo.common_dir)
+                .refresh_repo(&common_dir)
                 .await
                 .map_err(internal)?;
         }

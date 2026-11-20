@@ -1,0 +1,6 @@
+name: mkdocs
+type: proxy
+run:
+  cmd: "mkdocs serve -a ${HOST}:${PORT}"
+routing:
+  websocket: true
