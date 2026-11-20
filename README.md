@@ -1,6 +1,6 @@
 # Lantern: local dev server manager for Linux
 
-**Lantern is a local development server manager and process supervisor for Linux.** Start, stop and watch every dev server on your machine from one control center, a CLI, or an AI agent over MCP. Run any git branch next to `main` with its own port and URL, and see the servers you started by hand too.
+**Lantern is a local development server manager and process supervisor for Linux.** Start, stop and watch every dev server on your machine from a web control center (in your browser or a desktop window), a CLI, or an AI agent over MCP. Run any git branch next to `main` with its own port and URL, and see the servers you started by hand too.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
@@ -18,7 +18,7 @@ Lantern keeps one registry of your projects and runs each dev server as a superv
 - one place to see what is running, on which port, and why something failed;
 - the same port every time for the same project;
 - branches as first-class citizens: run `feature-x` and `main` side by side;
-- the same view for humans (web UI, CLI, desktop GUI) and for agents (MCP).
+- the same view for humans (control center, desktop window, CLI) and for agents (MCP).
 
 ## Features
 
@@ -43,9 +43,9 @@ Lantern keeps one registry of your projects and runs each dev server as a superv
 - Agents can read a project's docs and API endpoints (including OpenAPI) through the same server.
 
 **Clients**
-- A web **control center** served by the daemon (React, embedded in the binary) with project/worktree removal, branch management, custom commands, suggestion dismissal, and live `*.glow` HTTPS diagnostics.
+- A web **control center** served by the daemon at <http://127.0.0.1:4777> (React, embedded in the binary): tool cards with live status, Open/Start/Stop/Restart and logs, a **Branches & worktrees** modal, saved commands, an "Also running on this machine" list of other listeners, project suggestions you can add or dismiss, live `*.glow` HTTPS diagnostics, search (press `/`), and light and dark themes that follow your system.
+- A **desktop window** ([`desktop/`](desktop/), Tauri 2) that shows the same control center in a native window with a tray icon. Closing the window hides it to the tray, links to your apps open in your default browser, and quitting leaves the daemon and every server running. `--hidden` starts it in the tray for login autostart.
 - A full-featured **CLI** with `--json` output, shell completions and an NDJSON event stream.
-- A native **GUI** (`lantern gui`) with a tray icon, and a Tauri 2 desktop window in [`desktop/`](desktop/).
 
 **Optional named HTTPS URLs**
 - With Caddy and a one-time `lantern init`, projects get `https://<name>.glow` URLs (and `https://<branch>.<name>.glow` for branches) from a local, name-constrained certificate authority. Once active, the control center shows a green `*.glow` badge and **Open** buttons automatically use the named HTTPS URLs. See [Named HTTPS URLs](#named-https-urls-optional).
@@ -71,10 +71,6 @@ Lantern keeps one registry of your projects and runs each dev server as a superv
 ### MCP for AI agents
 
 ![Terminal showing lantern mcp url, the Claude Code MCP config snippet, and a list_projects MCP tool call returning project status and ports](docs/screenshots/mcp.png)
-
-### Native GUI
-
-![Lantern native desktop GUI listing projects and instances with Stop, Restart, Overview and Logs buttons](docs/screenshots/gui.png)
 
 *All screenshots are real captures of a Lantern daemon running generic demo projects; see [`scripts/screenshots/`](scripts/screenshots/) to regenerate them.*
 
@@ -116,9 +112,23 @@ lantern logs -f my-app # follow the logs
 lantern off my-app     # stop it
 ```
 
-Open <http://127.0.0.1:4777> for the control center. Without named HTTPS set up, **Open** buttons fall back to each app's loopback port (for example `http://127.0.0.1:29000`); once [Named HTTPS URLs](#named-https-urls-optional) are configured, **Open** automatically uses `https://my-app.glow` (the header `*.glow` badge shows live status and any remaining `lantern doctor` fixes).
+Open <http://127.0.0.1:4777> for the control center (or use the [desktop window](#desktop-window-optional)). Without named HTTPS set up, **Open** buttons fall back to each app's loopback port (for example `http://127.0.0.1:29000`); once [Named HTTPS URLs](#named-https-urls-optional) are configured, **Open** automatically uses `https://my-app.glow` (the header `*.glow` badge shows live status and any remaining `lantern doctor` fixes).
 
 Lantern scans the workspace folders listed in `~/.config/lantern/config.toml` (defaults `~/sites` and `~/tools`, with glob support in `workspaces.ignore`) for directories that contain a `lantern.yaml`, and suggests folders that look like dev projects (including nested monorepo subprojects).
+
+### Desktop window (optional)
+
+The desktop app is a separate crate so the main build does not need WebKitGTK:
+
+```bash
+(cd desktop && cargo build --release)
+desktop/target/release/lantern-desktop            # opens the control center in a window, with a tray icon
+desktop/target/release/lantern-desktop --hidden   # start in the tray (for login autostart)
+```
+
+It connects to `http://127.0.0.1:4777` by default; set `LANTERN_DAEMON_URL` to point it at another daemon (for example the `--dev` daemon on port 4778). If the daemon is not running yet, the window waits for it.
+
+### Run the daemon in the background
 
 To keep the daemon running in the background, [`packaging/lantern.service`](packaging/lantern.service) is a systemd user unit for it (it expects the binary at `/usr/bin/lantern`; adjust `ExecStart` if you installed elsewhere).
 
@@ -203,11 +213,12 @@ Details and the security reasoning are in [`docs/13-system.md`](docs/13-system.m
 ```
  lantern CLI ─┐                     ┌─ systemd --user transient units (lantern-inst-<project>)
  control      ├─►  lantern daemon ──┤   one per running instance; logs go to the user journal
- center / GUI │    127.0.0.1:4777   ├─ Caddy (optional): HTTPS names, local CA
- AI agents  ──┘    REST + SSE + MCP └─ DNS responder for *.glow (optional)
+ center,      │    127.0.0.1:4777   ├─ Caddy (optional): HTTPS names, local CA
+ desktop      │    REST + SSE + MCP └─ DNS responder for *.glow (optional)
+ AI agents  ──┘
 ```
 
-- One binary, `lantern`, is the daemon, the CLI and the GUI. The CLI, GUI and control center are plain HTTP clients of the daemon; they never start processes themselves.
+- One binary, `lantern`, is the daemon and the CLI, and serves the control center. The CLI, the control center and the desktop window are plain HTTP clients of the daemon; they never start processes themselves.
 - The daemon binds to loopback only and rejects requests with an unexpected `Host` or `Origin` header.
 - Dev servers belong to systemd, not to the daemon, so restarting or upgrading Lantern does not stop them.
 - State is a registry in `~/.local/state/lantern/state.json`; your preferences are in `~/.config/lantern/config.toml`; each project's behavior lives in its own `lantern.yaml`.
@@ -221,7 +232,7 @@ The Rust workspace is split into `lantern-core` (types, manifest, settings), `la
 - Node.js and npm to build the web control center (`ui/`).
 - `git` for branch and worktree features.
 - Optional: Caddy 2.8 or newer for `https://<name>.glow` URLs.
-- Optional: WebKitGTK to build the Tauri desktop window in [`desktop/`](desktop/), which is a separate crate so the main build does not need it.
+- Optional: WebKitGTK to build the Tauri desktop window in [`desktop/`](desktop/).
 
 ## Development
 
@@ -236,7 +247,13 @@ cd ui && npm run dev                    # control center with hot reload
 
 ## Regenerating the screenshots
 
-The images in `docs/screenshots/` are produced by [`scripts/screenshots/`](scripts/screenshots/): `demo.sh` starts an isolated daemon (own ports, config and `HOME` under `/tmp`) seeded with generic demo projects, `capture.mjs` takes the web and terminal screenshots with headless Chromium, and `gui.sh` captures the native GUI under Xvfb.
+The images in `docs/screenshots/` are produced by [`scripts/screenshots/`](scripts/screenshots/): `demo.sh` starts an isolated daemon (own ports, config and `HOME` under `/tmp`) seeded with generic demo projects and `capture.mjs` takes the control center and terminal screenshots with headless Chromium:
+
+```bash
+scripts/screenshots/demo.sh start
+(cd scripts/screenshots && npm install && npx playwright-core install chromium && node capture.mjs)
+scripts/screenshots/demo.sh stop
+```
 
 ## License
 
